@@ -102,15 +102,34 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64)) er
 	if err := os.Rename(tmp, dest); err != nil {
 		return err
 	}
+
+	// Online bitswap cached the fetched blocks in the plain blockstore. Drop that whole closure first: Filestore.Put
+	// skips any block that already exists, so without clearing them addNoCopy would NOT create the filestore
+	// references and the content would stay duplicated in the blockstore. After dropping, addNoCopy re-chunks dest
+	// from disk and stores the leaves as references into it — leaving the destination file as the only on-disk copy.
+	n.dropClosure(c)
 	if _, err := n.addNoCopy(dest); err != nil {
 		return err
 	}
-	n.gcUnpinnedLeaves() // M2 offline: no-op (no blockstore leaves); M3 online: reclaim bitswap-cached leaves
 	return nil
 }
 
-// gcUnpinnedLeaves reclaims leaf blocks left in the blockstore by online bitswap once they're referenced via the
-// filestore. M2 is offline (reads come straight from filestore references), so there is nothing to collect yet.
-func (n *node) gcUnpinnedLeaves() {
-	// TODO(M3): colored-set GC over the blockstore against the pinner once bitswap is online.
+// dropClosure removes a CID's entire block closure from the plain blockstore (used to clear bitswap's cached copy
+// before re-adding as filestore references). Reads each node's links before deleting it. Raw leaves have no links.
+func (n *node) dropClosure(root cid.Cid) {
+	main := n.fstore.MainBlockstore()
+	seen := cid.NewSet()
+	var walk func(c cid.Cid)
+	walk = func(c cid.Cid) {
+		if !seen.Visit(c) {
+			return
+		}
+		if nd, err := n.dserv.Get(n.ctx, c); err == nil {
+			for _, l := range nd.Links() {
+				walk(l.Cid)
+			}
+		}
+		_ = main.DeleteBlock(n.ctx, c)
+	}
+	walk(root)
 }

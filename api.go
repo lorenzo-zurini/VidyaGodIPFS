@@ -128,19 +128,41 @@ func VgPinRm(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
-// ---- network (M3 — stubs returning offline sentinels for now) ----
+// ---- network ----
 
 //export VgPeerCount
-func VgPeerCount() C.int { return 0 }
+func VgPeerCount() C.int {
+	n := get()
+	if n == nil {
+		return 0
+	}
+	return C.int(n.peerCount())
+}
 
 //export VgRepoStat
 func VgRepoStat(outJson **C.char, errOut **C.char) C.int {
-	setStr(outJson, `{"RepoSize":-1,"StorageMax":-1}`)
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	b, _ := json.Marshal(map[string]int64{"RepoSize": dirSize(n.repoPath), "StorageMax": -1})
+	setStr(outJson, string(b))
 	return 0
 }
 
 //export VgProviderCount
-func VgProviderCount(cidStr *C.char, timeoutMs C.int) C.int { return -1 }
+func VgProviderCount(cidStr *C.char, timeoutMs C.int) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	return C.int(n.providerCount(c, int(timeoutMs)))
+}
 
 // ---- fetch + cancellation + transfer callback ----
 

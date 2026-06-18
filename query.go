@@ -3,8 +3,27 @@ package main
 // query.go — read-only status helpers backing the IPFS tab columns.
 
 import (
+	"io/fs"
+	"path/filepath"
+
 	cid "github.com/ipfs/go-cid"
 )
+
+// dirSize sums the on-disk byte size under root (the node's local repo footprint — datastore + filestore index +
+// intermediate blocks; leaf data lives in the referenced package files, not here).
+func dirSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, e := d.Info(); e == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
 
 // cidSize returns the CumulativeSize of a CID's DAG (dag-pb root.Size() == cumulative size), -1 on error.
 func (n *node) cidSize(c cid.Cid) int64 {

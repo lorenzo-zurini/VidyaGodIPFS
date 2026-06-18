@@ -15,15 +15,19 @@ import (
 
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
+	exchange "github.com/ipfs/boxo/exchange"
 	offline "github.com/ipfs/boxo/exchange/offline"
 	filestore "github.com/ipfs/boxo/filestore"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
+	provider "github.com/ipfs/boxo/provider"
 	ipld "github.com/ipfs/go-ipld-format"
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	dssync "github.com/ipfs/go-datastore/sync"
 	datastore "github.com/ipfs/go-datastore"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	host "github.com/libp2p/go-libp2p/core/host"
 )
 
 // node is the singleton embedded IPFS node.
@@ -39,6 +43,13 @@ type node struct {
 	bserv     blockservice.BlockService
 	dserv     ipld.DAGService
 	pinner    ipfspinner.Pinner
+
+	// network (M3) — nil/false until goOnline succeeds
+	online   bool
+	host     host.Host
+	dht      *dht.IpfsDHT
+	exchange exchange.Interface
+	provider provider.System
 }
 
 var (
@@ -78,7 +89,10 @@ func openNode(repoPath string) error {
 	// M3 wires the real DHT reprovider here.
 	fstore := filestore.NewFilestore(bstore, fm, nil)
 
-	bserv := blockservice.New(fstore, offline.Exchange(fstore))
+	// WriteThrough so an Add always Puts (no Has-skip): when content already sits in the blockstore (e.g. cached by
+	// bitswap during a fetch), addNoCopy must still create the filestore reference so gcUnpinnedLeaves can then drop
+	// the redundant blockstore copy. Without this the no-duplication guarantee breaks on the online path.
+	bserv := blockservice.New(fstore, offline.Exchange(fstore), blockservice.WriteThrough(true))
 	dserv := merkledag.NewDAGService(bserv)
 
 	pnr, err := dspinner.New(ctx, ds, dserv)
@@ -92,6 +106,10 @@ func openNode(repoPath string) error {
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
 		ds: ds, fstore: fstore, bstore: fstore, bserv: bserv, dserv: dserv, pinner: pnr,
 	}
+
+	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays
+	// fully usable offline (local filestore reads, add-by-reference) — fetch of remote content just won't work.
+	_ = gNode.goOnline()
 	return nil
 }
 
@@ -101,6 +119,15 @@ func closeNode() {
 	defer gMu.Unlock()
 	if gNode == nil {
 		return
+	}
+	if gNode.provider != nil {
+		_ = gNode.provider.Close()
+	}
+	if gNode.dht != nil {
+		_ = gNode.dht.Close()
+	}
+	if gNode.host != nil {
+		_ = gNode.host.Close()
 	}
 	gNode.cancel()
 	if c, ok := gNode.ds.(datastore.Datastore); ok {
