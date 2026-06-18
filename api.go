@@ -142,22 +142,53 @@ func VgRepoStat(outJson **C.char, errOut **C.char) C.int {
 //export VgProviderCount
 func VgProviderCount(cidStr *C.char, timeoutMs C.int) C.int { return -1 }
 
-// ---- fetch + cancellation + transfer callback (M2) ----
+// ---- fetch + cancellation + transfer callback ----
+
+// transferCb holds the registered C callback; fetch progress/lifecycle is reported through it.
+var transferCb C.vg_transfer_cb
+
+// TransferEvent kinds — must match IpfsWrapper::TransferEvent::Kind on the C++ side.
+const (
+	kindStarted  = 0
+	kindProgress = 1
+	kindFinished = 2
+)
 
 //export VgFetchToPath
 func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
-	setStr(errOut, "fetch not implemented yet (M2)")
-	return -1
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	cs := C.GoString(cidStr)
+	d := C.GoString(dest)
+
+	// One C string for the CID, reused across every event for this transfer.
+	ccid := C.CString(cs)
+	defer C.free(unsafe.Pointer(ccid))
+	emit := func(kind int, pct float64, ok int, errc *C.char) {
+		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
+	}
+
+	emit(kindStarted, -1, 0, nil)
+	err := n.fetchToPath(cs, d, func(pct float64) { emit(kindProgress, pct, 0, nil) })
+	if err != nil {
+		ec := C.CString(err.Error())
+		defer C.free(unsafe.Pointer(ec))
+		emit(kindFinished, -1, 0, ec)
+		setStr(errOut, err.Error())
+		return -1
+	}
+	emit(kindFinished, 100, 1, nil)
+	return 0
 }
 
 //export VgRequestCancel
-func VgRequestCancel(cidStr *C.char) {}
+func VgRequestCancel(cidStr *C.char) { requestCancel(C.GoString(cidStr)) }
 
 //export VgClearCancel
-func VgClearCancel(cidStr *C.char) {}
-
-// transferCb holds the registered C callback (M2 wires fetch progress through it).
-var transferCb C.vg_transfer_cb
+func VgClearCancel(cidStr *C.char) { clearCancel(C.GoString(cidStr)) }
 
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
