@@ -1,0 +1,7 @@
+# cgo build outputs
+libvgipfs.so
+libvgipfs.h
+*.a
+
+# local test repos
+/repo/
