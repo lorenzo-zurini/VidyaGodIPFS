@@ -17,8 +17,8 @@ import (
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	provider "github.com/ipfs/boxo/provider"
 	cid "github.com/ipfs/go-cid"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	libp2p "github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 )

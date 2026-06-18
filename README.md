@@ -40,6 +40,18 @@ Built automatically by VidyaGod's CMake (`external/VidyaGodIPFS` submodule) into
 
 ## Status
 
-Milestone 1 (storage + CID parity) complete: `VgStart`/`VgStop`, `VgAddNoCopy` (parity-verified against recorded
-CIDs), `VgCidSize`, `VgPinLs`/`VgPinRm`. Networking (DHT, bitswap, provider) and the write-through fetch land in
-later milestones.
+Complete and in use by VidyaGod (Kubo fully removed):
+
+- **Storage + CID parity** — `VgAddNoCopy` reproduces Kubo's `--nocopy` CIDs exactly (regression-locked in tests).
+- **Write-through fetch** — `VgFetchToPath` materializes content at the destination and seeds it by reference, with
+  no blockstore duplication; progress + cancellation supported.
+- **Public network** — libp2p + Kademlia DHT + Bitswap + reprovider; `VgPeerCount`/`VgRepoStat`/`VgProviderCount`.
+
+## Tests
+
+```sh
+go test ./...
+```
+
+Offline tests (they force `VIDYAGOD_IPFS_OFFLINE`) covering CID parity, no-duplication, fetch round-trip, progress,
+and cancellation. Also run in CI.

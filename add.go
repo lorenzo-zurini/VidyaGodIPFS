@@ -54,7 +54,7 @@ func (n *node) addNoCopy(path string) (cid.Cid, error) {
 		Maxlinks:   uih.DefaultLinksPerBlock, // 174 — Kubo default
 		RawLeaves:  true,                     // forced by --nocopy
 		NoCopy:     true,
-		CidBuilder: merkledag.V0CidPrefix(),  // dag-pb v0 root; raw leaves carry the raw codec
+		CidBuilder: merkledag.V0CidPrefix(), // dag-pb v0 root; raw leaves carry the raw codec
 		Dagserv:    n.dserv,
 	}
 	db, err := dbp.New(spl)

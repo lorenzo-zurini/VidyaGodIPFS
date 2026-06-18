@@ -1,6 +1,6 @@
 package main
 
-// node.go — the embedded IPFS node assembly (Milestone 1: offline storage only; libp2p/DHT/bitswap added in M3).
+// node.go — the embedded IPFS node assembly: storage + lifecycle (the network stack lives in online.go).
 //
 // Holds a single process-wide node behind a mutex. Storage is a leveldb datastore plus a Boxo filestore so that
 // leaf blocks are stored BY REFERENCE into the on-disk file they came from (the whole point — no blockstore copy).
@@ -19,13 +19,13 @@ import (
 	offline "github.com/ipfs/boxo/exchange/offline"
 	filestore "github.com/ipfs/boxo/filestore"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
-	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
+	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	provider "github.com/ipfs/boxo/provider"
-	ipld "github.com/ipfs/go-ipld-format"
-	leveldb "github.com/ipfs/go-ds-leveldb"
-	dssync "github.com/ipfs/go-datastore/sync"
 	datastore "github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+	leveldb "github.com/ipfs/go-ds-leveldb"
+	ipld "github.com/ipfs/go-ipld-format"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	host "github.com/libp2p/go-libp2p/core/host"
 )
@@ -37,12 +37,12 @@ type node struct {
 
 	repoPath string
 
-	ds        datastore.Batching
-	fstore    *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
-	bstore    blockstore.Blockstore
-	bserv     blockservice.BlockService
-	dserv     ipld.DAGService
-	pinner    ipfspinner.Pinner
+	ds     datastore.Batching
+	fstore *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
+	bstore blockstore.Blockstore
+	bserv  blockservice.BlockService
+	dserv  ipld.DAGService
+	pinner ipfspinner.Pinner
 
 	// network (M3) — nil/false until goOnline succeeds
 	online   bool
@@ -89,9 +89,9 @@ func openNode(repoPath string) error {
 	// M3 wires the real DHT reprovider here.
 	fstore := filestore.NewFilestore(bstore, fm, nil)
 
-	// WriteThrough so an Add always Puts (no Has-skip): when content already sits in the blockstore (e.g. cached by
-	// bitswap during a fetch), addNoCopy must still create the filestore reference so gcUnpinnedLeaves can then drop
-	// the redundant blockstore copy. Without this the no-duplication guarantee breaks on the online path.
+	// WriteThrough so an Add always Puts (no Has-skip) — a safety invariant ensuring addNoCopy creates the filestore
+	// reference even if a block already happens to sit in the blockstore. (The online fetch path clears bitswap's
+	// cached blocks via dropClosure before re-adding, which is the primary guard against duplication.)
 	bserv := blockservice.New(fstore, offline.Exchange(fstore), blockservice.WriteThrough(true))
 	dserv := merkledag.NewDAGService(bserv)
 
@@ -109,7 +109,10 @@ func openNode(repoPath string) error {
 
 	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays
 	// fully usable offline (local filestore reads, add-by-reference) — fetch of remote content just won't work.
-	_ = gNode.goOnline()
+	// VIDYAGOD_IPFS_OFFLINE forces a purely-local node (used by the tests and as a no-network escape hatch).
+	if os.Getenv("VIDYAGOD_IPFS_OFFLINE") == "" {
+		_ = gNode.goOnline()
+	}
 	return nil
 }
 
