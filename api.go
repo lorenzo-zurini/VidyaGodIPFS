@@ -59,6 +59,23 @@ func VgStart(repoPath *C.char, errOut **C.char) C.int {
 //export VgStop
 func VgStop() { closeNode() }
 
+//export VgStarted
+func VgStarted() C.int {
+	if get() != nil {
+		return 1
+	}
+	return 0
+}
+
+//export VgOnline
+func VgOnline() C.int {
+	n := get()
+	if n != nil && n.online {
+		return 1
+	}
+	return 0
+}
+
 // ---- seed (filestore --nocopy) ----
 
 //export VgAddNoCopy
