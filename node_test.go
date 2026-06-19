@@ -232,6 +232,36 @@ func TestFetchCancellation(t *testing.T) {
 	}
 }
 
+func TestOrphanedRefDetectedAndFetchErrors(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	writeFile(t, src, sampleBytes())
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Intact: not missing, fetch works.
+	if n.cidMissing(c) {
+		t.Fatal("freshly-added content reported as missing")
+	}
+
+	// Delete the backing file out from under the filestore reference (simulates a deleted package).
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+
+	if !n.cidMissing(c) {
+		t.Error("orphaned CID (backing file deleted) not detected as missing")
+	}
+	// Fetching it now yields the clean "missing files" error (→ "Errored: missing files" in the UI), not a
+	// cryptic open() error and not a silent success.
+	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil); err != errMissingFiles {
+		t.Errorf("expected errMissingFiles fetching an orphaned CID, got %v", err)
+	}
+}
+
 func TestStartedOfflineNotOnline(t *testing.T) {
 	n := offlineNode(t)
 	if !n.online && get() == nil {

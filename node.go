@@ -40,9 +40,10 @@ type node struct {
 	ds     datastore.Batching
 	fstore *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
 	bstore blockstore.Blockstore
-	bserv  blockservice.BlockService
-	dserv  ipld.DAGService
-	pinner ipfspinner.Pinner
+	bserv      blockservice.BlockService
+	dserv      ipld.DAGService
+	localDserv ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
+	pinner     ipfspinner.Pinner
 
 	// network (M3) — nil/false until goOnline succeeds
 	online   bool
@@ -105,6 +106,9 @@ func openNode(repoPath string) error {
 	gNode = &node{
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
 		ds: ds, fstore: fstore, bstore: fstore, bserv: bserv, dserv: dserv, pinner: pnr,
+		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
+		// local-only checks (cidMissing) never trigger a network fetch.
+		localDserv: dserv,
 	}
 
 	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays

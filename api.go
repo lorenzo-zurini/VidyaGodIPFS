@@ -95,6 +95,22 @@ func VgAddNoCopy(path *C.char, outCid **C.char, errOut **C.char) C.int {
 
 // ---- status ----
 
+//export VgCidMissing
+func VgCidMissing(cidStr *C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	if n.cidMissing(c) {
+		return 1
+	}
+	return 0
+}
+
 //export VgCidSize
 func VgCidSize(cidStr *C.char) C.longlong {
 	n := get()

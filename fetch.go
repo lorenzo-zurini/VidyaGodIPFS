@@ -12,11 +12,29 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
+	filestore "github.com/ipfs/boxo/filestore"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	cid "github.com/ipfs/go-cid"
 )
+
+// errMissingFiles is returned when content the node believes it has (a filestore reference) can't be read because
+// the backing file was deleted. Surfaced to the UI as "Errored: missing files" rather than a cryptic open() error.
+var errMissingFiles = errors.New("missing files")
+
+// isMissingFile detects a filestore reference whose backing file is gone (deleted package content).
+func isMissingFile(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cre *filestore.CorruptReferenceError
+	if errors.As(err, &cre) {
+		return true
+	}
+	return strings.Contains(err.Error(), "no such file")
+}
 
 var (
 	cancelMu  sync.Mutex
@@ -43,12 +61,21 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64)) er
 	if _, err := os.Stat(dest); err == nil {
 		return nil // already present — no-op (matches the old FetchToPath semantics)
 	}
+	// Orphaned reference: the node "has" this CID via a filestore reference, but the backing file was deleted.
+	// Surface it cleanly as "missing files" (→ "Errored: missing files" in the UI) instead of reading the gone
+	// file. (cidMissing is local-only; for content we don't have it returns false, so normal fetches proceed.)
+	if n.cidMissing(c) {
+		return errMissingFiles
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
 
 	root, err := n.dserv.Get(n.ctx, c)
 	if err != nil {
+		if isMissingFile(err) {
+			return errMissingFiles // node has a filestore ref but the backing file is gone
+		}
 		return err
 	}
 	rdr, err := ufsio.NewDagReader(n.ctx, root, n.dserv)
@@ -90,6 +117,9 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64)) er
 		if rerr != nil {
 			_ = out.Close()
 			_ = os.Remove(tmp)
+			if isMissingFile(rerr) {
+				return errMissingFiles
+			}
 			return rerr
 		}
 	}
