@@ -86,8 +86,9 @@ func isCancelled(c string) bool {
 
 // fetchToPath retrieves cidStr's file content to dest and seeds it from there. onProgress is called with 0..100
 // during the transfer; onFinalize is called once the bytes are all down and the (slower) re-reference/"pinning"
-// step begins (so the UI can show "Pinning…" instead of looking stuck at 100%).
-func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func()) error {
+// step runs — with 0..100 progress through that step on the write-through path, or -1 (indeterminate) on the
+// fallback re-add path (so the UI can show "Pinning… 42%" instead of looking stuck at 100%).
+func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
@@ -188,8 +189,9 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 	// references and the content would stay duplicated in the blockstore. After dropping, addNoCopy re-chunks dest
 	// from disk and stores the leaves as references into it — leaving the destination file as the only on-disk copy.
 	// All bytes are down; the remaining re-chunk/re-reference step ("pinning") can take a while for large files.
+	// addNoCopy re-hashes the whole file opaquely, so we can't report granular progress here — signal indeterminate.
 	if onFinalize != nil {
-		onFinalize()
+		onFinalize(-1)
 	}
 	n.dropClosure(c)
 	if _, err := n.addNoCopy(dest); err != nil {
@@ -205,7 +207,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 // plain blocks. Returns errNotRawLeaves if the DAG isn't all raw leaves (filestore refs require raw leaves; the
 // caller then falls back to read + re-add).
 func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr string,
-	onProgress func(pct float64), onFinalize func()) error {
+	onProgress func(pct float64), onFinalize func(pct float64)) error {
 	// File size (for progress) — cheap, reads the root's UnixFS metadata.
 	rdr, err := ufsio.NewDagReader(n.ctx, rootNode, n.dserv)
 	if err != nil {
@@ -274,9 +276,11 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		return err
 	}
 
-	// Reference each leaf into dest and drop its plain blockstore copy — fast (metadata only, no data re-read).
+	// Reference each leaf into dest and drop its plain blockstore copy — metadata only (no data re-read), but for a
+	// large file this is thousands of leveldb writes under a shared lock (and several fetches may run concurrently),
+	// so report progress through onFinalize (throttled to whole-percent changes) instead of a single "Pinning…".
 	if onFinalize != nil {
-		onFinalize()
+		onFinalize(0)
 	}
 	st, err := os.Stat(dest)
 	if err != nil {
@@ -284,7 +288,8 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	}
 	fm := n.fstore.FileManager()
 	main := n.fstore.MainBlockstore()
-	for _, lf := range leaves {
+	lastPct := -1
+	for i, lf := range leaves {
 		fsn := &posinfo.FilestoreNode{
 			Node:    &refLeaf{c: lf.c, size: lf.sz},
 			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: dest, Stat: st},
@@ -293,6 +298,12 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			return err
 		}
 		_ = main.DeleteBlock(n.ctx, lf.c)
+		if onFinalize != nil && len(leaves) > 0 {
+			if p := (i + 1) * 100 / len(leaves); p != lastPct {
+				lastPct = p
+				onFinalize(float64(p))
+			}
+		}
 	}
 
 	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path).

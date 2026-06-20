@@ -242,7 +242,7 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	emit(kindStarted, -1, 0, nil)
 	err := n.fetchToPath(cs, d,
 		func(pct float64) { emit(kindProgress, pct, 0, nil) },
-		func() { emit(kindFinalizing, 100, 0, nil) })
+		func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
 	if err != nil {
 		ec := C.CString(err.Error())
 		defer C.free(unsafe.Pointer(ec))
