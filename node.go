@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -28,6 +29,7 @@ import (
 	ipld "github.com/ipfs/go-ipld-format"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	host "github.com/libp2p/go-libp2p/core/host"
+	goleveldbutil "github.com/syndtr/goleveldb/leveldb/util"
 )
 
 // node is the singleton embedded IPFS node.
@@ -37,6 +39,8 @@ type node struct {
 
 	repoPath string
 
+	ldb        *leveldb.Datastore // the underlying leveldb (for explicit compaction to reclaim tombstone disk)
+	compacting atomic.Bool        // coalesces overlapping compaction requests into one in-flight run
 	ds         datastore.Batching
 	fstore     *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
 	bstore     blockstore.Blockstore
@@ -106,7 +110,8 @@ func openNode(repoPath string) error {
 
 	gNode = &node{
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
-		ds: ds, fstore: fstore, bstore: fstore, bserv: bserv, dserv: dserv, pinner: pnr,
+		ldb: ldb,
+		ds:  ds, fstore: fstore, bstore: fstore, bserv: bserv, dserv: dserv, pinner: pnr,
 		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,
@@ -145,6 +150,20 @@ func closeNode() {
 		_ = c.Close()
 	}
 	gNode = nil
+}
+
+// scheduleCompaction kicks off an async whole-DB leveldb compaction to reclaim the disk that deleted blocks leave
+// behind as tombstones (go-ds-leveldb defers reclaim to compaction, so `du` on the repo balloons after a fetch even
+// though the logical block set is tiny). The datastore only ever holds references + small intermediate nodes, so a
+// full-range compaction is cheap. Coalesced via compacting: overlapping requests collapse into one in-flight run.
+func (n *node) scheduleCompaction() {
+	if n.ldb == nil || !n.compacting.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer n.compacting.Store(false)
+		_ = n.ldb.DB.CompactRange(goleveldbutil.Range{})
+	}()
 }
 
 // get returns the live node or nil.

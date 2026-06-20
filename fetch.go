@@ -119,6 +119,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
 	if err := n.writeThrough(c, root, dest, cidStr, onProgress, onFinalize); err == nil {
+		n.scheduleCompaction() // reclaim tombstone disk from the leaves we dropped from the blockstore
 		return nil
 	} else if err != errNotRawLeaves {
 		if isMissingFile(err) {
@@ -194,6 +195,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 	if _, err := n.addNoCopy(dest); err != nil {
 		return err
 	}
+	n.scheduleCompaction() // reclaim tombstone disk from the dropped bitswap-cached blocks
 	return nil
 }
 
