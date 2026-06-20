@@ -6,9 +6,12 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 )
 
 // offlineNode opens a fresh purely-local node in a temp repo and registers teardown.
@@ -259,6 +262,57 @@ func TestOrphanedRefDetectedAndFetchErrors(t *testing.T) {
 	// cryptic open() error and not a silent success.
 	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil); err != errMissingFiles {
 		t.Errorf("expected errMissingFiles fetching an orphaned CID, got %v", err)
+	}
+}
+
+// Write-through references must be correct: after fetching to a new path, the content must still be readable via
+// its CID even once the ORIGINAL source is gone — i.e. the references genuinely point into (and reconstruct) the
+// new destination file. This is what lets the fetcher re-seed what it downloaded.
+func TestWriteThroughReferencesAreValid(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	content := sampleBytes()
+	writeFile(t, src, content)
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(dir, "out", "fetched.bin")
+	if err := n.fetchToPath(c.String(), dst, nil, nil); err != nil { // write-through (sampleBytes is multi-chunk raw)
+		t.Fatalf("fetchToPath: %v", err)
+	}
+
+	// Remove the original — now the content can ONLY be served from the write-through references into dst.
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	if n.cidMissing(c) {
+		t.Fatal("content reported missing, but dst exists — write-through references are wrong")
+	}
+
+	// Read the whole DAG back via its CID (through the filestore references) and confirm it reconstructs.
+	rootNode, err := n.localDserv.Get(n.ctx, c)
+	if err != nil {
+		t.Fatalf("get root: %v", err)
+	}
+	rdr, err := ufsio.NewDagReader(n.ctx, rootNode, n.localDserv)
+	if err != nil {
+		t.Fatalf("dag reader: %v", err)
+	}
+	got, err := io.ReadAll(rdr)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("content read back via write-through refs differs: %d vs %d bytes", len(got), len(content))
+	}
+
+	// And the leaves must be stored as references (not duplicated as plain blocks in the blockstore).
+	fsRefs, mainBlocks := blockCounts(n)
+	if fsRefs < 1 || mainBlocks > 2 {
+		t.Errorf("unexpected dedup state: fsRefs=%d mainBlocks=%d (want leaves as refs, only the root as a block)", fsRefs, mainBlocks)
 	}
 }
 

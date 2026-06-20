@@ -95,6 +95,18 @@ func VgAddNoCopy(path *C.char, outCid **C.char, errOut **C.char) C.int {
 
 // ---- status ----
 
+//export VgDebugCounts
+func VgDebugCounts(outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	fs, mb := n.counts()
+	b, _ := json.Marshal(map[string]int{"fsRefs": fs, "mainBlocks": mb})
+	setStr(outJson, string(b))
+	return 0
+}
+
 //export VgCidMissing
 func VgCidMissing(cidStr *C.char) C.int {
 	n := get()

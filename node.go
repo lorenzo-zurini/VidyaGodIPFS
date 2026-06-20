@@ -37,9 +37,9 @@ type node struct {
 
 	repoPath string
 
-	ds     datastore.Batching
-	fstore *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
-	bstore blockstore.Blockstore
+	ds         datastore.Batching
+	fstore     *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
+	bstore     blockstore.Blockstore
 	bserv      blockservice.BlockService
 	dserv      ipld.DAGService
 	localDserv ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)

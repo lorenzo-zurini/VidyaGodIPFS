@@ -57,6 +57,23 @@ func (n *node) unpin(c cid.Cid) error {
 	return n.pinner.Unpin(n.ctx, c, true)
 }
 
+// counts returns (filestore references, plain-blockstore blocks) — the logical dedup view (ignores leveldb's
+// deferred disk reclaim). After a fetch, leaves should be references and only the small dag-pb root/intermediate
+// nodes plain blocks.
+func (n *node) counts() (fsRefs, mainBlocks int) {
+	if ch, err := n.fstore.FileManager().AllKeysChan(n.ctx); err == nil {
+		for range ch {
+			fsRefs++
+		}
+	}
+	if ch, err := n.fstore.MainBlockstore().AllKeysChan(n.ctx); err == nil {
+		for range ch {
+			mainBlocks++
+		}
+	}
+	return
+}
+
 // cidMissing reports whether a pinned CID's backing file (its filestore reference) is gone from disk — i.e. the
 // content was seeded by reference but the underlying package file has since been deleted. Cheap: it finds the first
 // filestore reference reachable from the CID (all of one file's leaves share the same path) and stats it, without
