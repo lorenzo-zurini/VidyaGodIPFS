@@ -49,8 +49,10 @@ func isCancelled(c string) bool {
 	return cancelSet[c]
 }
 
-// fetchToPath retrieves cidStr's file content to dest and seeds it from there. onProgress is called with 0..100.
-func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64)) error {
+// fetchToPath retrieves cidStr's file content to dest and seeds it from there. onProgress is called with 0..100
+// during the transfer; onFinalize is called once the bytes are all down and the (slower) re-reference/"pinning"
+// step begins (so the UI can show "Pinning…" instead of looking stuck at 100%).
+func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func()) error {
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
@@ -137,6 +139,10 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64)) er
 	// skips any block that already exists, so without clearing them addNoCopy would NOT create the filestore
 	// references and the content would stay duplicated in the blockstore. After dropping, addNoCopy re-chunks dest
 	// from disk and stores the leaves as references into it — leaving the destination file as the only on-disk copy.
+	// All bytes are down; the remaining re-chunk/re-reference step ("pinning") can take a while for large files.
+	if onFinalize != nil {
+		onFinalize()
+	}
 	n.dropClosure(c)
 	if _, err := n.addNoCopy(dest); err != nil {
 		return err

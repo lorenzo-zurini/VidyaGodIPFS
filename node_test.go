@@ -162,7 +162,7 @@ func TestFetchOfflineRoundTrip(t *testing.T) {
 	}
 
 	dst := filepath.Join(dir, "out", "fetched.bin")
-	if err := n.fetchToPath(c.String(), dst, nil); err != nil {
+	if err := n.fetchToPath(c.String(), dst, nil, nil); err != nil {
 		t.Fatalf("fetchToPath: %v", err)
 	}
 	got, err := os.ReadFile(dst)
@@ -174,7 +174,7 @@ func TestFetchOfflineRoundTrip(t *testing.T) {
 	}
 
 	// Fetching an existing destination is a no-op (and must not error).
-	if err := n.fetchToPath(c.String(), dst, nil); err != nil {
+	if err := n.fetchToPath(c.String(), dst, nil, nil); err != nil {
 		t.Errorf("re-fetch of existing dest should be a no-op, got %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestFetchProgressReported(t *testing.T) {
 			t.Errorf("progress went backwards: %f after %f", pct, last)
 		}
 		last = pct
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestFetchCancellation(t *testing.T) {
 	requestCancel(c.String())
 	defer clearCancel(c.String())
 	dst := filepath.Join(dir, "cancelled.bin")
-	if err := n.fetchToPath(c.String(), dst, nil); err == nil {
+	if err := n.fetchToPath(c.String(), dst, nil, nil); err == nil {
 		t.Error("expected cancellation to abort the fetch")
 	}
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
@@ -257,7 +257,7 @@ func TestOrphanedRefDetectedAndFetchErrors(t *testing.T) {
 	}
 	// Fetching it now yields the clean "missing files" error (→ "Errored: missing files" in the UI), not a
 	// cryptic open() error and not a silent success.
-	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil); err != errMissingFiles {
+	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil); err != errMissingFiles {
 		t.Errorf("expected errMissingFiles fetching an orphaned CID, got %v", err)
 	}
 }

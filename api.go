@@ -204,9 +204,10 @@ var transferCb C.vg_transfer_cb
 
 // TransferEvent kinds — must match IpfsWrapper::TransferEvent::Kind on the C++ side.
 const (
-	kindStarted  = 0
-	kindProgress = 1
-	kindFinished = 2
+	kindStarted    = 0
+	kindProgress   = 1
+	kindFinished   = 2
+	kindFinalizing = 3 // all bytes down; the re-reference/"pinning" step is running
 )
 
 //export VgFetchToPath
@@ -227,7 +228,9 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	}
 
 	emit(kindStarted, -1, 0, nil)
-	err := n.fetchToPath(cs, d, func(pct float64) { emit(kindProgress, pct, 0, nil) })
+	err := n.fetchToPath(cs, d,
+		func(pct float64) { emit(kindProgress, pct, 0, nil) },
+		func() { emit(kindFinalizing, 100, 0, nil) })
 	if err != nil {
 		ec := C.CString(err.Error())
 		defer C.free(unsafe.Pointer(ec))

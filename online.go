@@ -61,6 +61,11 @@ func (n *node) goOnline() error {
 		libp2p.NATPortMap(),
 		libp2p.EnableNATService(),
 		libp2p.EnableHolePunching(),
+		// AutoRelay: when this node is behind NAT (unreachable directly), reserve slots on relays and advertise
+		// relay addresses so peers on OTHER networks can still reach it (hole-punching is coordinated via the relay).
+		// Candidates come from the DHT routing table (those that support circuit-relay-v2 get used). Same-LAN peers
+		// don't need this — that's mDNS.
+		libp2p.EnableAutoRelayWithPeerSource(n.relayPeerSource),
 	)
 	if err != nil {
 		return err
@@ -105,6 +110,35 @@ func (n *node) goOnline() error {
 	n.online = true
 	go n.bootstrap()
 	return nil
+}
+
+// relayPeerSource feeds AutoRelay with candidate relays from the DHT routing table — public, well-connected peers;
+// those that support circuit-relay-v2 get used. Called by AutoRelay at runtime (n.dht/n.host are set by then).
+func (n *node) relayPeerSource(ctx context.Context, num int) <-chan peer.AddrInfo {
+	out := make(chan peer.AddrInfo)
+	go func() {
+		defer close(out)
+		if n.dht == nil || n.host == nil {
+			return
+		}
+		sent := 0
+		for _, p := range n.dht.RoutingTable().ListPeers() {
+			ai := n.host.Peerstore().PeerInfo(p)
+			if len(ai.Addrs) == 0 {
+				continue
+			}
+			select {
+			case out <- ai:
+				sent++
+			case <-ctx.Done():
+				return
+			}
+			if sent >= num {
+				return
+			}
+		}
+	}()
+	return out
 }
 
 // mdnsNotifee connects to peers discovered on the local network.
