@@ -20,7 +20,9 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
+	host "github.com/libp2p/go-libp2p/core/host"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 )
 
 // loadOrCreateIdentity persists a stable Ed25519 peer key under the repo so the peer ID is consistent across runs.
@@ -91,9 +93,30 @@ func (n *node) goOnline() error {
 		n.provider = prov
 	}
 
+	// Local-network discovery (mDNS): same-LAN nodes find + connect to each other directly. Essential because the
+	// public DHT does NOT advertise private LAN addresses, so two boxes on one network can't discover each other
+	// through it. Once connected, bitswap serves blocks directly between them (no DHT provider record needed).
+	if svc := mdns.NewMdnsService(h, "", &mdnsNotifee{h: h, ctx: n.ctx}); svc != nil {
+		if err := svc.Start(); err == nil {
+			n.mdns = svc
+		}
+	}
+
 	n.online = true
 	go n.bootstrap()
 	return nil
+}
+
+// mdnsNotifee connects to peers discovered on the local network.
+type mdnsNotifee struct {
+	h   host.Host
+	ctx context.Context
+}
+
+func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	defer cancel()
+	_ = m.h.Connect(ctx, pi)
 }
 
 // reprovideKeys streams the recursively-pinned roots for the reprovider to announce.

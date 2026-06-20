@@ -51,6 +51,7 @@ type node struct {
 	dht      *dht.IpfsDHT
 	exchange exchange.Interface
 	provider provider.System
+	mdns     interface{ Close() error } // local-network discovery service (mDNS)
 }
 
 var (
@@ -126,6 +127,9 @@ func closeNode() {
 	defer gMu.Unlock()
 	if gNode == nil {
 		return
+	}
+	if gNode.mdns != nil {
+		_ = gNode.mdns.Close()
 	}
 	if gNode.provider != nil {
 		_ = gNode.provider.Close()
