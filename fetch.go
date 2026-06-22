@@ -8,6 +8,7 @@ package main
 // gcUnpinnedLeaves() reclaims the leaf blocks bitswap cached in the blockstore.
 
 import (
+	"context"
 	"errors"
 	"io"
 	"math"
@@ -246,6 +247,42 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	}
 	var leaves []leafRef
 	var written int64
+
+	// Parallel prefetch: enumerate every leaf CID from the dag-pb spine (leaves are raw-codec links, identifiable
+	// from the link WITHOUT fetching the leaf — only the few intermediate nodes are read), then fetch them all
+	// concurrently via GetMany so they land in the local blockstore. The sequential write-walk below then reads each
+	// leaf from cache instead of blocking on a per-block network round-trip — turning RTT-bound ~4 MB/s into
+	// link-speed. Best-effort: any block the prefetch misses, the walk simply fetches itself.
+	{
+		var leafCids []cid.Cid
+		seen := cid.NewSet()
+		var spine func(nd ipld.Node) error
+		spine = func(nd ipld.Node) error {
+			for _, l := range nd.Links() {
+				if l.Cid.Prefix().Codec == cid.Raw {
+					leafCids = append(leafCids, l.Cid) // a raw leaf — record without fetching
+				} else if seen.Visit(l.Cid) {
+					child, gerr := n.dserv.Get(n.ctx, l.Cid) // intermediate dag-pb node (few, small)
+					if gerr != nil {
+						return gerr
+					}
+					if err := spine(child); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		if spineErr := spine(rootNode); spineErr == nil && len(leafCids) > 0 {
+			pctx, pcancel := context.WithCancel(n.ctx)
+			defer pcancel() // stop the prefetch when writeThrough returns (done / cancel / error)
+			go func() {
+				ch := n.dserv.GetMany(pctx, leafCids)
+				for range ch { // drain — bitswap caches each block in the blockstore as it arrives
+				}
+			}()
+		}
+	}
 
 	var walk func(c cid.Cid, nd ipld.Node) error
 	walk = func(c cid.Cid, nd ipld.Node) error {
