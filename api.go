@@ -107,6 +107,40 @@ func VgDebugCounts(outJson **C.char) C.int {
 	return 0
 }
 
+//export VgPeerID
+func VgPeerID(out **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	setStr(out, n.peerID())
+	return 0
+}
+
+//export VgListenAddrs
+func VgListenAddrs(out **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	b, _ := json.Marshal(n.listenAddrs())
+	setStr(out, string(b))
+	return 0
+}
+
+//export VgConnect
+func VgConnect(maddr *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	if err := n.connect(C.GoString(maddr)); err != nil {
+		return fail(errOut, err)
+	}
+	return 0
+}
+
 //export VgHasLocal
 func VgHasLocal(cidStr *C.char) C.int {
 	n := get()

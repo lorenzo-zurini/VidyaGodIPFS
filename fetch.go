@@ -251,14 +251,26 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	var written int64
 	abort := func(e error) error { _ = out.Close(); _ = os.Remove(tmp); return e }
 
-	// Enumerate the file's leaf CIDs IN ORDER from the dag-pb spine: a raw-codec link is a leaf (recorded without
-	// fetching it); only the few intermediate dag-pb nodes are read. A dag-pb node with no links reached here is a
-	// dag-pb leaf → errNotRawLeaves so the caller falls back to read + re-add (filestore refs require raw leaves).
-	var leafCids []cid.Cid
+	// Enumerate the file's leaves IN ORDER from the dag-pb spine: a raw-codec link is a leaf — its CID, byte size and
+	// file offset come from the link itself (no fetch); only the few intermediate dag-pb nodes are read. A dag-pb node
+	// with no links reached here is a dag-pb leaf → errNotRawLeaves so the caller falls back (refs need raw leaves).
+	// A chunk can repeat in a file (dedup), so a CID maps to every offset it occupies.
+	offsets := map[cid.Cid][]int64{}
+	var uniq []cid.Cid
+	uniqSeen := cid.NewSet()
+	var off int64
+	addLeaf := func(c cid.Cid, sz int) {
+		leaves = append(leaves, leafRef{c, uint64(off), sz})
+		offsets[c] = append(offsets[c], off)
+		off += int64(sz)
+		if uniqSeen.Visit(c) {
+			uniq = append(uniq, c)
+		}
+	}
 	if root.Prefix().Codec == cid.Raw {
-		leafCids = []cid.Cid{root} // single-block file: the root IS the only leaf
+		addLeaf(root, len(rootNode.RawData())) // single-block file: the root IS the only leaf
 	} else {
-		seen := cid.NewSet()
+		seenN := cid.NewSet()
 		var spine func(nd ipld.Node) error
 		spine = func(nd ipld.Node) error {
 			if len(nd.Links()) == 0 {
@@ -266,8 +278,8 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			}
 			for _, l := range nd.Links() {
 				if l.Cid.Prefix().Codec == cid.Raw {
-					leafCids = append(leafCids, l.Cid)
-				} else if seen.Visit(l.Cid) {
+					addLeaf(l.Cid, int(l.Size))
+				} else if seenN.Visit(l.Cid) {
 					child, gerr := n.dserv.Get(n.ctx, l.Cid)
 					if gerr != nil {
 						return gerr
@@ -283,15 +295,14 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			return abort(serr)
 		}
 	}
+	if err := out.Truncate(off); err != nil { // preallocate so out-of-order WriteAt lands correctly
+		return abort(err)
+	}
 
-	// Fetch leaves in PARALLEL over a bounded, double-buffered window: keep ~`window` blocks in flight (vs the old
-	// one-block-at-a-time walk that idled a round-trip per block, capping at ~4 MB/s), but NOT all at once (that
-	// floods bitswap → 150 MB/s bursts then multi-second "no peers" stalls). The next window is fetched while the
-	// current one is written to disk, so the pipe never drains. Each window arrives out of order; it's buffered then
-	// written in leaf order so file offsets stay exact. A cancellable context interrupts even a stalled fetch.
+	// Cancel watcher → cancels the in-flight fetch even mid-stall.
 	fctx, fcancel := context.WithCancel(n.ctx)
 	defer fcancel()
-	go func() { // user-cancel watcher → cancels in-flight GetMany even mid-stall
+	go func() {
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
 		for {
@@ -307,68 +318,30 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		}
 	}()
 
-	// One long-lived bitswap SESSION for the whole file: every window reuses the already-discovered peer set instead
-	// of re-running provider discovery per request (the session-less path did, causing the periodic ~3-4 s "no peers"
-	// stalls between bursts). Raw leaves are fetched as plain blocks (no DAG decode) — block.RawData() IS the bytes.
+	// Fetch the WHOLE want-list at once through one long-lived bitswap SESSION. The session keeps the single peer warm
+	// (no per-request provider re-discovery — the cause of the periodic "no peers" stalls), and handing bitswap every
+	// want up front lets it pipeline to link speed instead of one ~2-RTT round-trip per block (~4 MB/s). Blocks arrive
+	// out of order and are written straight to their file offset(s) — no buffering, so memory stays bitswap-bounded.
 	sess := blockservice.NewSession(fctx, n.bserv)
-
-	const window = 256 // ~64 MB of 256 KB blocks in flight — saturates the link, bounded memory + bitswap wants
-	type batchResult struct {
-		batch []cid.Cid
-		got   map[cid.Cid][]byte
-	}
-	startFetch := func(batch []cid.Cid) <-chan batchResult {
-		ch := make(chan batchResult, 1)
-		go func() {
-			got := make(map[cid.Cid][]byte, len(batch))
-			for blk := range sess.GetBlocks(fctx, batch) { // one session → no per-window rediscovery stalls
-				got[blk.Cid()] = blk.RawData()
-			}
-			ch <- batchResult{batch: batch, got: got}
-		}()
-		return ch
-	}
-	nextWindow := func(i int) []cid.Cid {
-		end := i + window
-		if end > len(leafCids) {
-			end = len(leafCids)
-		}
-		return leafCids[i:end]
-	}
-
-	i := 0
-	var pending <-chan batchResult
-	if i < len(leafCids) {
-		b := nextWindow(i)
-		pending = startFetch(b)
-		i += len(b)
-	}
-	for pending != nil {
-		res := <-pending
-		if i < len(leafCids) { // start the NEXT window fetching before writing this one (overlap fetch + disk write)
-			b := nextWindow(i)
-			pending = startFetch(b)
-			i += len(b)
-		} else {
-			pending = nil
-		}
-		if isCancelled(cidStr) {
-			return abort(errors.New("cancelled")) // session channel closed early on cancel → got is partial
-		}
-		for _, lc := range res.batch {
-			data, ok := res.got[lc]
-			if !ok {
-				return abort(errors.New("incomplete download (missing block)"))
-			}
-			if _, werr := out.Write(data); werr != nil {
+	got := 0
+	for blk := range sess.GetBlocks(fctx, uniq) {
+		data := blk.RawData()
+		for _, o := range offsets[blk.Cid()] {
+			if _, werr := out.WriteAt(data, o); werr != nil {
 				return abort(werr)
 			}
-			leaves = append(leaves, leafRef{lc, uint64(written), len(data)})
 			written += int64(len(data))
 			if total > 0 && onProgress != nil {
 				onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
 			}
 		}
+		got++
+	}
+	if got != len(uniq) { // channel closed before all blocks arrived
+		if isCancelled(cidStr) {
+			return abort(errors.New("cancelled"))
+		}
+		return abort(errMissingFiles) // some never arrived → let the wrapper drop stale refs + retry over the network
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)

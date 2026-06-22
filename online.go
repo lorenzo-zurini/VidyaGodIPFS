@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,12 +17,15 @@ import (
 	blockservice "github.com/ipfs/boxo/blockservice"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	provider "github.com/ipfs/boxo/provider"
+	routinghttp "github.com/ipfs/boxo/routing/http/client"
+	routinghttpcr "github.com/ipfs/boxo/routing/http/contentrouter"
 	cid "github.com/ipfs/go-cid"
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
 	host "github.com/libp2p/go-libp2p/core/host"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	routing "github.com/libp2p/go-libp2p/core/routing"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 )
 
@@ -39,6 +43,40 @@ func loadOrCreateIdentity(repoPath string) (crypto.PrivKey, error) {
 		_ = os.WriteFile(p, b, 0o600)
 	}
 	return priv, nil
+}
+
+// combinedFinder fans a provider lookup out to several content routers in parallel and merges the results, so bitswap
+// consults the fast delegated HTTP indexer alongside the (slow, cold) Amino DHT and uses whichever answers first.
+type combinedFinder struct{ routers []routing.ContentDiscovery }
+
+func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, count int) <-chan peer.AddrInfo {
+	out := make(chan peer.AddrInfo)
+	var wg sync.WaitGroup
+	for i, r := range cf.routers {
+		if r == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, rr routing.ContentDiscovery) {
+			defer wg.Done()
+			t0 := time.Now()
+			n := 0
+			for ai := range rr.FindProvidersAsync(ctx, c, count) {
+				n++
+				if n == 1 {
+					fmt.Fprintf(os.Stderr, "[finder] router %d: first provider in %s\n", idx, time.Since(t0))
+				}
+				select {
+				case out <- ai:
+				case <-ctx.Done():
+					return
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[finder] router %d: %d providers total in %s\n", idx, n, time.Since(t0))
+		}(i, r)
+	}
+	go func() { wg.Wait(); close(out) }()
+	return out
 }
 
 // goOnline builds the network stack and swaps the node's block/DAG services from the offline exchange to online
@@ -78,22 +116,24 @@ func (n *node) goOnline() error {
 		return err
 	}
 
-	// Online bitswap, using the DHT to find providers; swap the DAG service over to it.
+	// Online bitswap. Provider discovery was the ENTIRE download bottleneck: a cold Amino-DHT walk took ~14 s to find
+	// who holds a CID, while the transfer itself runs near link speed once a provider is known. So consult a delegated
+	// HTTP router (the public delegated-ipfs.dev indexer — IPNI + a warm DHT) IN PARALLEL with our own DHT; the HTTP
+	// indexer answers in well under a second. Falls back to DHT-only if the client can't be built.
 	bsn := bsnet.NewFromIpfsHost(h)
-	// Throughput tuning. Defaults are tuned for many-small-peers swarms and badly under-serve a single fast peer on a
-	// latent link (we measured ~2.9 MB/s of a 9.6 MB/s, ~40 ms-RTT link — block-serial, ~2 RTT/block). Let one peer
-	// keep far more bytes in flight + pack bigger messages so transfers pipeline to link speed instead of RTT-bound.
-	bswap := bitswap.New(n.ctx, bsn, kad, n.fstore,
-		bitswap.MaxOutstandingBytesPerPeer(16<<20), // serve up to 16 MiB in flight to one peer (default ~1 MiB)
-		bitswap.WithTargetMessageSize(1<<20),       // pack up to ~1 MiB per bitswap message (fewer round-trips)
-		bitswap.EngineBlockstoreWorkerCount(256),   // more workers reading blocks from the filestore to serve
-		bitswap.EngineTaskWorkerCount(16),
-		bitswap.TaskWorkerCount(16),
-	)
+	var finder routing.ContentDiscovery = kad
+	if hc, herr := routinghttp.New("https://delegated-ipfs.dev"); herr == nil {
+		finder = combinedFinder{routers: []routing.ContentDiscovery{kad, routinghttpcr.NewContentRoutingClient(hc)}}
+	}
+	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore)
 
 	n.host = h
 	n.dht = kad
 	n.exchange = bswap
+	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
+	for _, a := range h.Addrs() {
+		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
+	}
 	// WriteThrough(true): see node.go — addNoCopy must create filestore refs even when bitswap already cached blocks.
 	n.bserv = blockservice.New(n.fstore, bswap, blockservice.WriteThrough(true))
 	n.dserv = merkledag.NewDAGService(n.bserv)
