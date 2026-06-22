@@ -258,10 +258,14 @@ func TestOrphanedRefDetectedAndFetchErrors(t *testing.T) {
 	if !n.cidMissing(c) {
 		t.Error("orphaned CID (backing file deleted) not detected as missing")
 	}
-	// Fetching it now yields the clean "missing files" error (→ "Errored: missing files" in the UI), not a
-	// cryptic open() error and not a silent success.
-	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil); err != errMissingFiles {
-		t.Errorf("expected errMissingFiles fetching an orphaned CID, got %v", err)
+	// A download must NOT be blocked by a stale local reference: fetchToPath drops the orphaned reference and
+	// retries over the network. This node is offline, so the retry can't succeed — but the point is it does NOT
+	// return errMissingFiles (it re-fetches instead), and the stale reference is cleared afterwards.
+	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil); err == errMissingFiles {
+		t.Error("fetchToPath returned errMissingFiles instead of dropping the orphaned ref + retrying")
+	}
+	if n.hasLocal(c) {
+		t.Error("orphaned reference was not cleared by fetchToPath's drop-and-retry")
 	}
 }
 

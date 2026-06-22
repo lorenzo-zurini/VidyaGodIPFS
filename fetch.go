@@ -86,11 +86,26 @@ func isCancelled(c string) bool {
 	return cancelSet[c]
 }
 
-// fetchToPath retrieves cidStr's file content to dest and seeds it from there. onProgress is called with 0..100
-// during the transfer; onFinalize is called once the bytes are all down and the (slower) re-reference/"pinning"
-// step runs — with 0..100 progress through that step on the write-through path, or -1 (indeterminate) on the
-// fallback re-add path (so the UI can show "Pinning… 42%" instead of looking stuck at 100%).
+// fetchToPath retrieves cidStr's file content to dest and seeds it from there. A stale/orphaned LOCAL reference (a
+// prior copy whose backing file is gone — a removed game, an interrupted finalize, a moved library) must never block
+// a fresh download: if the fetch reports "missing files", the closure's references are cleared and the fetch retried
+// once over the network. (This is the download path — local content we "have" but can't read should be re-fetched,
+// not surfaced as an error.) See fetchToPathOnce for the per-attempt mechanics.
 func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+	err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+	if err == errMissingFiles {
+		if c, derr := cid.Decode(cidStr); derr == nil {
+			n.dropRef(c) // clear the stale references (+ cached blocks) so the retry fetches over the network
+			err = n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+		}
+	}
+	return err
+}
+
+// onProgress is called with 0..100 during the transfer; onFinalize is called once the bytes are all down and the
+// (slower) re-reference/"pinning" step runs — with 0..100 progress through that step on the write-through path, or -1
+// (indeterminate) on the fallback re-add path (so the UI can show "Pinning… 42%" instead of looking stuck at 100%).
+func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
