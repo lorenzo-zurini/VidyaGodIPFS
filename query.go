@@ -78,6 +78,14 @@ func (n *node) counts() (fsRefs, mainBlocks int) {
 // content was seeded by reference but the underlying package file has since been deleted. Cheap: it finds the first
 // filestore reference reachable from the CID (all of one file's leaves share the same path) and stats it, without
 // reading or hash-verifying any block contents.
+// hasLocal reports whether the node holds a block for c locally (a filestore reference OR a plain block) WITHOUT any
+// network fetch. A reference whose backing file is gone still counts as "has" — pair with cidMissing to tell a
+// healthy reference from an orphaned one (additive seeding skips only healthy-present CIDs).
+func (n *node) hasLocal(c cid.Cid) bool {
+	has, err := n.fstore.Has(n.ctx, c)
+	return err == nil && has
+}
+
 func (n *node) cidMissing(c cid.Cid) bool {
 	p := n.firstRefPath(c, cid.NewSet())
 	if p == "" {

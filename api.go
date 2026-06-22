@@ -107,6 +107,37 @@ func VgDebugCounts(outJson **C.char) C.int {
 	return 0
 }
 
+//export VgHasLocal
+func VgHasLocal(cidStr *C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	if n.hasLocal(c) {
+		return 1
+	}
+	return 0
+}
+
+//export VgDropRef
+func VgDropRef(cidStr *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	n.dropRef(c)
+	return 0
+}
+
 //export VgCidMissing
 func VgCidMissing(cidStr *C.char) C.int {
 	n := get()

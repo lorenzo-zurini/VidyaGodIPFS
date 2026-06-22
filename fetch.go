@@ -332,3 +332,28 @@ func (n *node) dropClosure(root cid.Cid) {
 	}
 	walk(root)
 }
+
+// dropRef removes a CID's entire closure from the FILESTORE (the FileManager references AND any plain blockstore
+// blocks), then unpins it. Filestore.Put skips a block it already has, so an existing reference — healthy or orphaned
+// (backing file deleted/moved) — must be deleted before addNoCopy can re-point it at a new backing file. Uses the
+// offline DAG service so an orphaned leaf (whose backing file is gone) is simply skipped, never fetched over the
+// network. Only the small dag-pb intermediate nodes need reading to enumerate leaf CIDs; the leaves themselves are
+// deleted by CID without reading their (possibly gone) content.
+func (n *node) dropRef(root cid.Cid) {
+	seen := cid.NewSet()
+	var walk func(c cid.Cid)
+	walk = func(c cid.Cid) {
+		if !seen.Visit(c) {
+			return
+		}
+		if nd, err := n.localDserv.Get(n.ctx, c); err == nil {
+			for _, l := range nd.Links() {
+				walk(l.Cid)
+			}
+		}
+		_ = n.fstore.DeleteBlock(n.ctx, c)
+	}
+	walk(root)
+	_ = n.unpin(root) // drop the stale recursive pin; the re-add re-pins against the new backing file
+	n.scheduleCompaction()
+}
