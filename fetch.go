@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 
+	blockstore "github.com/ipfs/boxo/blockstore"
+	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
@@ -276,9 +278,10 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		return err
 	}
 
-	// Reference each leaf into dest and drop its plain blockstore copy — metadata only (no data re-read), but for a
-	// large file this is thousands of leveldb writes under a shared lock (and several fetches may run concurrently),
-	// so report progress through onFinalize (throttled to whole-percent changes) instead of a single "Pinning…".
+	// Reference each leaf into dest, then drop its plain blockstore copy. Done as TWO batched datastore commits (one
+	// for the filestore references, one for the blockstore deletes) instead of per-leaf Put/Delete — a large file has
+	// thousands of leaves, and individual writes under the shared datastore lock made "Pinning…" take ~a minute and
+	// starved concurrent GUI node queries. Batching collapses that to a couple of commits (near-instant).
 	if onFinalize != nil {
 		onFinalize(0)
 	}
@@ -287,23 +290,26 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		return err
 	}
 	fm := n.fstore.FileManager()
-	main := n.fstore.MainBlockstore()
-	lastPct := -1
-	for i, lf := range leaves {
-		fsn := &posinfo.FilestoreNode{
+	fsns := make([]*posinfo.FilestoreNode, 0, len(leaves))
+	for _, lf := range leaves {
+		fsns = append(fsns, &posinfo.FilestoreNode{
 			Node:    &refLeaf{c: lf.c, size: lf.sz},
 			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: dest, Stat: st},
+		})
+	}
+	if err := fm.PutMany(n.ctx, fsns); err != nil { // one batched commit of all references
+		return err
+	}
+	// Drop the bitswap-cached leaf blocks from the plain blockstore in one batched commit (they're now referenced in
+	// place, so the blockstore copies are redundant). Keys follow boxo's blockstore scheme: BlockPrefix + multihash.
+	if batch, berr := n.ds.Batch(n.ctx); berr == nil {
+		for _, lf := range leaves {
+			_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(dshelp.MultihashToDsKey(lf.c.Hash())))
 		}
-		if err := fm.Put(n.ctx, fsn); err != nil {
-			return err
-		}
-		_ = main.DeleteBlock(n.ctx, lf.c)
-		if onFinalize != nil && len(leaves) > 0 {
-			if p := (i + 1) * 100 / len(leaves); p != lastPct {
-				lastPct = p
-				onFinalize(float64(p))
-			}
-		}
+		_ = batch.Commit(n.ctx)
+	}
+	if onFinalize != nil {
+		onFinalize(100)
 	}
 
 	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path).
