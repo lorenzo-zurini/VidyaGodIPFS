@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	blockstore "github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
@@ -247,78 +248,129 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	}
 	var leaves []leafRef
 	var written int64
+	abort := func(e error) error { _ = out.Close(); _ = os.Remove(tmp); return e }
 
-	// Parallel prefetch: enumerate every leaf CID from the dag-pb spine (leaves are raw-codec links, identifiable
-	// from the link WITHOUT fetching the leaf — only the few intermediate nodes are read), then fetch them all
-	// concurrently via GetMany so they land in the local blockstore. The sequential write-walk below then reads each
-	// leaf from cache instead of blocking on a per-block network round-trip — turning RTT-bound ~4 MB/s into
-	// link-speed. Best-effort: any block the prefetch misses, the walk simply fetches itself.
-	{
-		var leafCids []cid.Cid
+	// Enumerate the file's leaf CIDs IN ORDER from the dag-pb spine: a raw-codec link is a leaf (recorded without
+	// fetching it); only the few intermediate dag-pb nodes are read. A dag-pb node with no links reached here is a
+	// dag-pb leaf → errNotRawLeaves so the caller falls back to read + re-add (filestore refs require raw leaves).
+	var leafCids []cid.Cid
+	if root.Prefix().Codec == cid.Raw {
+		leafCids = []cid.Cid{root} // single-block file: the root IS the only leaf
+	} else {
 		seen := cid.NewSet()
 		var spine func(nd ipld.Node) error
 		spine = func(nd ipld.Node) error {
+			if len(nd.Links()) == 0 {
+				return errNotRawLeaves
+			}
 			for _, l := range nd.Links() {
 				if l.Cid.Prefix().Codec == cid.Raw {
-					leafCids = append(leafCids, l.Cid) // a raw leaf — record without fetching
+					leafCids = append(leafCids, l.Cid)
 				} else if seen.Visit(l.Cid) {
-					child, gerr := n.dserv.Get(n.ctx, l.Cid) // intermediate dag-pb node (few, small)
+					child, gerr := n.dserv.Get(n.ctx, l.Cid)
 					if gerr != nil {
 						return gerr
 					}
-					if err := spine(child); err != nil {
-						return err
+					if serr := spine(child); serr != nil {
+						return serr
 					}
 				}
 			}
 			return nil
 		}
-		if spineErr := spine(rootNode); spineErr == nil && len(leafCids) > 0 {
-			pctx, pcancel := context.WithCancel(n.ctx)
-			defer pcancel() // stop the prefetch when writeThrough returns (done / cancel / error)
-			go func() {
-				ch := n.dserv.GetMany(pctx, leafCids)
-				for range ch { // drain — bitswap caches each block in the blockstore as it arrives
-				}
-			}()
+		if serr := spine(rootNode); serr != nil {
+			return abort(serr)
 		}
 	}
 
-	var walk func(c cid.Cid, nd ipld.Node) error
-	walk = func(c cid.Cid, nd ipld.Node) error {
-		if isCancelled(cidStr) {
-			return errors.New("cancelled")
+	// Fetch leaves in PARALLEL over a bounded, double-buffered window: keep ~`window` blocks in flight (vs the old
+	// one-block-at-a-time walk that idled a round-trip per block, capping at ~4 MB/s), but NOT all at once (that
+	// floods bitswap → 150 MB/s bursts then multi-second "no peers" stalls). The next window is fetched while the
+	// current one is written to disk, so the pipe never drains. Each window arrives out of order; it's buffered then
+	// written in leaf order so file offsets stay exact. A cancellable context interrupts even a stalled fetch.
+	fctx, fcancel := context.WithCancel(n.ctx)
+	defer fcancel()
+	go func() { // user-cancel watcher → cancels in-flight GetMany even mid-stall
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-fctx.Done():
+				return
+			case <-t.C:
+				if isCancelled(cidStr) {
+					fcancel()
+					return
+				}
+			}
 		}
-		if len(nd.Links()) == 0 { // a leaf
-			if c.Prefix().Codec != cid.Raw {
-				return errNotRawLeaves // dag-pb leaf carries protobuf framing, not raw file bytes — can't reference
+	}()
+
+	const window = 256 // ~64 MB of 256 KB blocks in flight — saturates the link, bounded memory + bitswap wants
+	type batchResult struct {
+		batch []cid.Cid
+		got   map[cid.Cid][]byte
+		err   error
+	}
+	startFetch := func(batch []cid.Cid) <-chan batchResult {
+		ch := make(chan batchResult, 1)
+		go func() {
+			got := make(map[cid.Cid][]byte, len(batch))
+			for opt := range n.dserv.GetMany(fctx, batch) {
+				if opt.Err != nil {
+					ch <- batchResult{err: opt.Err}
+					return
+				}
+				got[opt.Node.Cid()] = opt.Node.RawData()
 			}
-			data := nd.RawData()
+			ch <- batchResult{batch: batch, got: got}
+		}()
+		return ch
+	}
+	nextWindow := func(i int) []cid.Cid {
+		end := i + window
+		if end > len(leafCids) {
+			end = len(leafCids)
+		}
+		return leafCids[i:end]
+	}
+
+	i := 0
+	var pending <-chan batchResult
+	if i < len(leafCids) {
+		b := nextWindow(i)
+		pending = startFetch(b)
+		i += len(b)
+	}
+	for pending != nil {
+		res := <-pending
+		if res.err != nil {
+			return abort(res.err)
+		}
+		if i < len(leafCids) { // start the NEXT window fetching before writing this one (overlap fetch + disk write)
+			b := nextWindow(i)
+			pending = startFetch(b)
+			i += len(b)
+		} else {
+			pending = nil
+		}
+		if isCancelled(cidStr) {
+			return abort(errors.New("cancelled"))
+		}
+		for _, lc := range res.batch {
+			data, ok := res.got[lc]
+			if !ok {
+				return abort(errors.New("incomplete download (missing block)"))
+			}
 			if _, werr := out.Write(data); werr != nil {
-				return werr
+				return abort(werr)
 			}
-			leaves = append(leaves, leafRef{c, uint64(written), len(data)})
+			leaves = append(leaves, leafRef{lc, uint64(written), len(data)})
 			written += int64(len(data))
 			if total > 0 && onProgress != nil {
 				onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
 			}
-			return nil
 		}
-		for _, l := range nd.Links() {
-			child, gerr := n.dserv.Get(n.ctx, l.Cid) // fetches via bitswap if not local
-			if gerr != nil {
-				return gerr
-			}
-			if werr := walk(l.Cid, child); werr != nil {
-				return werr
-			}
-		}
-		return nil
-	}
-	if err := walk(root, rootNode); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return err
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
