@@ -23,6 +23,8 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	host "github.com/libp2p/go-libp2p/core/host"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
@@ -88,14 +90,33 @@ func (n *node) goOnline() error {
 		return err
 	}
 
+	// Maximum connectivity: hold a large peer set (default trims at ~192 — too low to fan out to many providers) and
+	// remove resource-manager caps (the default limits per-peer streams, which throttles parallel multi-provider
+	// fetch). connmgr bounds total connections (so FDs stay sane) while rcmgr stays unbounded underneath.
+	cm, cmErr := connmgr.NewConnManager(400, 900, connmgr.WithGracePeriod(20*time.Second))
+	if cmErr != nil {
+		return cmErr
+	}
+	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	if rmErr != nil {
+		return rmErr
+	}
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
+		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
+		// WebSocket, WebTransport). More transports = more usable providers when content has many hosts.
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
 			"/ip4/0.0.0.0/udp/0/quic-v1",
+			"/ip4/0.0.0.0/udp/0/quic-v1/webtransport",
+			"/ip4/0.0.0.0/tcp/0/ws",
 			"/ip6/::/tcp/0",
 			"/ip6/::/udp/0/quic-v1",
+			"/ip6/::/udp/0/quic-v1/webtransport",
+			"/ip6/::/tcp/0/ws",
 		),
+		libp2p.ConnectionManager(cm),
+		libp2p.ResourceManager(rm),
 		libp2p.NATPortMap(),
 		libp2p.EnableNATService(),
 		libp2p.EnableHolePunching(),
@@ -134,6 +155,14 @@ func (n *node) goOnline() error {
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
 	}
+	// Re-log addresses once AutoNAT/UPnP/relay have settled — these are what the node ACTUALLY advertises to the
+	// public network (a public ip4/ip6 = directly reachable; only /p2p-circuit = relay-only → slow downloads).
+	go func() {
+		time.Sleep(45 * time.Second)
+		for _, a := range h.Addrs() {
+			fmt.Fprintf(os.Stderr, "[node] advertised=%s\n", a)
+		}
+	}()
 	// WriteThrough(true): see node.go — addNoCopy must create filestore refs even when bitswap already cached blocks.
 	n.bserv = blockservice.New(n.fstore, bswap, blockservice.WriteThrough(true))
 	n.dserv = merkledag.NewDAGService(n.bserv)
