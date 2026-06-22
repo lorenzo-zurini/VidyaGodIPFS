@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	filestore "github.com/ipfs/boxo/filestore"
@@ -306,22 +307,22 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		}
 	}()
 
+	// One long-lived bitswap SESSION for the whole file: every window reuses the already-discovered peer set instead
+	// of re-running provider discovery per request (the session-less path did, causing the periodic ~3-4 s "no peers"
+	// stalls between bursts). Raw leaves are fetched as plain blocks (no DAG decode) — block.RawData() IS the bytes.
+	sess := blockservice.NewSession(fctx, n.bserv)
+
 	const window = 256 // ~64 MB of 256 KB blocks in flight — saturates the link, bounded memory + bitswap wants
 	type batchResult struct {
 		batch []cid.Cid
 		got   map[cid.Cid][]byte
-		err   error
 	}
 	startFetch := func(batch []cid.Cid) <-chan batchResult {
 		ch := make(chan batchResult, 1)
 		go func() {
 			got := make(map[cid.Cid][]byte, len(batch))
-			for opt := range n.dserv.GetMany(fctx, batch) {
-				if opt.Err != nil {
-					ch <- batchResult{err: opt.Err}
-					return
-				}
-				got[opt.Node.Cid()] = opt.Node.RawData()
+			for blk := range sess.GetBlocks(fctx, batch) { // one session → no per-window rediscovery stalls
+				got[blk.Cid()] = blk.RawData()
 			}
 			ch <- batchResult{batch: batch, got: got}
 		}()
@@ -344,9 +345,6 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	}
 	for pending != nil {
 		res := <-pending
-		if res.err != nil {
-			return abort(res.err)
-		}
 		if i < len(leafCids) { // start the NEXT window fetching before writing this one (overlap fetch + disk write)
 			b := nextWindow(i)
 			pending = startFetch(b)
@@ -355,7 +353,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			pending = nil
 		}
 		if isCancelled(cidStr) {
-			return abort(errors.New("cancelled"))
+			return abort(errors.New("cancelled")) // session channel closed early on cancel → got is partial
 		}
 		for _, lc := range res.batch {
 			data, ok := res.got[lc]
