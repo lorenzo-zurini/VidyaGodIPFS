@@ -80,7 +80,16 @@ func (n *node) goOnline() error {
 
 	// Online bitswap, using the DHT to find providers; swap the DAG service over to it.
 	bsn := bsnet.NewFromIpfsHost(h)
-	bswap := bitswap.New(n.ctx, bsn, kad, n.fstore)
+	// Throughput tuning. Defaults are tuned for many-small-peers swarms and badly under-serve a single fast peer on a
+	// latent link (we measured ~2.9 MB/s of a 9.6 MB/s, ~40 ms-RTT link — block-serial, ~2 RTT/block). Let one peer
+	// keep far more bytes in flight + pack bigger messages so transfers pipeline to link speed instead of RTT-bound.
+	bswap := bitswap.New(n.ctx, bsn, kad, n.fstore,
+		bitswap.MaxOutstandingBytesPerPeer(16<<20), // serve up to 16 MiB in flight to one peer (default ~1 MiB)
+		bitswap.WithTargetMessageSize(1<<20),       // pack up to ~1 MiB per bitswap message (fewer round-trips)
+		bitswap.EngineBlockstoreWorkerCount(256),   // more workers reading blocks from the filestore to serve
+		bitswap.EngineTaskWorkerCount(16),
+		bitswap.TaskWorkerCount(16),
+	)
 
 	n.host = h
 	n.dht = kad
