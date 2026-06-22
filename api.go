@@ -138,6 +138,22 @@ func VgDropRef(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+//export VgDropCached
+func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	n.dropClosure(c)      // delete the partial's cached blocks (offline walk; absent leaves skipped)
+	n.scheduleCompaction() // reclaim the tombstone disk
+	return 0
+}
+
 //export VgCidMissing
 func VgCidMissing(cidStr *C.char) C.int {
 	n := get()

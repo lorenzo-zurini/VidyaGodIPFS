@@ -319,24 +319,38 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	return n.pinner.Flush(n.ctx)
 }
 
-// dropClosure removes a CID's entire block closure from the plain blockstore (used to clear bitswap's cached copy
-// before re-adding as filestore references). Reads each node's links before deleting it. Raw leaves have no links.
+// dropClosure removes a CID's block closure from the plain blockstore — used both to clear bitswap's cached copy
+// before re-adding as filestore references (successful fetch), and to PURGE a cancelled download's partial cached
+// blocks. Walks via the OFFLINE DAG service so absent leaves (a partial download) are skipped, never fetched over the
+// network, and batches the deletes into one datastore commit (a large partial is thousands of blocks). Only touches
+// the plain blockstore — a completed download's leaves are filestore references, so those are unaffected.
 func (n *node) dropClosure(root cid.Cid) {
-	main := n.fstore.MainBlockstore()
 	seen := cid.NewSet()
+	var cids []cid.Cid
 	var walk func(c cid.Cid)
 	walk = func(c cid.Cid) {
 		if !seen.Visit(c) {
 			return
 		}
-		if nd, err := n.dserv.Get(n.ctx, c); err == nil {
+		if nd, err := n.localDserv.Get(n.ctx, c); err == nil { // only present (cached) nodes are readable offline
 			for _, l := range nd.Links() {
 				walk(l.Cid)
 			}
 		}
-		_ = main.DeleteBlock(n.ctx, c)
+		cids = append(cids, c)
 	}
 	walk(root)
+	if batch, err := n.ds.Batch(n.ctx); err == nil {
+		for _, c := range cids {
+			_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(dshelp.MultihashToDsKey(c.Hash())))
+		}
+		_ = batch.Commit(n.ctx)
+	} else {
+		main := n.fstore.MainBlockstore()
+		for _, c := range cids {
+			_ = main.DeleteBlock(n.ctx, c)
+		}
+	}
 }
 
 // dropRef removes a CID's entire closure from the FILESTORE (the FileManager references AND any plain blockstore
