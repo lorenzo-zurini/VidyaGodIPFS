@@ -35,7 +35,7 @@ results/errors back through `char**` out-params allocated with C and freed via `
 go build -buildmode=c-shared -o libvgipfs.so .
 ```
 
-Built automatically by VidyaGod's CMake (`external/VidyaGodIPFS` submodule) into the build root next to the
+Built automatically by VidyaGod's CMake (`VidyaGodIPFS` submodule) into the build root next to the
 `VidyaGod` binary.
 
 ## Status
