@@ -149,7 +149,8 @@ func (n *node) goOnline() error {
 	if hc, herr := routinghttp.New("https://delegated-ipfs.dev"); herr == nil {
 		finder = combinedFinder{routers: []routing.ContentDiscovery{kad, routinghttpcr.NewContentRoutingClient(hc)}}
 	}
-	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore)
+	n.upSeen = make(map[string]int64)
+	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore, bitswap.WithTracer(upTracer{n})) // per-CID upload tracking
 
 	n.host = h
 	n.dht = kad
@@ -191,6 +192,7 @@ func (n *node) goOnline() error {
 
 	n.online = true
 	go n.bootstrap()
+	go n.refreshPinnedSet(n.ctx) // keep the pinned-root set warm for the upload tracer
 	return nil
 }
 

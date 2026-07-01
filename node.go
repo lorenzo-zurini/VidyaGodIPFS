@@ -58,6 +58,13 @@ type node struct {
 	provider provider.System
 	mdns     interface{ Close() error } // local-network discovery service (mDNS)
 	bwc      *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
+
+	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can
+	// flag which seeded items are being uploaded right now. pinnedSet is refreshed periodically so the hot MessageSent
+	// path is a cheap in-memory lookup (no datastore hit per block).
+	upMu      sync.Mutex
+	upSeen    map[string]int64 // pinned-root CID → last-served unix-ms
+	pinnedSet atomic.Value     // holds map[string]struct{} of pinned root CIDs
 }
 
 var (

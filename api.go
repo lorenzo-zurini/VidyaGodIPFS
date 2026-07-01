@@ -306,6 +306,19 @@ func VgBandwidthRates(inBps *C.double, outBps *C.double) {
 	}
 }
 
+//export VgActiveUploads
+// JSON array of pinned-root CIDs served to a peer within the last windowMs (the items currently being uploaded).
+func VgActiveUploads(windowMs C.int, outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(outJson, "[]")
+		return 0
+	}
+	b, _ := json.Marshal(n.activeUploads(int64(windowMs)))
+	setStr(outJson, string(b))
+	return 0
+}
+
 // ---- fetch + cancellation + transfer callback ----
 
 // transferCb holds the registered C callback; fetch progress/lifecycle is reported through it.
