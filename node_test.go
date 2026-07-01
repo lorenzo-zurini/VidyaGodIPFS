@@ -11,7 +11,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	chunker "github.com/ipfs/boxo/chunker"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	balanced "github.com/ipfs/boxo/ipld/unixfs/importer/balanced"
+	uih "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	ipld "github.com/ipfs/go-ipld-format"
 )
 
 // offlineNode opens a fresh purely-local node in a temp repo and registers teardown.
@@ -327,5 +332,85 @@ func TestStartedOfflineNotOnline(t *testing.T) {
 	}
 	if n.online {
 		t.Error("VIDYAGOD_IPFS_OFFLINE node should not be online")
+	}
+}
+
+// fileNodeFromBytes builds a UnixFS file DAG from bytes (added to n.dserv) and returns its root node.
+func fileNodeFromBytes(t *testing.T, n *node, b []byte) ipld.Node {
+	t.Helper()
+	spl := chunker.NewSizeSplitter(bytes.NewReader(b), chunkSize)
+	dbp := uih.DagBuilderParams{
+		Maxlinks:   uih.DefaultLinksPerBlock,
+		RawLeaves:  true,
+		CidBuilder: merkledag.V0CidPrefix(),
+		Dagserv:    n.dserv,
+	}
+	db, err := dbp.New(spl)
+	if err != nil {
+		t.Fatalf("dag builder: %v", err)
+	}
+	root, err := balanced.Layout(db)
+	if err != nil {
+		t.Fatalf("layout: %v", err)
+	}
+	return root
+}
+
+// TestFetchDirToPath: build a UnixFS directory (two files + a nested subdir with a file), fetch its CID recursively,
+// and assert the whole tree materializes to disk with matching contents — the "add a package folder by CID" path.
+func TestFetchDirToPath(t *testing.T) {
+	n := offlineNode(t)
+
+	// nested/ subdir with one file
+	sub, err := ufsio.NewDirectory(n.dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.AddChild(n.ctx, "inner.json", fileNodeFromBytes(t, n, []byte(`{"NODE_ID":"inner"}`))); err != nil {
+		t.Fatal(err)
+	}
+	subNode, err := sub.GetNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.dserv.Add(n.ctx, subNode); err != nil {
+		t.Fatal(err)
+	}
+
+	// root dir: two files + the subdir
+	dir, err := ufsio.NewDirectory(n.dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.AddChild(n.ctx, "pkg.json", fileNodeFromBytes(t, n, []byte(`{"NODE_ID":"pkg"}`))); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.AddChild(n.ctx, "cover.png", fileNodeFromBytes(t, n, sampleBytes())); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.AddChild(n.ctx, "nested", subNode); err != nil {
+		t.Fatal(err)
+	}
+	dirNode, err := dir.GetNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.dserv.Add(n.ctx, dirNode); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out")
+	if err := n.fetchDirToPath(dirNode.Cid().String(), dest); err != nil {
+		t.Fatalf("fetchDirToPath: %v", err)
+	}
+
+	if got, _ := os.ReadFile(filepath.Join(dest, "pkg.json")); string(got) != `{"NODE_ID":"pkg"}` {
+		t.Errorf("pkg.json = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "nested", "inner.json")); string(got) != `{"NODE_ID":"inner"}` {
+		t.Errorf("nested/inner.json = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "cover.png")); !bytes.Equal(got, sampleBytes()) {
+		t.Errorf("cover.png bytes mismatch (%d)", len(got))
 	}
 }

@@ -335,6 +335,26 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+//export VgFetchDirToPath
+// Recursively materialize a UnixFS DIRECTORY CID (a folder of dehydrated packages) to dest. Fetches the small manifest
+// tree only — no per-layer content hydration. Requires the node's network stack to be up (blocks arrive via bitswap).
+func VgFetchDirToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	if VgOnline() == 0 {
+		setStr(errOut, "IPFS networking is offline — enable it to fetch a package CID")
+		return -1
+	}
+	if err := n.fetchDirToPath(C.GoString(cidStr), C.GoString(dest)); err != nil {
+		setStr(errOut, err.Error())
+		return -1
+	}
+	return 0
+}
+
 //export VgRequestCancel
 func VgRequestCancel(cidStr *C.char) { requestCancel(C.GoString(cidStr)) }
 

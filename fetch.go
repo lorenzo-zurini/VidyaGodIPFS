@@ -21,8 +21,10 @@ import (
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	files "github.com/ipfs/boxo/files"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
+	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -103,6 +105,43 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 		}
 	}
 	return err
+}
+
+// fetchDirToPath materializes a UnixFS DIRECTORY CID (a folder of dehydrated packages) recursively to dest, writing the
+// whole tree — files and subdirs — to disk. Missing blocks arrive over the network via bitswap through n.dserv (online).
+// Unlike fetchToPath (a single file, no-dup filestore reference), this is a plain recursive materialize: the fetched
+// tree is intentionally SMALL (node JSON + cover images, no content bytes — the folder is dehydrated), and each
+// package's large per-layer content is hydrated later, on demand, by fetchToPath. Writes to a temp dir then renames
+// into place so a partial/cancelled fetch never leaves a half dir at dest.
+func (n *node) fetchDirToPath(cidStr, dest string) error {
+	c, err := cid.Decode(cidStr)
+	if err != nil {
+		return err
+	}
+	root, err := n.dserv.Get(n.ctx, c)
+	if err != nil {
+		if isMissingFile(err) {
+			return errMissingFiles
+		}
+		return err
+	}
+	fnode, err := unixfile.NewUnixfsFile(n.ctx, n.dserv, root)
+	if err != nil {
+		return err
+	}
+	defer fnode.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	tmp := dest + ".tmp"
+	_ = os.RemoveAll(tmp)
+	if err := files.WriteTo(fnode, tmp); err != nil {
+		_ = os.RemoveAll(tmp)
+		return err
+	}
+	_ = os.RemoveAll(dest)
+	return os.Rename(tmp, dest)
 }
 
 // onProgress is called with 0..100 during the transfer; onFinalize is called once the bytes are all down and the
