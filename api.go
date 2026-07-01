@@ -290,6 +290,22 @@ func VgProviderCount(cidStr *C.char, timeoutMs C.int) C.int {
 	return C.int(n.providerCount(c, int(timeoutMs)))
 }
 
+//export VgBandwidthRates
+// Writes the node's current global receive/send rates (bytes/sec) into *inBps/*outBps. Zero when offline.
+func VgBandwidthRates(inBps *C.double, outBps *C.double) {
+	n := get()
+	if n == nil {
+		return
+	}
+	ri, ro := n.bandwidth()
+	if inBps != nil {
+		*inBps = C.double(ri)
+	}
+	if outBps != nil {
+		*outBps = C.double(ro)
+	}
+}
+
 // ---- fetch + cancellation + transfer callback ----
 
 // transferCb holds the registered C callback; fetch progress/lifecycle is reported through it.

@@ -29,6 +29,7 @@ import (
 	ipld "github.com/ipfs/go-ipld-format"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	host "github.com/libp2p/go-libp2p/core/host"
+	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	goleveldbutil "github.com/syndtr/goleveldb/leveldb/util"
 )
 
@@ -56,6 +57,7 @@ type node struct {
 	exchange exchange.Interface
 	provider provider.System
 	mdns     interface{ Close() error } // local-network discovery service (mDNS)
+	bwc      *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
 }
 
 var (

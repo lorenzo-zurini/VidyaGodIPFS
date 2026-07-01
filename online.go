@@ -23,6 +23,7 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
+	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	host "github.com/libp2p/go-libp2p/core/host"
@@ -101,8 +102,10 @@ func (n *node) goOnline() error {
 	if rmErr != nil {
 		return rmErr
 	}
+	bwc := metrics.NewBandwidthCounter() // global up/down byte counters + rolling rates for every stream
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
+		libp2p.BandwidthReporter(bwc),
 		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
 		// WebSocket, WebTransport). More transports = more usable providers when content has many hosts.
 		libp2p.ListenAddrStrings(
@@ -151,6 +154,7 @@ func (n *node) goOnline() error {
 	n.host = h
 	n.dht = kad
 	n.exchange = bswap
+	n.bwc = bwc
 	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
@@ -272,6 +276,16 @@ func (n *node) peerCount() int {
 		return 0
 	}
 	return len(n.host.Network().Peers())
+}
+
+// bandwidth returns the current global receive/send rates in bytes per second (0,0 when offline). Backed by the
+// libp2p BandwidthReporter — a rolling rate over all streams, i.e. the whole node's aggregate down/up throughput.
+func (n *node) bandwidth() (rateIn float64, rateOut float64) {
+	if n.bwc == nil {
+		return 0, 0
+	}
+	s := n.bwc.GetBandwidthTotals()
+	return s.RateIn, s.RateOut
 }
 
 // providerCount counts distinct peers announcing a CID via the DHT, bounded by timeoutMs. -1 if offline.
