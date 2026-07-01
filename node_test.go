@@ -45,6 +45,9 @@ func sampleBytes() []byte {
 
 func writeFile(t *testing.T, path string, b []byte) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -114,10 +117,32 @@ func TestAddNoCopyNoDuplication(t *testing.T) {
 	}
 }
 
-func TestAddNoCopyDirectoryRejected(t *testing.T) {
+// Adding a DIRECTORY recursively references its files and returns a folder CID; fetching that CID back materializes the
+// same tree — the publish/add-by-CID round trip for a folder of (dehydrated) packages.
+func TestAddDirNoCopyRoundTrip(t *testing.T) {
 	n := offlineNode(t)
-	if _, err := n.addNoCopy(t.TempDir()); err == nil {
-		t.Error("expected directory add to be rejected (M1: files only)")
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "pkgA", "a.json"), []byte(`{"NODE_ID":"a"}`))
+	writeFile(t, filepath.Join(src, "pkgA", "cover.png"), sampleBytes())
+	writeFile(t, filepath.Join(src, "pkgB", "nested", "b.json"), []byte(`{"NODE_ID":"b"}`))
+
+	c, err := n.addDirNoCopy(src)
+	if err != nil {
+		t.Fatalf("addDirNoCopy: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out")
+	if err := n.fetchDirToPath(c.String(), dest); err != nil {
+		t.Fatalf("fetchDirToPath: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "pkgA", "a.json")); string(got) != `{"NODE_ID":"a"}` {
+		t.Errorf("pkgA/a.json = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "pkgB", "nested", "b.json")); string(got) != `{"NODE_ID":"b"}` {
+		t.Errorf("pkgB/nested/b.json = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "pkgA", "cover.png")); !bytes.Equal(got, sampleBytes()) {
+		t.Errorf("pkgA/cover.png bytes mismatch (%d)", len(got))
 	}
 }
 
