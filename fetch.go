@@ -141,7 +141,15 @@ func (n *node) fetchDirToPath(cidStr, dest string) error {
 		return err
 	}
 	_ = os.RemoveAll(dest)
-	return os.Rename(tmp, dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		return err
+	}
+	// Pin the folder root recursively so the fetched source tree is SEEDED (reprovided to the DHT) and shows in VgPinLs
+	// — mirrors addDirNoCopy. Best-effort: the files are already on disk, so a pin hiccup must not fail the fetch.
+	if err := n.pinner.Pin(n.ctx, root, true, dest); err == nil {
+		_ = n.pinner.Flush(n.ctx)
+	}
+	return nil
 }
 
 // onProgress is called with 0..100 during the transfer; onFinalize is called once the bytes are all down and the

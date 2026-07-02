@@ -438,4 +438,18 @@ func TestFetchDirToPath(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(dest, "cover.png")); !bytes.Equal(got, sampleBytes()) {
 		t.Errorf("cover.png bytes mismatch (%d)", len(got))
 	}
+
+	// The fetched folder root must be recursively PINNED so the source tree is seeded/reprovided (shows in VgPinLs).
+	pinned := false
+	for sp := range n.pinner.RecursiveKeys(n.ctx, false) {
+		if sp.Err != nil {
+			t.Fatal(sp.Err)
+		}
+		if sp.Pin.Key == dirNode.Cid() {
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Errorf("fetched dir root %s is not recursively pinned", dirNode.Cid())
+	}
 }
