@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -146,8 +147,10 @@ func (n *node) fetchDirToPath(cidStr, dest string) error {
 	}
 	// Pin the folder root recursively so the fetched source tree is SEEDED (reprovided to the DHT) and shows in VgPinLs
 	// — mirrors addDirNoCopy. Best-effort: the files are already on disk, so a pin hiccup must not fail the fetch.
-	if err := n.pinner.Pin(n.ctx, root, true, dest); err == nil {
-		_ = n.pinner.Flush(n.ctx)
+	if err := n.pinner.Pin(n.ctx, root, true, dest); err != nil {
+		fmt.Fprintf(os.Stderr, "[fetchDir] pin %s failed: %v\n", cidStr, err)
+	} else if err := n.pinner.Flush(n.ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[fetchDir] pin flush %s failed: %v\n", cidStr, err)
 	}
 	return nil
 }

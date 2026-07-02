@@ -3,6 +3,7 @@ package main
 // query.go — read-only status helpers backing the IPFS tab columns.
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -45,6 +46,7 @@ func (n *node) pinLs() ([]cid.Cid, error) {
 	var out []cid.Cid
 	for sp := range n.pinner.RecursiveKeys(n.ctx, false) {
 		if sp.Err != nil {
+			fmt.Fprintf(os.Stderr, "[pinLs] RecursiveKeys err: %v\n", sp.Err)
 			return out, sp.Err
 		}
 		out = append(out, sp.Pin.Key)
