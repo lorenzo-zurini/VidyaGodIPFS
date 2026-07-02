@@ -377,10 +377,29 @@ func VgFetchDirToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 		setStr(errOut, "IPFS networking is offline — enable it to fetch a package CID")
 		return -1
 	}
-	if err := n.fetchDirToPath(C.GoString(cidStr), C.GoString(dest)); err != nil {
+	cs := C.GoString(cidStr)
+	d := C.GoString(dest)
+
+	// Report the source fetch through the same transfer callback as file fetches, so a pending/stuck/slow source shows
+	// a live row (Fetching… → Stalled → Pinning… → seeded) in the IPFS tab instead of being silently invisible.
+	ccid := C.CString(cs)
+	defer C.free(unsafe.Pointer(ccid))
+	emit := func(kind int, pct float64, ok int, errc *C.char) {
+		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
+	}
+
+	emit(kindStarted, -1, 0, nil)
+	err := n.fetchDirToPath(cs, d,
+		func(pct float64) { emit(kindProgress, pct, 0, nil) },
+		func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
+	if err != nil {
+		ec := C.CString(err.Error())
+		defer C.free(unsafe.Pointer(ec))
+		emit(kindFinished, -1, 0, ec)
 		setStr(errOut, err.Error())
 		return -1
 	}
+	emit(kindFinished, 100, 1, nil)
 	return 0
 }
 

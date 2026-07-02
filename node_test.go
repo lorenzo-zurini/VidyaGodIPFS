@@ -132,7 +132,7 @@ func TestAddDirNoCopyRoundTrip(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "out")
-	if err := n.fetchDirToPath(c.String(), dest); err != nil {
+	if err := n.fetchDirToPath(c.String(), dest, nil, nil); err != nil {
 		t.Fatalf("fetchDirToPath: %v", err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(dest, "pkgA", "a.json")); string(got) != `{"NODE_ID":"a"}` {
@@ -425,7 +425,7 @@ func TestFetchDirToPath(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "out")
-	if err := n.fetchDirToPath(dirNode.Cid().String(), dest); err != nil {
+	if err := n.fetchDirToPath(dirNode.Cid().String(), dest, nil, nil); err != nil {
 		t.Fatalf("fetchDirToPath: %v", err)
 	}
 

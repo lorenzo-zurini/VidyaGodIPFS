@@ -114,12 +114,14 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 // tree is intentionally SMALL (node JSON + cover images, no content bytes — the folder is dehydrated), and each
 // package's large per-layer content is hydrated later, on demand, by fetchToPath. Writes to a temp dir then renames
 // into place so a partial/cancelled fetch never leaves a half dir at dest.
-func (n *node) fetchDirToPath(cidStr, dest string) error {
+// onProgress is called with 0..100 while the tree streams in (indeterminate until the first tick); onFinalize(-1) fires
+// once the bytes are down and the pin/reference step runs. Both may be nil (e.g. the offline test path).
+func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	c, err := cid.Decode(cidStr)
 	if err != nil {
 		return err
 	}
-	root, err := n.dserv.Get(n.ctx, c)
+	root, err := n.dserv.Get(n.ctx, c) // blocks here until the root block arrives — where a no-reachable-provider fetch hangs
 	if err != nil {
 		if isMissingFile(err) {
 			return errMissingFiles
@@ -137,9 +139,36 @@ func (n *node) fetchDirToPath(cidStr, dest string) error {
 	}
 	tmp := dest + ".tmp"
 	_ = os.RemoveAll(tmp)
-	if err := files.WriteTo(fnode, tmp); err != nil {
+
+	// Report download progress by polling bytes-on-disk vs the folder's cumulative size while WriteTo streams the tree.
+	var total int64
+	if sz, serr := fnode.Size(); serr == nil {
+		total = sz
+	}
+	stop := make(chan struct{})
+	if onProgress != nil && total > 0 {
+		go func() {
+			t := time.NewTicker(250 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					pct := 100.0 * float64(dirSize(tmp)) / float64(total)
+					if pct > 99 {
+						pct = 99 // leave the last 1% for the pin/finalize step
+					}
+					onProgress(pct)
+				}
+			}
+		}()
+	}
+	werr := files.WriteTo(fnode, tmp)
+	close(stop)
+	if werr != nil {
 		_ = os.RemoveAll(tmp)
-		return err
+		return werr
 	}
 	_ = os.RemoveAll(dest)
 	if err := os.Rename(tmp, dest); err != nil {
@@ -147,6 +176,9 @@ func (n *node) fetchDirToPath(cidStr, dest string) error {
 	}
 	// Pin the folder root recursively so the fetched source tree is SEEDED (reprovided to the DHT) and shows in VgPinLs
 	// — mirrors addDirNoCopy. Best-effort: the files are already on disk, so a pin hiccup must not fail the fetch.
+	if onFinalize != nil {
+		onFinalize(-1)
+	}
 	if err := n.pinner.Pin(n.ctx, root, true, dest); err != nil {
 		fmt.Fprintf(os.Stderr, "[fetchDir] pin %s failed: %v\n", cidStr, err)
 	} else if err := n.pinner.Flush(n.ctx); err != nil {
