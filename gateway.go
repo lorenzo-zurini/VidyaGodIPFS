@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	cid "github.com/ipfs/go-cid"
@@ -26,7 +27,7 @@ var trustlessGateways = []string{
 	"https://dweb.link",
 }
 
-// countingReader reports bytes read as they stream past, for download progress.
+// countingReader reports bytes read as they stream past — for download progress AND stall detection.
 type countingReader struct {
 	r      io.Reader
 	onRead func(n int)
@@ -43,7 +44,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // fetchViaGateway pulls a CID's whole DAG as a verified CAR over HTTPS from the first working trustless gateway and
 // stores the blocks locally. onProgress (0..99) tracks the CAR download. Returns nil once a gateway delivers the DAG.
 func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, onProgress func(pct float64)) error {
-	hc := dohHTTPClient(newDoHResolver()) // DoH-resolving client: works through DNS filters, keeps Host/SNI = hostname
+	hc := dohStreamingClient(newDoHResolver()) // DoH-resolving, NO whole-request timeout (large CARs stream for minutes)
 	var lastErr error
 	for _, gw := range trustlessGateways {
 		if err := n.fetchCarFromGateway(ctx, hc, gw, root, onProgress); err != nil {
@@ -61,7 +62,9 @@ func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, onProgress fun
 }
 
 func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw string, root cid.Cid, onProgress func(pct float64)) error {
-	gctx, cancel := context.WithTimeout(ctx, 30*time.Minute) // big files stream a big CAR; the reader enforces progress
+	// No fixed duration cap — a big CAR streams for minutes. Bound it by a STALL watchdog (abort only if bytes stop),
+	// like the bitswap fetcher, so a slow-but-progressing large download keeps going instead of dying at a deadline.
+	gctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	url := gw + "/ipfs/" + root.String() + "?format=car&dag-scope=all&car-order=dfs"
 	req, err := http.NewRequestWithContext(gctx, http.MethodGet, url, nil)
@@ -79,15 +82,35 @@ func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw stri
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
-	var body io.Reader = resp.Body
-	if onProgress != nil && resp.ContentLength > 0 {
-		total := resp.ContentLength
-		var read int64
-		body = &countingReader{r: resp.Body, onRead: func(nr int) {
+	// Stall watchdog: tear the transfer down if no bytes arrive for stallTimeout (a dead/hung gateway), so we move on
+	// to the next one instead of hanging. Reset on every read.
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > stallTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	total := resp.ContentLength
+	var read int64
+	body := &countingReader{r: resp.Body, onRead: func(nr int) {
+		lastRead.Store(time.Now().UnixNano())
+		if onProgress != nil && total > 0 {
 			read += int64(nr)
 			onProgress(math.Min(99, 100.0*float64(read)/float64(total)))
-		}}
-	}
+		}
+	}}
 
 	br, err := car.NewBlockReader(body)
 	if err != nil {

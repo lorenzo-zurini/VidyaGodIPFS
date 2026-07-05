@@ -107,30 +107,47 @@ func dohMultiaddrResolver() (*madns.Resolver, error) {
 // routing indexer (delegated-ipfs.dev) so provider discovery works on a DNS-filtered network too. TLS still uses the
 // original hostname for SNI/verification (http.Transport sets it from the request), so dialing the resolved IP is safe.
 func dohHTTPClient(d *dohResolver) *http.Client {
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	return &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			ForceAttemptHTTP2: true,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil || net.ParseIP(host) != nil {
-					return dialer.DialContext(ctx, network, addr) // already an IP (or unparseable) → dial as-is
+		Timeout:   60 * time.Second, // whole-request cap — fine for small routing responses, NOT for large downloads
+		Transport: dohTransport(d),
+	}
+}
+
+// dohStreamingClient is like dohHTTPClient but with NO overall request timeout — for streaming large downloads (a
+// gateway CAR of a big file takes minutes). A whole-request Timeout would abort mid-download ("context deadline
+// exceeded"). Instead the caller bounds it with the request context + a stall watchdog on the body; the transport's
+// ResponseHeaderTimeout still catches a gateway that never starts responding.
+func dohStreamingClient(d *dohResolver) *http.Client {
+	t := dohTransport(d)
+	t.ResponseHeaderTimeout = 45 * time.Second
+	t.IdleConnTimeout = 90 * time.Second
+	return &http.Client{Transport: t} // Timeout: 0 — no whole-request cap; the context + stall watchdog bound it
+}
+
+// dohTransport builds an http.Transport whose connections resolve hostnames via DoH before dialing (TLS SNI/Host stay
+// the hostname, so it works through DNS filters AND behind Cloudflare).
+func dohTransport(d *dohResolver) *http.Transport {
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	return &http.Transport{
+		ForceAttemptHTTP2: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil || net.ParseIP(host) != nil {
+				return dialer.DialContext(ctx, network, addr) // already an IP (or unparseable) → dial as-is
+			}
+			ips, err := d.LookupIPAddr(ctx, host)
+			if err != nil || len(ips) == 0 {
+				return dialer.DialContext(ctx, network, addr)
+			}
+			var lastErr error
+			for _, ip := range ips {
+				if conn, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port)); e == nil {
+					return conn, nil
+				} else {
+					lastErr = e
 				}
-				ips, err := d.LookupIPAddr(ctx, host)
-				if err != nil || len(ips) == 0 {
-					return dialer.DialContext(ctx, network, addr)
-				}
-				var lastErr error
-				for _, ip := range ips {
-					if conn, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port)); e == nil {
-						return conn, nil
-					} else {
-						lastErr = e
-					}
-				}
-				return nil, lastErr
-			},
+			}
+			return nil, lastErr
 		},
 	}
 }
