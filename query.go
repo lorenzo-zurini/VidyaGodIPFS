@@ -3,10 +3,12 @@ package main
 // query.go — read-only status helpers backing the IPFS tab columns.
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	filestore "github.com/ipfs/boxo/filestore"
 	cid "github.com/ipfs/go-cid"
@@ -28,17 +30,21 @@ func dirSize(root string) int64 {
 	return total
 }
 
-// cidSize returns the CumulativeSize of a CID's DAG (dag-pb root.Size() == cumulative size), -1 on error.
+// cidSize returns the CumulativeSize of a CID's DAG (dag-pb root.Size() == cumulative size), -1 on error. Bounded so a
+// no-provider fetch can't hang; on a hostile network where libp2p can't get the root, it falls back to an HTTPS gateway
+// HEAD so the UI still shows a size + speed for gateway-served downloads.
 func (n *node) cidSize(c cid.Cid) int64 {
-	nd, err := n.dserv.Get(n.ctx, c)
-	if err != nil {
-		return -1
+	getCtx, cancel := context.WithTimeout(n.ctx, 15*time.Second)
+	nd, err := n.dserv.Get(getCtx, c)
+	cancel()
+	if err == nil {
+		if sz, serr := nd.Size(); serr == nil {
+			return int64(sz)
+		}
 	}
-	sz, err := nd.Size()
-	if err != nil {
-		return -1
-	}
-	return int64(sz)
+	sctx, scancel := context.WithTimeout(n.ctx, 20*time.Second)
+	defer scancel()
+	return n.gatewaySize(sctx, c)
 }
 
 // pinLs returns the recursively-pinned (seeded) CIDs (drains the streaming pinner API).

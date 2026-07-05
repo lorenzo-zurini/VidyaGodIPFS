@@ -41,6 +41,38 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// headSize returns a URL's Content-Length via a bounded HEAD, or -1 if unknown.
+func headSize(ctx context.Context, hc *http.Client, url string) int64 {
+	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(hctx, http.MethodHead, url, nil)
+	if err != nil {
+		return -1
+	}
+	req.Header.Set("User-Agent", "vidyagod")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return -1
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK && resp.ContentLength > 0 {
+		return resp.ContentLength
+	}
+	return -1
+}
+
+// gatewaySize asks the trustless gateways for a CID's file size over HTTPS (HEAD → Content-Length). Used as cidSize's
+// fallback so the UI can show a size/speed even on a network where the DHT can't fetch the root block.
+func (n *node) gatewaySize(ctx context.Context, root cid.Cid) int64 {
+	hc := dohHTTPClient(newDoHResolver())
+	for _, gw := range trustlessGateways {
+		if sz := headSize(ctx, hc, gw+"/ipfs/"+root.String()); sz > 0 {
+			return sz
+		}
+	}
+	return -1
+}
+
 // fetchViaGateway pulls a CID's whole DAG as a verified CAR over HTTPS from the first working trustless gateway and
 // stores the blocks locally. onProgress (0..99) tracks the CAR download. Returns nil once a gateway delivers the DAG.
 func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, onProgress func(pct float64)) error {
@@ -102,12 +134,17 @@ func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw stri
 		}
 	}()
 
+	// The CAR stream carries no Content-Length (chunked), so probe the file size with a HEAD for a real progress bar.
+	// The CAR is a touch larger than the file (block framing) so cap the ratio at 99; the finalize step lands it at 100.
 	total := resp.ContentLength
+	if total <= 0 {
+		total = headSize(gctx, hc, gw+"/ipfs/"+root.String())
+	}
 	var read int64
 	body := &countingReader{r: resp.Body, onRead: func(nr int) {
 		lastRead.Store(time.Now().UnixNano())
+		read += int64(nr)
 		if onProgress != nil && total > 0 {
-			read += int64(nr)
 			onProgress(math.Min(99, 100.0*float64(read)/float64(total)))
 		}
 	}}
