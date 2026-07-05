@@ -37,13 +37,23 @@ import (
 var errNotRawLeaves = errors.New("not all-raw-leaves")
 
 // dbgFetch enables verbose stderr tracing of the fetch path when VG_FETCH_DEBUG is set — used to diagnose why a
-// specific CID takes the slow fallback / errors. No-op in normal operation.
+// specific CID takes the slow fallback / errors. No-op in normal operation. Every line is wall-clock timestamped
+// (HH:MM:SS.mmm) so a "stuck for a minute" gap is visible directly in the log.
 var dbgFetch = os.Getenv("VG_FETCH_DEBUG") != ""
 
 func fdbg(format string, a ...interface{}) {
 	if dbgFetch {
-		fmt.Fprintf(os.Stderr, "[fetchdbg] "+format+"\n", a...)
+		fmt.Fprintf(os.Stderr, "[fetchdbg %s] "+format+"\n", append([]interface{}{time.Now().Format("15:04:05.000")}, a...)...)
 	}
+}
+
+// shortCid trims a CID for readable logs (first 6 + last 4 of the base58/base32 string).
+func shortCid(c cid.Cid) string {
+	s := c.String()
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + ".." + s[len(s)-4:]
 }
 
 // stallTimeout: if no block arrives for this long the fetch session is torn down so the wrapper can back off and RESUME
@@ -115,15 +125,20 @@ func isCancelled(c string) bool {
 func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	backoff := 2 * time.Second
 	missTries := 0
-	for {
+	fdbg("fetchToPath ENTER cid=%s dest=%s", cidStr, dest)
+	for attempt := 1; ; attempt++ {
 		if isCancelled(cidStr) {
+			fdbg("fetchToPath cancelled before attempt %d cid=%s", attempt, cidStr)
 			removePartial(dest)
 			return errors.New("cancelled")
 		}
 		start := time.Now()
+		fdbg("fetchToPath attempt %d START cid=%s", attempt, cidStr)
 		err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+		fdbg("fetchToPath attempt %d DONE cid=%s err=%v elapsed=%s", attempt, cidStr, err, time.Since(start).Round(time.Millisecond))
 		switch {
 		case err == nil:
+			fdbg("fetchToPath SUCCESS cid=%s after %d attempt(s)", cidStr, attempt)
 			return nil
 		case err == errIncomplete:
 			if time.Since(start) > 5*time.Second { // the attempt fetched for a while before stalling → reset backoff
@@ -131,6 +146,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 			} else if backoff < 30*time.Second {
 				backoff *= 2
 			}
+			fdbg("fetchToPath incomplete → backoff %s then resume cid=%s", backoff, cidStr)
 			select {
 			case <-time.After(backoff):
 			case <-n.ctx.Done():
@@ -138,6 +154,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 			}
 		case err == errMissingFiles:
 			missTries++
+			fdbg("fetchToPath missingFiles (try %d) → dropRef + refetch cid=%s", missTries, cidStr)
 			if missTries > 2 { // shouldn't recur after dropRef; guard against a spin
 				return err
 			}
@@ -240,26 +257,32 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(dest); err == nil {
+	if st, err := os.Stat(dest); err == nil {
+		fdbg("fetchToPathOnce: dest already present (%d bytes) → no-op cid=%s", st.Size(), cidStr)
 		return nil // already present — no-op (matches the old FetchToPath semantics)
 	}
 	// Orphaned reference: the node "has" this CID via a filestore reference, but the backing file was deleted.
 	// Surface it cleanly as "missing files" (→ "Errored: missing files" in the UI) instead of reading the gone
 	// file. (cidMissing is local-only; for content we don't have it returns false, so normal fetches proceed.)
 	if n.cidMissing(c) {
+		fdbg("fetchToPathOnce: cidMissing=true (orphaned local ref) → errMissingFiles cid=%s", cidStr)
 		return errMissingFiles
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
 
+	fdbg("fetchToPathOnce: fetching root block cid=%s", cidStr)
+	getStart := time.Now()
 	root, err := n.dserv.Get(n.ctx, c)
 	if err != nil {
+		fdbg("fetchToPathOnce: root Get FAILED cid=%s err=%v (isMissingFile=%v)", cidStr, err, isMissingFile(err))
 		if isMissingFile(err) {
 			return errMissingFiles // node has a filestore ref but the backing file is gone
 		}
 		return err
 	}
+	fdbg("fetchToPathOnce: got root block codec=%d in %s cid=%s", root.Cid().Prefix().Codec, time.Since(getStart).Round(time.Millisecond), cidStr)
 
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
@@ -284,6 +307,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 		return err
 	}
 	total := int64(rdr.Size())
+	fdbg("fallback: DagReader size=%d cid=%s — reading whole DAG over the network", total, cidStr)
 
 	tmp := dest + ".tmp"
 	_ = os.RemoveAll(tmp)
@@ -294,6 +318,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 
 	buf := make([]byte, 1<<20)
 	var written int64
+	nextMark := int64(10)
 	for {
 		if isCancelled(cidStr) {
 			_ = out.Close()
@@ -309,7 +334,12 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 			}
 			written += int64(nr)
 			if total > 0 && onProgress != nil {
-				onProgress(100.0 * float64(written) / float64(total))
+				pct := 100.0 * float64(written) / float64(total)
+				onProgress(pct)
+				if int64(pct) >= nextMark { // log every ~10% so a stall inside the read is visible
+					fdbg("fallback: read %d%% (%d/%d) cid=%s", int64(pct), written, total, cidStr)
+					nextMark = int64(pct) + 10
+				}
 			}
 		}
 		if rerr == io.EOF {
@@ -318,6 +348,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 		if rerr != nil {
 			_ = out.Close()
 			_ = os.Remove(tmp)
+			fdbg("fallback: read error cid=%s err=%v (isMissingFile=%v)", cidStr, rerr, isMissingFile(rerr))
 			if isMissingFile(rerr) {
 				return errMissingFiles
 			}
@@ -327,6 +358,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	if err := out.Close(); err != nil {
 		return err
 	}
+	fdbg("fallback: read complete (%d bytes) → rename + addNoCopy re-hash cid=%s", written, cidStr)
 
 	// Publish atomically, then seed from the destination by reference (filestore) so dest IS the seed source.
 	_ = os.RemoveAll(dest)
@@ -343,10 +375,14 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	if onFinalize != nil {
 		onFinalize(-1)
 	}
+	fdbg("fallback: dropClosure + addNoCopy re-hash START cid=%s", cidStr)
+	addStart := time.Now()
 	n.dropClosure(c)
 	if _, err := n.addNoCopy(dest); err != nil {
+		fdbg("fallback: addNoCopy FAILED cid=%s err=%v", cidStr, err)
 		return err
 	}
+	fdbg("fallback: addNoCopy DONE in %s cid=%s", time.Since(addStart).Round(time.Millisecond), cidStr)
 	n.scheduleCompaction() // reclaim tombstone disk from the dropped bitswap-cached blocks
 	return nil
 }
@@ -358,6 +394,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 // caller then falls back to read + re-add).
 func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr string,
 	onProgress func(pct float64), onFinalize func(pct float64)) error {
+	fdbg("writeThrough ENTER cid=%s dest=%s", cidStr, dest)
 	// File size (for progress + preallocation) — cheap, reads the root's UnixFS metadata.
 	rdr, err := ufsio.NewDagReader(n.ctx, rootNode, n.dserv)
 	if err != nil {
@@ -418,7 +455,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			return serr
 		}
 	}
-	fdbg("enumerated %s: total(unixfs)=%d off(sum-leaf-sizes)=%d leaves=%d uniq=%d", root, total, off, len(leaves), len(uniq))
+	fdbg("enumerated %s: total(unixfs)=%d off(sum-leaf-sizes)=%d leaves=%d uniq=%d match=%v", root, total, off, len(leaves), len(uniq), total == off)
 
 	// Open the partial: RESUME if a matching dest.tmp + dest.part exist, else start fresh (preallocated + empty bitmap).
 	tmp := tmpPath(dest)
@@ -427,6 +464,9 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	if pb, ok := loadPart(dest, root.String(), total, len(leaves)); ok {
 		if f, oerr := os.OpenFile(tmp, os.O_RDWR, 0o644); oerr == nil {
 			out, bits = f, pb // resume where the last attempt left off
+			fdbg("writeThrough RESUME from partial: %d/%d leaves already on disk cid=%s", pb.nset, pb.count, cidStr)
+		} else {
+			fdbg("writeThrough: .part loaded but tmp open FAILED (%v) → starting fresh cid=%s", oerr, cidStr)
 		}
 	}
 	if out == nil {
@@ -465,6 +505,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			}
 		}
 	}
+	fdbg("writeThrough: %d/%d unique leaves still needed (written so far=%d/%d) cid=%s", len(need), len(uniq), written, total, cidStr)
 
 	if len(need) > 0 {
 		// Cancel + STALL watcher: cancel the fetch on user-cancel, OR when no block has arrived for stallTimeout (a dead
@@ -473,6 +514,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		defer fcancel()
 		var lastBlk atomic.Int64
 		lastBlk.Store(time.Now().UnixNano())
+		var stalled atomic.Bool
 		go func() {
 			t := time.NewTicker(200 * time.Millisecond)
 			defer t.Stop()
@@ -481,7 +523,14 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 				case <-fctx.Done():
 					return
 				case <-t.C:
-					if isCancelled(cidStr) || time.Since(time.Unix(0, lastBlk.Load())) > stallTimeout {
+					if isCancelled(cidStr) {
+						fdbg("writeThrough: user-cancel detected → tearing down session cid=%s", cidStr)
+						fcancel()
+						return
+					}
+					if time.Since(time.Unix(0, lastBlk.Load())) > stallTimeout {
+						stalled.Store(true)
+						fdbg("writeThrough: STALL — no block for >%s → tearing down session cid=%s", stallTimeout, cidStr)
 						fcancel()
 						return
 					}
@@ -491,14 +540,19 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 
 		// One long-lived bitswap SESSION for the want-list (keeps peers warm + pipelines to link speed). Blocks arrive
 		// out of order → written straight to their offset(s); the bitmap + a periodically fsync'd sidecar make it resumable.
+		fdbg("writeThrough: opening bitswap session for %d leaves cid=%s", len(need), cidStr)
 		sess := blockservice.NewSession(fctx, n.bserv)
 		lastSave := time.Now()
+		recv := 0
+		sessStart := time.Now()
 		for blk := range sess.GetBlocks(fctx, need) {
 			lastBlk.Store(time.Now().UnixNano())
+			recv++
 			data := blk.RawData()
 			for _, o := range offsets[blk.Cid()] {
 				if _, werr := out.WriteAt(data, o); werr != nil {
 					_ = out.Close()
+					fdbg("writeThrough: WriteAt IO error cid=%s err=%v", cidStr, werr)
 					return werr // IO error — keep the partial for a later retry
 				}
 				written += int64(len(data))
@@ -509,12 +563,16 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			for _, i := range idxOf[blk.Cid()] {
 				bits.set(i)
 			}
+			if recv%256 == 0 { // periodic heartbeat so throughput/stall is visible in the log
+				fdbg("writeThrough: recv %d/%d leaves, written=%d/%d (%.1f%%) cid=%s", recv, len(need), written, total, 100.0*float64(written)/float64(total), cidStr)
+			}
 			if time.Since(lastSave) > 2*time.Second { // durability: fsync the data BEFORE persisting the bitmap
 				_ = out.Sync()
 				_ = savePart(dest, bits)
 				lastSave = time.Now()
 			}
 		}
+		fdbg("writeThrough: session ended cid=%s recv=%d/%d elapsed=%s stalled=%v cancelled=%v allSet=%v", cidStr, recv, len(need), time.Since(sessStart).Round(time.Millisecond), stalled.Load(), isCancelled(cidStr), bits.allSet())
 
 		if isCancelled(cidStr) {
 			_ = out.Close()
@@ -525,11 +583,14 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			_ = out.Sync()
 			_ = savePart(dest, bits)
 			_ = out.Close()
+			fdbg("writeThrough: INCOMPLETE — %d/%d leaves, keeping partial, returning errIncomplete cid=%s", bits.nset, bits.count, cidStr)
 			return errIncomplete
 		}
 	}
 
 	// Complete: flush, publish atomically, reference every leaf into dest, drop the redundant blockstore copies, pin.
+	fdbg("writeThrough: all %d leaves present → FINALIZE START (fsync+rename) cid=%s", len(leaves), cidStr)
+	finStart := time.Now()
 	if err := out.Sync(); err != nil {
 		_ = out.Close()
 		return err
@@ -541,6 +602,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	if err := os.Rename(tmp, dest); err != nil {
 		return err
 	}
+	fdbg("finalize: fsync+rename done in %s cid=%s", time.Since(finStart).Round(time.Millisecond), cidStr)
 
 	// Reference each leaf into dest, then drop its plain blockstore copy — TWO batched datastore commits (one for refs,
 	// one for blockstore deletes) so a large file's thousands of leaves finalize in ~a couple of commits (near-instant).
@@ -559,9 +621,10 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: dest, Stat: st},
 		})
 	}
-	fdbg("finalize %s: dest size=%d, referencing %d leaves", root, st.Size(), len(fsns))
+	fdbg("finalize %s: dest size=%d, referencing %d leaves via PutMany (validates each leaf hash vs on-disk bytes)", root, st.Size(), len(fsns))
+	putStart := time.Now()
 	if err := fm.PutMany(n.ctx, fsns); err != nil { // one batched commit of all references
-		fdbg("PutMany(%s) FAILED: %v (isMissingFile=%v)", root, err, isMissingFile(err))
+		fdbg("PutMany(%s) FAILED after %s: %v (isMissingFile=%v)", root, time.Since(putStart).Round(time.Millisecond), err, isMissingFile(err))
 		// A CorruptReferenceError here means the bytes we just wrote to dest DON'T hash to their leaf CIDs — a
 		// corrupt/incomplete transfer, NOT a stale local reference. Returning errMissingFiles would send the wrapper
 		// down dropRef (wrong medicine) AND leave the bad dest + partial in place, so every retry re-fails identically
@@ -574,24 +637,36 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		}
 		return err
 	}
+	fdbg("finalize: PutMany OK in %s cid=%s", time.Since(putStart).Round(time.Millisecond), cidStr)
 	// Drop the bitswap-cached leaf blocks from the plain blockstore in one batched commit (they're now referenced in
 	// place, so the blockstore copies are redundant). Keys follow boxo's blockstore scheme: BlockPrefix + multihash.
+	delStart := time.Now()
 	if batch, berr := n.ds.Batch(n.ctx); berr == nil {
 		for _, lf := range leaves {
 			_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(dshelp.MultihashToDsKey(lf.c.Hash())))
 		}
 		_ = batch.Commit(n.ctx)
 	}
+	fdbg("finalize: dropped %d blockstore copies in %s cid=%s", len(leaves), time.Since(delStart).Round(time.Millisecond), cidStr)
 	if onFinalize != nil {
 		onFinalize(100)
 	}
 	removePartial(dest) // tmp is now dest; clear the .part resume sidecar
 
-	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path).
+	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path). Walks the DAG via the OFFLINE
+	// pinner dagservice (captured pre-goOnline) so leaves resolve from the filestore/disk, never the network.
+	fdbg("finalize: recursive PIN START cid=%s", cidStr)
+	pinStart := time.Now()
 	if err := n.pinner.Pin(n.ctx, rootNode, true, dest); err != nil {
+		fdbg("finalize: PIN FAILED in %s cid=%s err=%v", time.Since(pinStart).Round(time.Millisecond), cidStr, err)
 		return err
 	}
-	return n.pinner.Flush(n.ctx)
+	if err := n.pinner.Flush(n.ctx); err != nil {
+		fdbg("finalize: pin Flush FAILED cid=%s err=%v", cidStr, err)
+		return err
+	}
+	fdbg("finalize: PIN+flush done in %s → writeThrough SUCCESS cid=%s", time.Since(pinStart).Round(time.Millisecond), cidStr)
+	return nil
 }
 
 // dropClosure removes a CID's block closure from the plain blockstore — used both to clear bitswap's cached copy
