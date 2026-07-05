@@ -140,6 +140,7 @@ func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw stri
 	if total <= 0 {
 		total = headSize(gctx, hc, gw+"/ipfs/"+root.String())
 	}
+	fdbg("gateway CAR %s: size probe=%d (progress %s)", shortCid(root), total, map[bool]string{true: "ON", false: "indeterminate"}[total > 0])
 	var read int64
 	body := &countingReader{r: resp.Body, onRead: func(nr int) {
 		lastRead.Store(time.Now().UnixNano())
