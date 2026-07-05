@@ -30,7 +30,14 @@ import (
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	"golang.org/x/sync/singleflight"
 )
+
+// fetchGroup de-duplicates concurrent fetches that target the SAME destination file. Two workers (e.g. a layer CID
+// referenced from two nodes, an overlapping hydrate, or a startup auto-resume racing a manual download) writing the
+// same dest.tmp/dest would stomp each other's rename/pin → spurious "no such file"/missing-files. Keyed by dest (a
+// dest maps to exactly one CID), the second caller JOINS the first and shares its result instead of racing.
+var fetchGroup singleflight.Group
 
 // errNotRawLeaves signals that a DAG isn't all-raw-leaves, so the write-through path can't reference it (filestore
 // references require raw leaves) and the caller must fall back to the read + re-add path.
@@ -122,7 +129,21 @@ func isCancelled(c string) bool {
 // writeThrough) resumes only the missing leaves from the on-disk partial (dest.tmp + dest.part). A stall/drop returns
 // errIncomplete → back off (growing to a cap, reset once an attempt has clearly made progress) and resume. A stale
 // LOCAL reference (removed/moved content) returns errMissingFiles → clear it once and re-fetch over the network.
+// fetchToPath de-duplicates by dest (see fetchGroup) then runs the resumable retry loop. Concurrent callers for the
+// same dest share ONE fetch and its result — the leader drives the transfer callbacks; joiners just wait + get the
+// same error, so they never race on the same tmp/dest files.
 func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+	v, err, shared := fetchGroup.Do(dest, func() (interface{}, error) {
+		return nil, n.fetchToPathLoop(cidStr, dest, onProgress, onFinalize)
+	})
+	_ = v
+	if shared {
+		fdbg("fetchToPath JOINED an in-flight fetch of the same dest (deduped) cid=%s dest=%s err=%v", cidStr, dest, err)
+	}
+	return err
+}
+
+func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	backoff := 2 * time.Second
 	missTries := 0
 	fdbg("fetchToPath ENTER cid=%s dest=%s", cidStr, dest)
