@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	chunker "github.com/ipfs/boxo/chunker"
@@ -214,6 +215,47 @@ func TestFetchOfflineRoundTrip(t *testing.T) {
 	// No blockstore duplication: leaves are filestore references, only the root is a plain block.
 	if fsRefs, mainBlocks := blockCounts(n); fsRefs < 1 || mainBlocks > 2 {
 		t.Errorf("unexpected dedup state after fetch: fsRefs=%d mainBlocks=%d", fsRefs, mainBlocks)
+	}
+}
+
+// Two workers fetching the SAME dest concurrently (a layer CID referenced from two nodes) must NOT race on the
+// tmp/dest files — the singleflight dedup makes them share one fetch. Without it they stomp each other's
+// rename/pin → spurious "no such file"/missing-files. Assert both succeed and the file is byte-correct.
+func TestConcurrentFetchSameDestDeduped(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	content := sampleBytes()
+	writeFile(t, src, content)
+
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(dir, "out", "fetched.bin")
+	const workers = 6
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = n.fetchToPath(c.String(), dst, nil, nil)
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("worker %d: concurrent fetch to same dest failed: %v", i, e)
+		}
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("fetched content differs after concurrent fetch: %d vs %d bytes", len(got), len(content))
 	}
 }
 
