@@ -150,7 +150,16 @@ func (n *node) goOnline() error {
 		finder = combinedFinder{routers: []routing.ContentDiscovery{kad, routinghttpcr.NewContentRoutingClient(hc)}}
 	}
 	n.upSeen = make(map[string]int64)
-	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore, bitswap.WithTracer(upTracer{n})) // per-CID upload tracking
+	// Concurrent-UPLOAD tuning. boxo's server defaults cap a SINGLE peer to 1 MiB of outstanding (in-flight) block
+	// bytes (~4× 256 KiB) and 8 send workers. When one downloader fetches several files at once (e.g. our 3-way
+	// concurrent download), all its requests hit the seeder as ONE peer, so that 1 MiB window is monopolized by the
+	// first file and the others starve → they trip the fetch stall watchdog and serialize. Widen the per-peer window
+	// to 128 MiB and double the task workers so the seeder interleaves many files to a single peer at link speed.
+	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore,
+		bitswap.WithTracer(upTracer{n}), // per-CID upload tracking
+		bitswap.MaxOutstandingBytesPerPeer(128<<20),
+		bitswap.TaskWorkerCount(16),
+		bitswap.EngineTaskWorkerCount(16))
 
 	n.host = h
 	n.dht = kad
