@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	blockservice "github.com/ipfs/boxo/blockservice"
@@ -34,6 +35,10 @@ import (
 // errNotRawLeaves signals that a DAG isn't all-raw-leaves, so the write-through path can't reference it (filestore
 // references require raw leaves) and the caller must fall back to the read + re-add path.
 var errNotRawLeaves = errors.New("not all-raw-leaves")
+
+// stallTimeout: if no block arrives for this long the fetch session is torn down so the wrapper can back off and RESUME
+// from the on-disk bitmap (a dead peer shouldn't hang the download). Longer than the UI's 6s "Stalled" hint.
+const stallTimeout = 20 * time.Second
 
 // zeroChunk backs refLeaf.RawData() — FileManager.Put only reads len(RawData()), never the bytes, so a shared
 // read-only buffer of the max chunk size avoids allocating per leaf.
@@ -92,20 +97,47 @@ func isCancelled(c string) bool {
 	return cancelSet[c]
 }
 
-// fetchToPath retrieves cidStr's file content to dest and seeds it from there. A stale/orphaned LOCAL reference (a
-// prior copy whose backing file is gone — a removed game, an interrupted finalize, a moved library) must never block
-// a fresh download: if the fetch reports "missing files", the closure's references are cleared and the fetch retried
-// once over the network. (This is the download path — local content we "have" but can't read should be re-fetched,
-// not surfaced as an error.) See fetchToPathOnce for the per-attempt mechanics.
+// fetchToPath retrieves cidStr's file content to dest and seeds it from there — TORRENT-STYLE: it resumes and retries
+// until the file is whole or the user cancels, never failing on a transient stall. Each attempt (fetchToPathOnce →
+// writeThrough) resumes only the missing leaves from the on-disk partial (dest.tmp + dest.part). A stall/drop returns
+// errIncomplete → back off (growing to a cap, reset once an attempt has clearly made progress) and resume. A stale
+// LOCAL reference (removed/moved content) returns errMissingFiles → clear it once and re-fetch over the network.
 func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
-	err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
-	if err == errMissingFiles {
-		if c, derr := cid.Decode(cidStr); derr == nil {
-			n.dropRef(c) // clear the stale references (+ cached blocks) so the retry fetches over the network
-			err = n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+	backoff := 2 * time.Second
+	missTries := 0
+	for {
+		if isCancelled(cidStr) {
+			removePartial(dest)
+			return errors.New("cancelled")
+		}
+		start := time.Now()
+		err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+		switch {
+		case err == nil:
+			return nil
+		case err == errIncomplete:
+			if time.Since(start) > 5*time.Second { // the attempt fetched for a while before stalling → reset backoff
+				backoff = 2 * time.Second
+			} else if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			select {
+			case <-time.After(backoff):
+			case <-n.ctx.Done():
+				return n.ctx.Err()
+			}
+		case err == errMissingFiles:
+			missTries++
+			if missTries > 2 { // shouldn't recur after dropRef; guard against a spin
+				return err
+			}
+			if c, derr := cid.Decode(cidStr); derr == nil {
+				n.dropRef(c) // clear stale refs (+ cached blocks) so the retry fetches over the network
+			}
+		default:
+			return err // hard io/decode error, or "cancelled"
 		}
 	}
-	return err
 }
 
 // fetchDirToPath materializes a UnixFS DIRECTORY CID (a folder of dehydrated packages) recursively to dest, writing the
@@ -224,6 +256,8 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	if err := n.writeThrough(c, root, dest, cidStr, onProgress, onFinalize); err == nil {
 		n.scheduleCompaction() // reclaim tombstone disk from the leaves we dropped from the blockstore
 		return nil
+	} else if err == errIncomplete {
+		return errIncomplete // stalled/dropped mid-transfer — partial kept; the wrapper backs off + resumes
 	} else if err != errNotRawLeaves {
 		if isMissingFile(err) {
 			return errMissingFiles
@@ -310,38 +344,30 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 // caller then falls back to read + re-add).
 func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr string,
 	onProgress func(pct float64), onFinalize func(pct float64)) error {
-	// File size (for progress) — cheap, reads the root's UnixFS metadata.
+	// File size (for progress + preallocation) — cheap, reads the root's UnixFS metadata.
 	rdr, err := ufsio.NewDagReader(n.ctx, rootNode, n.dserv)
 	if err != nil {
 		return err
 	}
 	total := int64(rdr.Size())
 
-	tmp := dest + ".tmp"
-	_ = os.RemoveAll(tmp)
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-
+	// Enumerate the file's leaves IN ORDER from the dag-pb spine BEFORE touching any tmp (so errNotRawLeaves is a clean
+	// fall-through). A raw-codec link is a leaf — CID/size/offset come from the link (no fetch); only the few
+	// intermediate dag-pb nodes are read. A dag-pb node with no links = a dag-pb leaf → errNotRawLeaves. A chunk can
+	// repeat (dedup), so a CID maps to every offset AND every leaf-INDEX it occupies (leaf-index drives the resume bitmap).
 	type leafRef struct {
 		c   cid.Cid
 		off uint64
 		sz  int
 	}
 	var leaves []leafRef
-	var written int64
-	abort := func(e error) error { _ = out.Close(); _ = os.Remove(tmp); return e }
-
-	// Enumerate the file's leaves IN ORDER from the dag-pb spine: a raw-codec link is a leaf — its CID, byte size and
-	// file offset come from the link itself (no fetch); only the few intermediate dag-pb nodes are read. A dag-pb node
-	// with no links reached here is a dag-pb leaf → errNotRawLeaves so the caller falls back (refs need raw leaves).
-	// A chunk can repeat in a file (dedup), so a CID maps to every offset it occupies.
 	offsets := map[cid.Cid][]int64{}
+	idxOf := map[cid.Cid][]int{}
 	var uniq []cid.Cid
 	uniqSeen := cid.NewSet()
 	var off int64
 	addLeaf := func(c cid.Cid, sz int) {
+		idxOf[c] = append(idxOf[c], len(leaves))
 		leaves = append(leaves, leafRef{c, uint64(off), sz})
 		offsets[c] = append(offsets[c], off)
 		off += int64(sz)
@@ -374,71 +400,134 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			return nil
 		}
 		if serr := spine(rootNode); serr != nil {
-			return abort(serr)
+			return serr
 		}
 	}
-	if err := out.Truncate(off); err != nil { // preallocate so out-of-order WriteAt lands correctly
-		return abort(err)
+
+	// Open the partial: RESUME if a matching dest.tmp + dest.part exist, else start fresh (preallocated + empty bitmap).
+	tmp := tmpPath(dest)
+	var out *os.File
+	var bits *partBits
+	if pb, ok := loadPart(dest, root.String(), total, len(leaves)); ok {
+		if f, oerr := os.OpenFile(tmp, os.O_RDWR, 0o644); oerr == nil {
+			out, bits = f, pb // resume where the last attempt left off
+		}
+	}
+	if out == nil {
+		_ = os.RemoveAll(tmp)
+		f, cerr := os.Create(tmp)
+		if cerr != nil {
+			return cerr
+		}
+		if terr := f.Truncate(off); terr != nil { // preallocate so out-of-order WriteAt lands correctly
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return terr
+		}
+		out, bits = f, newPartBits(root.String(), total, len(leaves))
+		_ = savePart(dest, bits)
 	}
 
-	// Cancel watcher → cancels the in-flight fetch even mid-stall.
-	fctx, fcancel := context.WithCancel(n.ctx)
-	defer fcancel()
-	go func() {
-		t := time.NewTicker(200 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-fctx.Done():
-				return
-			case <-t.C:
-				if isCancelled(cidStr) {
-					fcancel()
+	// Bytes already on disk from prior attempts → resume the progress bar from there, not 0.
+	var written int64
+	for i, lf := range leaves {
+		if bits.get(i) {
+			written += int64(lf.sz)
+		}
+	}
+	if total > 0 && onProgress != nil {
+		onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+	}
+
+	// Only re-request the leaves not yet durable on disk.
+	var need []cid.Cid
+	for _, c := range uniq {
+		for _, i := range idxOf[c] {
+			if !bits.get(i) {
+				need = append(need, c)
+				break
+			}
+		}
+	}
+
+	if len(need) > 0 {
+		// Cancel + STALL watcher: cancel the fetch on user-cancel, OR when no block has arrived for stallTimeout (a dead
+		// peer), so the wrapper can back off + resume from the bitmap instead of hanging.
+		fctx, fcancel := context.WithCancel(n.ctx)
+		defer fcancel()
+		var lastBlk atomic.Int64
+		lastBlk.Store(time.Now().UnixNano())
+		go func() {
+			t := time.NewTicker(200 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-fctx.Done():
 					return
+				case <-t.C:
+					if isCancelled(cidStr) || time.Since(time.Unix(0, lastBlk.Load())) > stallTimeout {
+						fcancel()
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// Fetch the WHOLE want-list at once through one long-lived bitswap SESSION. The session keeps the single peer warm
-	// (no per-request provider re-discovery — the cause of the periodic "no peers" stalls), and handing bitswap every
-	// want up front lets it pipeline to link speed instead of one ~2-RTT round-trip per block (~4 MB/s). Blocks arrive
-	// out of order and are written straight to their file offset(s) — no buffering, so memory stays bitswap-bounded.
-	sess := blockservice.NewSession(fctx, n.bserv)
-	got := 0
-	for blk := range sess.GetBlocks(fctx, uniq) {
-		data := blk.RawData()
-		for _, o := range offsets[blk.Cid()] {
-			if _, werr := out.WriteAt(data, o); werr != nil {
-				return abort(werr)
+		// One long-lived bitswap SESSION for the want-list (keeps peers warm + pipelines to link speed). Blocks arrive
+		// out of order → written straight to their offset(s); the bitmap + a periodically fsync'd sidecar make it resumable.
+		sess := blockservice.NewSession(fctx, n.bserv)
+		lastSave := time.Now()
+		for blk := range sess.GetBlocks(fctx, need) {
+			lastBlk.Store(time.Now().UnixNano())
+			data := blk.RawData()
+			for _, o := range offsets[blk.Cid()] {
+				if _, werr := out.WriteAt(data, o); werr != nil {
+					_ = out.Close()
+					return werr // IO error — keep the partial for a later retry
+				}
+				written += int64(len(data))
+				if total > 0 && onProgress != nil {
+					onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+				}
 			}
-			written += int64(len(data))
-			if total > 0 && onProgress != nil {
-				onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+			for _, i := range idxOf[blk.Cid()] {
+				bits.set(i)
+			}
+			if time.Since(lastSave) > 2*time.Second { // durability: fsync the data BEFORE persisting the bitmap
+				_ = out.Sync()
+				_ = savePart(dest, bits)
+				lastSave = time.Now()
 			}
 		}
-		got++
-	}
-	if got != len(uniq) { // channel closed before all blocks arrived
+
 		if isCancelled(cidStr) {
-			return abort(errors.New("cancelled"))
+			_ = out.Close()
+			removePartial(dest) // explicit cancel discards the partial
+			return errors.New("cancelled")
 		}
-		return abort(errMissingFiles) // some never arrived → let the wrapper drop stale refs + retry over the network
+		if !bits.allSet() { // stalled / session dropped incomplete → persist progress, keep the partial, resume later
+			_ = out.Sync()
+			_ = savePart(dest, bits)
+			_ = out.Close()
+			return errIncomplete
+		}
 	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmp)
+
+	// Complete: flush, publish atomically, reference every leaf into dest, drop the redundant blockstore copies, pin.
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
 		return err
 	}
-
+	if err := out.Close(); err != nil {
+		return err
+	}
 	_ = os.RemoveAll(dest)
 	if err := os.Rename(tmp, dest); err != nil {
 		return err
 	}
 
-	// Reference each leaf into dest, then drop its plain blockstore copy. Done as TWO batched datastore commits (one
-	// for the filestore references, one for the blockstore deletes) instead of per-leaf Put/Delete — a large file has
-	// thousands of leaves, and individual writes under the shared datastore lock made "Pinning…" take ~a minute and
-	// starved concurrent GUI node queries. Batching collapses that to a couple of commits (near-instant).
+	// Reference each leaf into dest, then drop its plain blockstore copy — TWO batched datastore commits (one for refs,
+	// one for blockstore deletes) so a large file's thousands of leaves finalize in ~a couple of commits (near-instant).
 	if onFinalize != nil {
 		onFinalize(0)
 	}
@@ -468,6 +557,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	if onFinalize != nil {
 		onFinalize(100)
 	}
+	removePartial(dest) // tmp is now dest; clear the .part resume sidecar
 
 	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path).
 	if err := n.pinner.Pin(n.ctx, rootNode, true, dest); err != nil {

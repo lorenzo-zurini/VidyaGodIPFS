@@ -217,6 +217,122 @@ func TestFetchOfflineRoundTrip(t *testing.T) {
 	}
 }
 
+// The .part resume sidecar: bit accounting + save/load roundtrip + rejection of a foreign/corrupt sidecar.
+func TestPartBitsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	p := newPartBits("QmRoot", 600000, 3)
+	p.set(0)
+	p.set(2)
+	p.set(0) // idempotent
+	if p.nset != 2 || p.allSet() {
+		t.Fatalf("bit accounting: nset=%d allSet=%v (want 2,false)", p.nset, p.allSet())
+	}
+	if err := savePart(dest, p); err != nil {
+		t.Fatal(err)
+	}
+	q, ok := loadPart(dest, "QmRoot", 600000, 3)
+	if !ok || !q.get(0) || q.get(1) || !q.get(2) || q.nset != 2 {
+		t.Fatalf("loadPart didn't restore bits: ok=%v nset=%d", ok, q.nset)
+	}
+	if _, ok := loadPart(dest, "QmOther", 600000, 3); ok {
+		t.Error("accepted a sidecar with the wrong root CID")
+	}
+	if _, ok := loadPart(dest, "QmRoot", 999, 3); ok {
+		t.Error("accepted a sidecar with the wrong total")
+	}
+	if _, ok := loadPart(dest, "QmRoot", 600000, 9); ok {
+		t.Error("accepted a sidecar with the wrong leaf count")
+	}
+	writeFile(t, partPath(dest), []byte("junk"))
+	if _, ok := loadPart(dest, "QmRoot", 600000, 3); ok {
+		t.Error("accepted a corrupt sidecar")
+	}
+	p.set(1)
+	if !p.allSet() {
+		t.Error("allSet false when every bit is set")
+	}
+}
+
+// A killed/stalled fetch leaves dest.tmp + dest.part; the next attempt must resume — fetching ONLY the missing leaves —
+// and complete byte-identical, then clean up the sidecar.
+func TestFetchResumesFromPartial(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	content := sampleBytes() // 600000 bytes → 3 leaves at the 262144 chunk size
+	writeFile(t, src, content)
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const chunk = 262144
+	dest := filepath.Join(dir, "out.bin")
+	// Simulate an interrupted fetch: leaf 0 (offset 0) written, leaves 1 & 2 still zero.
+	tmp := make([]byte, len(content))
+	copy(tmp[:chunk], content[:chunk])
+	writeFile(t, tmpPath(dest), tmp)
+	pb := newPartBits(c.String(), int64(len(content)), 3)
+	pb.set(0)
+	if err := savePart(dest, pb); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := n.fetchToPath(c.String(), dest, nil, nil); err != nil {
+		t.Fatalf("resume fetchToPath: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("resumed content differs: %d bytes vs %d", len(got), len(content))
+	}
+	if _, err := os.Stat(partPath(dest)); !os.IsNotExist(err) {
+		t.Error(".part sidecar not removed after completion")
+	}
+	if _, err := os.Stat(tmpPath(dest)); !os.IsNotExist(err) {
+		t.Error(".tmp not removed after completion")
+	}
+	if fsRefs, _ := blockCounts(n); fsRefs < 1 {
+		t.Error("no filestore references after a resumed fetch")
+	}
+}
+
+// A stale/foreign partial (wrong root, garbage tmp) must be discarded, not trusted — the fetch starts fresh and
+// produces correct bytes.
+func TestFetchIgnoresStalePartial(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	content := sampleBytes()
+	writeFile(t, src, content)
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "out.bin")
+	writeFile(t, tmpPath(dest), bytes.Repeat([]byte{0xFF}, len(content))) // garbage tmp
+	bad := newPartBits("QmWrongRoot", int64(len(content)), 3)
+	bad.set(0)
+	bad.set(1)
+	bad.set(2)
+	if err := savePart(dest, bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.fetchToPath(c.String(), dest, nil, nil); err != nil {
+		t.Fatalf("fetchToPath: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatal("stale partial was trusted — fetched content is corrupt")
+	}
+}
+
 func TestFetchProgressReported(t *testing.T) {
 	n := offlineNode(t)
 	dir := t.TempDir()
