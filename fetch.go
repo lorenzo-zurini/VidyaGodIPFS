@@ -54,6 +54,28 @@ func fdbg(format string, a ...interface{}) {
 	}
 }
 
+// getRoot fetches a CID's root block over the network with a bounded timeout, and — if libp2p can't reach any provider
+// in time (a hostile/captive network where the DHT finds providers but no transport connects, e.g. Pinata's ws:3000
+// mangled by a proxy) — falls back to importing the whole DAG from an HTTPS trustless gateway (gateway.go) and reads
+// the root from the now-local blockstore. On a normal network the root arrives fast and the gateway is never touched.
+func (n *node) getRoot(c cid.Cid, cidStr string, onProgress func(pct float64)) (ipld.Node, error) {
+	getCtx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	root, err := n.dserv.Get(getCtx, c)
+	cancel()
+	if err == nil {
+		return root, nil
+	}
+	if isMissingFile(err) {
+		return nil, errMissingFiles
+	}
+	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
+	if gerr := n.fetchViaGateway(n.ctx, c, onProgress); gerr != nil {
+		fdbg("getRoot: gateway fallback failed cid=%s: %v", cidStr, gerr)
+		return nil, err // surface the original network error
+	}
+	return n.dserv.Get(n.ctx, c) // DAG now in the local blockstore
+}
+
 // shortCid trims a CID for readable logs (first 6 + last 4 of the base58/base32 string).
 func shortCid(c cid.Cid) string {
 	s := c.String()
@@ -201,9 +223,9 @@ func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64),
 	if err != nil {
 		return err
 	}
-	root, err := n.dserv.Get(n.ctx, c) // blocks here until the root block arrives — where a no-reachable-provider fetch hangs
+	root, err := n.getRoot(c, cidStr, onProgress) // libp2p, or an HTTPS trustless-gateway CAR fallback on hostile nets
 	if err != nil {
-		if isMissingFile(err) {
+		if err == errMissingFiles || isMissingFile(err) {
 			return errMissingFiles
 		}
 		return err
@@ -296,10 +318,10 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 
 	fdbg("fetchToPathOnce: fetching root block cid=%s", cidStr)
 	getStart := time.Now()
-	root, err := n.dserv.Get(n.ctx, c)
+	root, err := n.getRoot(c, cidStr, onProgress)
 	if err != nil {
 		fdbg("fetchToPathOnce: root Get FAILED cid=%s err=%v (isMissingFile=%v)", cidStr, err, isMissingFile(err))
-		if isMissingFile(err) {
+		if err == errMissingFiles || isMissingFile(err) {
 			return errMissingFiles // node has a filestore ref but the backing file is gone
 		}
 		return err
