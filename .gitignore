@@ -2,6 +2,8 @@
 libvgipfs.so
 libvgipfs.h
 *.a
+# stray `go build` executable (module name == dir name); build produces libvgipfs.so, not this
+/VidyaGodIPFS
 
 # local test repos
 /repo/
