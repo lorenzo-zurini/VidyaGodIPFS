@@ -76,6 +76,7 @@ func (n *node) addNoCopy(path string) (cid.Cid, error) {
 	if err := n.pinner.Flush(n.ctx); err != nil {
 		return cid.Undef, err
 	}
+	n.announce(root.Cid()) // publish to the DHT now so it's discoverable without waiting for the 22h reprovide
 	return root.Cid(), nil
 }
 
@@ -140,5 +141,6 @@ func (n *node) addDirNoCopy(path string) (cid.Cid, error) {
 	if err := n.pinner.Flush(n.ctx); err != nil {
 		return cid.Undef, err
 	}
+	n.announce(root.Cid()) // publish to the DHT now so it's discoverable without waiting for the 22h reprovide
 	return root.Cid(), nil
 }

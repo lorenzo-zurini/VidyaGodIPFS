@@ -205,6 +205,21 @@ func (n *node) goOnline() error {
 	return nil
 }
 
+// announce eagerly publishes a freshly added/fetched CID to the DHT so peers AND pinning services (Pinata) can find
+// it within seconds, instead of waiting up to ReproviderInterval (22h) for the next reprovide sweep. Without this,
+// newly-added content has ZERO providers on the public routing layer — a pin-by-CID just "searches" forever because
+// there is nothing to discover. Best-effort + async: a DHT provide walks to the ~20 closest peers (a few seconds).
+func (n *node) announce(c cid.Cid) {
+	if n.provider == nil {
+		return // offline node / provider not wired
+	}
+	go func() {
+		if err := n.provider.Provide(n.ctx, c, true); err != nil {
+			fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
+		}
+	}()
+}
+
 // relayPeerSource feeds AutoRelay with candidate relays from the DHT routing table — public, well-connected peers;
 // those that support circuit-relay-v2 get used. Called by AutoRelay at runtime (n.dht/n.host are set by then).
 func (n *node) relayPeerSource(ctx context.Context, num int) <-chan peer.AddrInfo {

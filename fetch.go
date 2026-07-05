@@ -264,6 +264,7 @@ func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64),
 	} else if err := n.pinner.Flush(n.ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[fetchDir] pin flush %s failed: %v\n", cidStr, err)
 	}
+	n.announce(c) // publish now so a re-hosted source tree is immediately discoverable (not after the 22h reprovide)
 	return nil
 }
 
@@ -686,6 +687,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		fdbg("finalize: pin Flush FAILED cid=%s err=%v", cidStr, err)
 		return err
 	}
+	n.announce(root) // re-announce now so a re-hosted CID is immediately discoverable (not after the 22h reprovide)
 	fdbg("finalize: PIN+flush done in %s → writeThrough SUCCESS cid=%s", time.Since(pinStart).Round(time.Millisecond), cidStr)
 	return nil
 }
