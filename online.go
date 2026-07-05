@@ -159,7 +159,13 @@ func (n *node) goOnline() error {
 		bitswap.WithTracer(upTracer{n}), // per-CID upload tracking
 		bitswap.MaxOutstandingBytesPerPeer(128<<20),
 		bitswap.TaskWorkerCount(16),
-		bitswap.EngineTaskWorkerCount(16))
+		bitswap.EngineTaskWorkerCount(16),
+		// A bitswap session broadcasts its wants once, then only RE-REQUESTS unfulfilled ones after RebroadcastDelay
+		// (default 60s). So the TAIL of a large fetch (last blocks not served in the first pass) sits idle for up to a
+		// minute — looking "stalled — waiting for peers" — until the rebroadcast (or our 20s watchdog tears the
+		// session down and a fresh one re-asks). Cut it to 10s so a session self-heals its tail well before the
+		// watchdog fires, which also un-starves files queued behind another on a slow link (concurrent downloads).
+		bitswap.RebroadcastDelay(10*time.Second))
 
 	n.host = h
 	n.dht = kad
@@ -202,6 +208,26 @@ func (n *node) goOnline() error {
 	n.online = true
 	go n.bootstrap()
 	go n.refreshPinnedSet(n.ctx) // keep the pinned-root set warm for the upload tracer
+
+	// Announce EVERYTHING we seed to the DHT shortly after startup (once the routing table is warm), instead of waiting
+	// up to ReproviderInterval (22h) for the first scheduled sweep. Without this, a just-launched seeder's content —
+	// and anything added while it was down — stays undiscoverable for up to 22h, so a pin-by-CID (Pinata) or a peer
+	// just "searches" forever. A short-lived process's one-shot provide barely propagates (immature routing table);
+	// this robust batch sweep runs from the long-lived node once it has peers.
+	go func() {
+		select {
+		case <-time.After(45 * time.Second): // let bootstrap + DHT routing settle so the provides actually stick
+		case <-n.ctx.Done():
+			return
+		}
+		if n.provider != nil {
+			if err := n.provider.Reprovide(n.ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "[node] startup reprovide failed: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[node] startup reprovide: announced seeded content to the DHT\n")
+			}
+		}
+	}()
 	return nil
 }
 
