@@ -36,6 +36,16 @@ import (
 // references require raw leaves) and the caller must fall back to the read + re-add path.
 var errNotRawLeaves = errors.New("not all-raw-leaves")
 
+// dbgFetch enables verbose stderr tracing of the fetch path when VG_FETCH_DEBUG is set — used to diagnose why a
+// specific CID takes the slow fallback / errors. No-op in normal operation.
+var dbgFetch = os.Getenv("VG_FETCH_DEBUG") != ""
+
+func fdbg(format string, a ...interface{}) {
+	if dbgFetch {
+		fmt.Fprintf(os.Stderr, "[fetchdbg] "+format+"\n", a...)
+	}
+}
+
 // stallTimeout: if no block arrives for this long the fetch session is torn down so the wrapper can back off and RESUME
 // from the on-disk bitmap (a dead peer shouldn't hang the download). Longer than the UI's 6s "Stalled" hint.
 const stallTimeout = 20 * time.Second
@@ -253,17 +263,21 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
-	if err := n.writeThrough(c, root, dest, cidStr, onProgress, onFinalize); err == nil {
+	wtErr := n.writeThrough(c, root, dest, cidStr, onProgress, onFinalize)
+	fdbg("writeThrough(%s) -> %v", cidStr, wtErr)
+	if err := wtErr; err == nil {
 		n.scheduleCompaction() // reclaim tombstone disk from the leaves we dropped from the blockstore
 		return nil
 	} else if err == errIncomplete {
 		return errIncomplete // stalled/dropped mid-transfer — partial kept; the wrapper backs off + resumes
 	} else if err != errNotRawLeaves {
 		if isMissingFile(err) {
+			fdbg("writeThrough(%s) classified as MISSING FILES (isMissingFile=true): %v", cidStr, err)
 			return errMissingFiles
 		}
 		return err // cancelled / network / io
 	}
+	fdbg("writeThrough(%s) fell through to SLOW read+addNoCopy fallback", cidStr)
 
 	rdr, err := ufsio.NewDagReader(n.ctx, root, n.dserv)
 	if err != nil {
@@ -382,6 +396,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		var spine func(nd ipld.Node) error
 		spine = func(nd ipld.Node) error {
 			if len(nd.Links()) == 0 {
+				fdbg("spine: dag-pb node %s has NO links -> errNotRawLeaves", nd.Cid())
 				return errNotRawLeaves
 			}
 			for _, l := range nd.Links() {
@@ -403,6 +418,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			return serr
 		}
 	}
+	fdbg("enumerated %s: total(unixfs)=%d off(sum-leaf-sizes)=%d leaves=%d uniq=%d", root, total, off, len(leaves), len(uniq))
 
 	// Open the partial: RESUME if a matching dest.tmp + dest.part exist, else start fresh (preallocated + empty bitmap).
 	tmp := tmpPath(dest)
@@ -543,7 +559,19 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: dest, Stat: st},
 		})
 	}
+	fdbg("finalize %s: dest size=%d, referencing %d leaves", root, st.Size(), len(fsns))
 	if err := fm.PutMany(n.ctx, fsns); err != nil { // one batched commit of all references
+		fdbg("PutMany(%s) FAILED: %v (isMissingFile=%v)", root, err, isMissingFile(err))
+		// A CorruptReferenceError here means the bytes we just wrote to dest DON'T hash to their leaf CIDs — a
+		// corrupt/incomplete transfer, NOT a stale local reference. Returning errMissingFiles would send the wrapper
+		// down dropRef (wrong medicine) AND leave the bad dest + partial in place, so every retry re-fails identically
+		// (the "errored missing files that keeps re-downloading" symptom). Instead DISCARD the bad output and the
+		// resume sidecar and report errIncomplete so the wrapper backs off and re-fetches from scratch.
+		if isMissingFile(err) {
+			_ = os.Remove(dest)
+			removePartial(dest)
+			return errIncomplete
+		}
 		return err
 	}
 	// Drop the bitswap-cached leaf blocks from the plain blockstore in one batched commit (they're now referenced in
