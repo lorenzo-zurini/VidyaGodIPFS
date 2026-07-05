@@ -26,6 +26,7 @@ import (
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	swarm "github.com/libp2p/go-libp2p/p2p/net/swarm"
 	host "github.com/libp2p/go-libp2p/core/host"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
@@ -103,7 +104,7 @@ func (n *node) goOnline() error {
 		return rmErr
 	}
 	bwc := metrics.NewBandwidthCounter() // global up/down byte counters + rolling rates for every stream
-	h, err := libp2p.New(
+	libp2pOpts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.BandwidthReporter(bwc),
 		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
@@ -128,7 +129,13 @@ func (n *node) goOnline() error {
 		// Candidates come from the DHT routing table (those that support circuit-relay-v2 get used). Same-LAN peers
 		// don't need this — that's mDNS.
 		libp2p.EnableAutoRelayWithPeerSource(n.relayPeerSource),
-	)
+	}
+	// Resolve /dnsaddr + /dns dials over DoH (see doh.go) so bootstrap peers AND DNS-addressed providers (Pinata is
+	// /dnsaddr/bitswap.pinata.cloud) are dialable on DNS-filtered / captive networks. Best-effort: skip if it can't build.
+	if mr, merr := dohMultiaddrResolver(); merr == nil {
+		libp2pOpts = append(libp2pOpts, libp2p.MultiaddrResolver(swarm.ResolverFromMaDNS{Resolver: mr}))
+	}
+	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return err
 	}
@@ -146,7 +153,8 @@ func (n *node) goOnline() error {
 	// indexer answers in well under a second. Falls back to DHT-only if the client can't be built.
 	bsn := bsnet.NewFromIpfsHost(h)
 	var finder routing.ContentDiscovery = kad
-	if hc, herr := routinghttp.New("https://delegated-ipfs.dev"); herr == nil {
+	// DoH-resolving HTTP client so the indexer host (delegated-ipfs.dev) also resolves through a DNS filter.
+	if hc, herr := routinghttp.New("https://delegated-ipfs.dev", routinghttp.WithHTTPClient(dohHTTPClient(newDoHResolver()))); herr == nil {
 		finder = combinedFinder{routers: []routing.ContentDiscovery{kad, routinghttpcr.NewContentRoutingClient(hc)}}
 	}
 	n.upSeen = make(map[string]int64)
