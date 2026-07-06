@@ -59,6 +59,11 @@ type node struct {
 	mdns     interface{ Close() error } // local-network discovery service (mDNS)
 	bwc      *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
 
+	// friends / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
+	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
+	social *socialState
+	friend *friendService
+
 	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can
 	// flag which seeded items are being uploaded right now. pinnedSet is refreshed periodically so the hot MessageSent
 	// path is a cheap in-memory lookup (no datastore hit per block).
@@ -125,6 +130,9 @@ func openNode(repoPath string) error {
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,
 	}
+	// The address book loads independently of the network so contacts survive offline; the live protocol attaches
+	// in goOnline.
+	gNode.social = newSocialState(repoPath)
 
 	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays
 	// fully usable offline (local filestore reads, add-by-reference) — fetch of remote content just won't work.

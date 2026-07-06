@@ -213,6 +213,14 @@ func (n *node) goOnline() error {
 		}
 	}
 
+	// Friends / multiplayer social layer: register the /vidyagod/friend protocol on the host and start presence.
+	// Uses the DHT for peer routing (FindPeer) and the same libp2p auth that secures bitswap. Best-effort.
+	if n.social != nil {
+		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
+		n.friend.start()
+		n.friend.startPresence(45 * time.Second)
+	}
+
 	n.online = true
 	go n.bootstrap()
 	go n.refreshPinnedSet(n.ctx) // keep the pinned-root set warm for the upload tracer
