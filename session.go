@@ -291,6 +291,33 @@ func sessionMap(s *session) map[string]any {
 	}
 }
 
+// overlayConfig derives the local overlay parameters for a session: our own vIP, the /24 subnet, and the vIP→peer
+// routing table for every OTHER member. ok is false if we aren't in the session or have no vIP yet.
+func (ss *sessionService) overlayConfig(sid string) (myVIP, subnet string, peerByVIP map[string]string, ok bool) {
+	me := ss.host.ID().String()
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	s, exists := ss.sessions[sid]
+	if !exists {
+		return "", "", nil, false
+	}
+	peerByVIP = map[string]string{}
+	for pid, m := range s.Members {
+		if m.VIP == "" {
+			continue
+		}
+		if pid == me {
+			myVIP = m.VIP
+		} else {
+			peerByVIP[m.VIP] = pid
+		}
+	}
+	if myVIP == "" {
+		return "", "", nil, false
+	}
+	return myVIP, s.Subnet, peerByVIP, true
+}
+
 // snapshot returns the JSON view of one session (thread-safe).
 func (ss *sessionService) snapshot(sid string) (map[string]any, bool) {
 	ss.mu.Lock()

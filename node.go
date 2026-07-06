@@ -64,6 +64,7 @@ type node struct {
 	social  *socialState
 	friend  *friendService
 	session *sessionService
+	overlay *overlayService
 
 	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can
 	// flag which seeded items are being uploaded right now. pinnedSet is refreshed periodically so the hot MessageSent

@@ -222,6 +222,10 @@ func (n *node) goOnline() error {
 		// Session/lobby layer: coordinates who is in a play-together session and each member's overlay vIP.
 		n.session = newSessionService(n.ctx, h, kad, n.social, emitSessionEvent)
 		n.session.start()
+		// Overlay datapath: registers the /vidyagod/overlay handler now; a TUN is attached on demand when a session
+		// launches (VgOverlayStart).
+		n.overlay = newOverlayService(n.ctx, h, kad)
+		n.overlay.start()
 	}
 
 	n.online = true
