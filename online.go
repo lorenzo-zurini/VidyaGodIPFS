@@ -219,6 +219,9 @@ func (n *node) goOnline() error {
 		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
 		n.friend.start()
 		n.friend.startPresence(45 * time.Second)
+		// Session/lobby layer: coordinates who is in a play-together session and each member's overlay vIP.
+		n.session = newSessionService(n.ctx, h, kad, n.social, emitSessionEvent)
+		n.session.start()
 	}
 
 	n.online = true

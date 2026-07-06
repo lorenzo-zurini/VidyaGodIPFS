@@ -61,8 +61,9 @@ type node struct {
 
 	// friends / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
 	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
-	social *socialState
-	friend *friendService
+	social  *socialState
+	friend  *friendService
+	session *sessionService
 
 	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can
 	// flag which seeded items are being uploaded right now. pinnedSet is refreshed periodically so the hot MessageSent
