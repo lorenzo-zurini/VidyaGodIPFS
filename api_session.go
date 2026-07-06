@@ -145,3 +145,20 @@ func VgSessionRoster(sid *C.char, outJson **C.char) C.int {
 	setStr(outJson, string(b))
 	return 0
 }
+
+//export VgSessionLaunchVars
+// JSON object of the custom variables to launch a game into this session (VIDYAGOD_SANDBOX + overlay vIPs), which a
+// Goldberg-style LAN-emulator content node writes into its config. -1 if the session/our vIP isn't known yet.
+func VgSessionLaunchVars(sid *C.char, outJson **C.char) C.int {
+	ss := sessionSvc()
+	if ss == nil {
+		return -1
+	}
+	vars, ok := ss.launchVars(C.GoString(sid))
+	if !ok {
+		return -1
+	}
+	b, _ := json.Marshal(vars)
+	setStr(outJson, string(b))
+	return 0
+}

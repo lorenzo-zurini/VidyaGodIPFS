@@ -86,4 +86,13 @@ func TestSessionJoinRosterAndVIPs(t *testing.T) {
 	}
 	waitFor(t, "host sees joiner ready", func() bool { return joinerReady(ssA) })
 	waitFor(t, "joiner's replica shows ready", func() bool { return joinerReady(ssB) })
+
+	// launchVars maps the session into the CustomVars a game launch (Goldberg) consumes: our own vIP + the peer's vIP.
+	vars, okv := ssA.launchVars(s.ID)
+	if !okv {
+		t.Fatalf("launchVars failed")
+	}
+	if vars["VIDYAGOD_SANDBOX"] != "on" || vars["VIDYAGOD_SELF_VIP"] != va || vars["VIDYAGOD_PEER_VIPS"] != vb {
+		t.Fatalf("bad launch vars: %+v (self=%s peer=%s)", vars, va, vb)
+	}
 }

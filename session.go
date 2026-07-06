@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -316,6 +317,41 @@ func (ss *sessionService) overlayConfig(sid string) (myVIP, subnet string, peerB
 		return "", "", nil, false
 	}
 	return myVIP, s.Subnet, peerByVIP, true
+}
+
+// launchVars maps a session into the custom variables a game launch consumes to join the overlay and configure its
+// LAN emulator (e.g. Goldberg): the sandbox toggle, our own vIP, the subnet, and the parallel comma-lists of peer
+// vIPs + nicknames. A Goldberg content node's FileEdit writes these into steam_settings (custom_broadcasts.txt = the
+// peer vIPs, account_name = our nick, listen_port), so the emulator finds the other players over the overlay LAN.
+func (ss *sessionService) launchVars(sid string) (map[string]string, bool) {
+	myVIP, subnet, peerByVIP, ok := ss.overlayConfig(sid)
+	if !ok {
+		return nil, false
+	}
+	// Pull nicknames from the roster so PEER_NAMES lines up with PEER_VIPS.
+	nickByPeer := map[string]string{}
+	if snap, ok2 := ss.snapshot(sid); ok2 {
+		for _, m := range snap["members"].([]member) {
+			nickByPeer[m.PeerID] = m.Nick
+		}
+	}
+	var vips, names []string
+	for vip, pid := range peerByVIP {
+		vips = append(vips, vip)
+		n := nickByPeer[pid]
+		if n == "" {
+			n = pid[:min(8, len(pid))]
+		}
+		names = append(names, n)
+	}
+	return map[string]string{
+		"VIDYAGOD_SANDBOX":     "on",
+		"VIDYAGOD_SANDBOX_NET": "host", // host until the isolated-netns TUN injection lands
+		"VIDYAGOD_SELF_VIP":    myVIP,
+		"VIDYAGOD_SUBNET":      subnet,
+		"VIDYAGOD_PEER_VIPS":   strings.Join(vips, ","),
+		"VIDYAGOD_PEER_NAMES":  strings.Join(names, ","),
+	}, true
 }
 
 // snapshot returns the JSON view of one session (thread-safe).
