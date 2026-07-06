@@ -54,6 +54,31 @@ func VgOverlayStart(sid *C.char, outName **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+//export VgOverlayServe
+// Nested-sandbox overlay: configure this session's routes and listen on sockPath for the TUN fd that the in-sandbox
+// sandbox-init will send (it creates + addresses the TUN inside the sandbox's netns). Non-blocking — returns once
+// listening, so the caller can then spawn bwrap. When the fd arrives, forwarding attaches automatically.
+func VgOverlayServe(sid *C.char, sockPath *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil || n.overlay == nil || n.session == nil {
+		setStr(errOut, "networking is offline")
+		return -1
+	}
+	s := C.GoString(sid)
+	myVIP, _, peerByVIP, ok := n.session.overlayConfig(s)
+	if !ok {
+		setStr(errOut, "not a member of session (or no vIP assigned yet)")
+		return -1
+	}
+	if err := n.overlay.configure(myVIP, peerByVIP); err != nil {
+		return fail(errOut, err)
+	}
+	if err := n.overlay.serve(C.GoString(sockPath)); err != nil {
+		return fail(errOut, err)
+	}
+	return 0
+}
+
 //export VgOverlayStop
 // Tear the overlay down (removes the TUN + closes forwarding streams).
 func VgOverlayStop() {

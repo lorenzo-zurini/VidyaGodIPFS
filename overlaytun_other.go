@@ -15,3 +15,5 @@ func (t *tunLink) ReadPacket() ([]byte, error) { return nil, errors.New("unsuppo
 func (t *tunLink) WritePacket([]byte) error     { return errors.New("unsupported") }
 func (t *tunLink) Close() error                 { return nil }
 func (t *tunLink) configureIP(string) error     { return errors.New("unsupported") }
+
+func (o *overlayService) serve(string) error { return errors.New("TUN overlay is Linux-only") }

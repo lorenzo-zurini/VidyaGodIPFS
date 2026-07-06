@@ -60,7 +60,30 @@ type overlayService struct {
 
 	writeMu sync.Mutex // serialize WritePacket into the link (inbound arrives on many goroutines)
 	running bool
+
+	sockL    net.Listener // unix socket receiving the TUN fd from a nested sandbox-init (nil in host-TUN mode)
+	sockPath string
 }
+
+// fdLink is a packetLink over an already-open TUN fd (received from the sandbox-init over a unix socket). Unlike
+// tunLink it does no device creation/config — the interface was created + addressed inside the sandbox netns; here we
+// only move packets across the fd, which stays valid while the sandbox (and thus its netns) lives.
+type fdLink struct {
+	f   *os.File
+	mtu int
+}
+
+func (l *fdLink) ReadPacket() ([]byte, error) {
+	buf := make([]byte, l.mtu+64)
+	n, err := l.f.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return err }
+func (l *fdLink) Close() error               { return l.f.Close() }
 
 func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
 	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{}, sends: map[peer.ID]network.Stream{}}
@@ -103,17 +126,24 @@ func (o *overlayService) attach(link packetLink) {
 	go o.readLoop(ctx, link)
 }
 
-// detach stops forwarding and tears down the link + cached streams.
+// detach stops forwarding and tears down the link + cached streams + any pending fd-handoff socket.
 func (o *overlayService) detach() {
 	o.mu.Lock()
-	if !o.running {
-		o.mu.Unlock()
+	cancel, link := o.cancel, o.link
+	sockL, sockPath := o.sockL, o.sockPath
+	wasRunning := o.running
+	o.running, o.link, o.sockL, o.sockPath = false, nil, nil, ""
+	o.mu.Unlock()
+	// Always tear down the fd-handoff socket (the accept goroutine may still be waiting even if no link attached yet).
+	if sockL != nil {
+		_ = sockL.Close()
+	}
+	if sockPath != "" {
+		_ = os.Remove(sockPath)
+	}
+	if !wasRunning {
 		return
 	}
-	o.running = false
-	cancel, link := o.cancel, o.link
-	o.link = nil
-	o.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
