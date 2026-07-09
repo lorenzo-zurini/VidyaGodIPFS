@@ -94,34 +94,44 @@ func (n *node) hasLocal(c cid.Cid) bool {
 	return err == nil && has
 }
 
+// cidMissing reports whether content the node believes it holds (via filestore references) is actually un-serveable
+// because a backing file is gone. It walks the WHOLE reference chain, not just the first leaf: a file that moved
+// wholesale orphans every leaf together, but a PARTIALLY-broken reference (only some leaves' backing gone) would slip
+// past a first-leaf check and then fail only when a peer requests those specific blocks — the "green locally, errors
+// only while serving" bug. Each DISTINCT backing path is stat'd once (a large file's thousands of leaves share one
+// path, so the walk is cheap) and the CID is "missing" if ANY backing is gone. Uses the LOCAL-only DAG service so an
+// absent block never triggers a network fetch. A CID with no filestore references at all (we simply don't host it) is
+// NOT missing — matches the previous firstRefPath=="" semantics.
 func (n *node) cidMissing(c cid.Cid) bool {
-	p := n.firstRefPath(c, cid.NewSet())
-	if p == "" {
-		return false // no filestore-referenced content reachable → nothing to be "missing"
-	}
-	_, err := os.Stat(p)
-	return err != nil
-}
-
-func (n *node) firstRefPath(c cid.Cid, seen *cid.Set) string {
-	if !seen.Visit(c) {
-		return ""
-	}
-	if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
-		// c is a filestore leaf reference. List returns the path RELATIVE to the FileManager root ("/", see
-		// node.go), so join it back to an absolute path before stat-ing.
-		return filepath.Join("/", res.FilePath)
-	}
-	// Otherwise c is a plain block (a dag-pb intermediate/root) — descend into the first child that yields a ref.
-	// Use the LOCAL-only DAG service: a node we don't have locally must not trigger a network fetch here.
-	nd, err := n.localDserv.Get(n.ctx, c)
-	if err != nil {
-		return ""
-	}
-	for _, l := range nd.Links() {
-		if p := n.firstRefPath(l.Cid, seen); p != "" {
-			return p
+	checked := map[string]bool{} // backing path -> exists (memoized across a file's many same-path leaves)
+	seen := cid.NewSet()
+	var walk func(c cid.Cid) bool
+	walk = func(c cid.Cid) bool {
+		if !seen.Visit(c) {
+			return false
 		}
+		if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
+			// A filestore leaf. List returns the path RELATIVE to the FileManager root ("/", see node.go).
+			p := filepath.Join("/", res.FilePath)
+			ok, done := checked[p]
+			if !done {
+				_, err := os.Stat(p)
+				ok = err == nil
+				checked[p] = ok
+			}
+			return !ok // backing gone → this leaf, and thus the CID, is un-serveable
+		}
+		// Plain block (dag-pb root/intermediate) — descend. Local-only: a block we don't hold isn't a broken ref.
+		nd, err := n.localDserv.Get(n.ctx, c)
+		if err != nil {
+			return false
+		}
+		for _, l := range nd.Links() {
+			if walk(l.Cid) {
+				return true // short-circuit on the first broken leaf
+			}
+		}
+		return false
 	}
-	return ""
+	return walk(c)
 }
