@@ -319,6 +319,21 @@ func VgActiveUploads(windowMs C.int, outJson **C.char) C.int {
 	return 0
 }
 
+//export VgOrphanedRefPaths
+// JSON array of DISTINCT filestore backing paths whose file is gone — orphaned no-copy references the node can't
+// serve. Empty = nothing to heal. Cheap probe (one filestore scan, one stat per distinct file) the app polls to
+// trigger an on-demand re-seed/heal without waiting for the next launch.
+func VgOrphanedRefPaths(outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(outJson, "[]")
+		return 0
+	}
+	b, _ := json.Marshal(n.orphanedRefPaths())
+	setStr(outJson, string(b))
+	return 0
+}
+
 // ---- fetch + cancellation + transfer callback ----
 
 // transferCb holds the registered C callback; fetch progress/lifecycle is reported through it.

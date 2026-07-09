@@ -102,6 +102,37 @@ func (n *node) hasLocal(c cid.Cid) bool {
 // path, so the walk is cheap) and the CID is "missing" if ANY backing is gone. Uses the LOCAL-only DAG service so an
 // absent block never triggers a network fetch. A CID with no filestore references at all (we simply don't host it) is
 // NOT missing — matches the previous firstRefPath=="" semantics.
+// orphanedRefPaths scans the filestore's references and returns the DISTINCT backing paths whose file is gone. Cheap
+// relative to per-CID cidMissing: one datastore scan + one stat per distinct file (fileOrder groups a file's leaves so
+// each path is met contiguously). This is the SERVE-reliability probe — every path returned is content some pinned CID
+// references but the node can no longer read for a requesting peer, i.e. an orphan the heal should re-point.
+func (n *node) orphanedRefPaths() []string {
+	next, err := filestore.ListAll(n.ctx, n.fstore, true) // fileOrder: a file's leaves are contiguous → 1 stat/file
+	if err != nil || next == nil {
+		return nil
+	}
+	var gone []string
+	seen := map[string]struct{}{}
+	for {
+		r := next(n.ctx)
+		if r == nil {
+			break
+		}
+		p := filepath.Join("/", r.FilePath)
+		if p == "/" {
+			continue
+		}
+		if _, done := seen[p]; done {
+			continue
+		}
+		seen[p] = struct{}{}
+		if _, statErr := os.Stat(p); statErr != nil {
+			gone = append(gone, p)
+		}
+	}
+	return gone
+}
+
 func (n *node) cidMissing(c cid.Cid) bool {
 	checked := map[string]bool{} // backing path -> exists (memoized across a file's many same-path leaves)
 	seen := cid.NewSet()
