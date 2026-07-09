@@ -219,11 +219,9 @@ func (n *node) goOnline() error {
 		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
 		n.friend.start()
 		n.friend.startPresence(45 * time.Second)
-		// Session/lobby layer: coordinates who is in a play-together session and each member's overlay vIP.
-		n.session = newSessionService(n.ctx, h, kad, n.social, emitSessionEvent)
-		n.session.start()
-		// Overlay datapath: registers the /vidyagod/overlay handler now; a TUN is attached on demand when a session
-		// launches (VgOverlayStart).
+		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
+		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
+		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
 		n.overlay = newOverlayService(n.ctx, h, kad)
 		n.overlay.start()
 	}

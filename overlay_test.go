@@ -81,10 +81,10 @@ func TestOverlayForwardsPacketToOwningPeer(t *testing.T) {
 	aVIP := [4]byte{10, 66, 5, 1}
 	bVIP := [4]byte{10, 66, 5, 2}
 	// A knows B owns 10.66.5.2; B knows A owns 10.66.5.1.
-	if err := oA.configure("10.66.5.1", map[string]string{"10.66.5.2": hB.ID().String()}); err != nil {
+	if err := oA.configure("10.66.5.1", "10.66.0.0/16", map[string]string{"10.66.5.2": hB.ID().String()}); err != nil {
 		t.Fatalf("configure A: %v", err)
 	}
-	if err := oB.configure("10.66.5.2", map[string]string{"10.66.5.1": hA.ID().String()}); err != nil {
+	if err := oB.configure("10.66.5.2", "10.66.0.0/16", map[string]string{"10.66.5.1": hA.ID().String()}); err != nil {
 		t.Fatalf("configure B: %v", err)
 	}
 
@@ -129,5 +129,50 @@ func TestOverlayForwardsPacketToOwningPeer(t *testing.T) {
 		t.Fatal("packet to an unrouted vIP should not have been delivered")
 	case <-time.After(300 * time.Millisecond):
 		// expected: dropped
+	}
+}
+
+// A broadcast packet (dst = the /16 directed broadcast) must be replicated to EVERY LAN peer — this is what makes
+// classic LAN-game discovery work over the routed overlay (which has no real broadcast domain).
+func TestOverlayFansOutBroadcast(t *testing.T) {
+	hA, hB, hC := testHost(t), testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	connectHosts(t, hA, hC)
+
+	ctx := context.Background()
+	oA, oB, oC := newOverlayService(ctx, hA, nil), newOverlayService(ctx, hB, nil), newOverlayService(ctx, hC, nil)
+	oA.start()
+	oB.start()
+	oC.start()
+
+	// A routes to both B and C (its two online LAN friends).
+	if err := oA.configure("10.66.0.1", "10.66.0.0/16", map[string]string{
+		"10.66.0.2": hB.ID().String(), "10.66.0.3": hC.ID().String(),
+	}); err != nil {
+		t.Fatalf("configure A: %v", err)
+	}
+	_ = oB.configure("10.66.0.2", "10.66.0.0/16", map[string]string{"10.66.0.1": hA.ID().String()})
+	_ = oC.configure("10.66.0.3", "10.66.0.0/16", map[string]string{"10.66.0.1": hA.ID().String()})
+
+	lA, lB, lC := newChanLink(), newChanLink(), newChanLink()
+	oA.attach(lA)
+	oB.attach(lB)
+	oC.attach(lC)
+	defer oA.detach()
+	defer oB.detach()
+	defer oC.detach()
+
+	// A broadcasts to 10.66.255.255 → both B and C must receive it.
+	bcast := ipv4Packet([4]byte{10, 66, 0, 1}, [4]byte{10, 66, 255, 255}, []byte("who-is-there"))
+	lA.in <- bcast
+	for name, l := range map[string]*chanLink{"B": lB, "C": lC} {
+		select {
+		case got := <-l.out:
+			if !bytes.Equal(got, bcast) {
+				t.Fatalf("%s received a mangled broadcast", name)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("broadcast never reached %s (fan-out failed)", name)
+		}
 	}
 }

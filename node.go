@@ -63,7 +63,6 @@ type node struct {
 	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
 	social  *socialState
 	friend  *friendService
-	session *sessionService
 	overlay *overlayService
 
 	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can

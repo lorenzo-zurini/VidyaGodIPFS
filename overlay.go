@@ -54,6 +54,7 @@ type overlayService struct {
 	link     packetLink
 	localVIP string
 	routes   map[string]peer.ID // dest vIP (e.g. "10.66.42.2") → owning peer
+	bcast    string             // the subnet's directed-broadcast address (e.g. "10.66.255.255"); "" if unknown
 
 	sendMu sync.Mutex
 	sends  map[peer.ID]network.Stream // cached outbound stream per peer (reopened on error)
@@ -89,14 +90,30 @@ func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayS
 	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{}, sends: map[peer.ID]network.Stream{}}
 }
 
+// dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
+func dialPeer(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
+	if h.Network().Connectedness(pid) == network.Connected {
+		return nil
+	}
+	if router != nil {
+		ai, err := router.FindPeer(ctx, pid)
+		if err != nil {
+			return fmt.Errorf("locate peer: %w", err)
+		}
+		return h.Connect(ctx, ai)
+	}
+	return h.Connect(ctx, peer.AddrInfo{ID: pid})
+}
+
 // start registers the inbound handler once (idempotent). Forwarding only happens while a link is attached.
 func (o *overlayService) start() {
 	o.host.SetStreamHandler(overlayProtoID, o.handleInbound)
 }
 
-// configure sets the local vIP and the vIP→peer routing table from a session roster. peerByVIP maps each remote
-// member's vIP string to their peer-ID string.
-func (o *overlayService) configure(localVIP string, peerByVIP map[string]string) error {
+// configure sets the local vIP, the /N subnet, and the vIP→peer routing table (peerByVIP maps each remote friend's vIP
+// to their peer-ID). The subnet's directed-broadcast address is derived so broadcast/multicast packets can be fanned
+// out to every peer (LAN-game discovery) rather than dropped.
+func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string]string) error {
 	routes := make(map[string]peer.ID, len(peerByVIP))
 	for vip, pidStr := range peerByVIP {
 		pid, err := peer.Decode(pidStr)
@@ -105,11 +122,33 @@ func (o *overlayService) configure(localVIP string, peerByVIP map[string]string)
 		}
 		routes[vip] = pid
 	}
+	bcast := ""
+	if _, ipnet, err := net.ParseCIDR(subnet); err == nil {
+		b := make(net.IP, len(ipnet.IP))
+		for i := range ipnet.IP {
+			b[i] = ipnet.IP[i] | ^ipnet.Mask[i]
+		}
+		bcast = b.String()
+	}
 	o.mu.Lock()
 	o.localVIP = localVIP
 	o.routes = routes
+	o.bcast = bcast
 	o.mu.Unlock()
 	return nil
+}
+
+// isFanout reports whether a destination IP is a broadcast or multicast address that should be replicated to every LAN
+// peer (so classic LAN games discover each other over the routed overlay, which has no real broadcast domain):
+// the limited broadcast 255.255.255.255, the subnet directed-broadcast (e.g. 10.66.255.255), or multicast 224.0.0.0/4.
+func (o *overlayService) isFanout(dst string) bool {
+	if dst == "255.255.255.255" || (o.bcast != "" && dst == o.bcast) {
+		return true
+	}
+	if ip := net.ParseIP(dst).To4(); ip != nil && ip[0] >= 224 && ip[0] <= 239 {
+		return true
+	}
+	return false
 }
 
 // attach begins forwarding over the given link (the TUN). Idempotent-safe: a second attach replaces the link.
@@ -173,10 +212,27 @@ func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
 			continue // not IPv4 (e.g. IPv6 ND) — drop for now
 		}
 		o.mu.Lock()
+		fanout := o.isFanout(dst)
+		var targets []peer.ID
+		if fanout {
+			targets = make([]peer.ID, 0, len(o.routes))
+			for _, pid := range o.routes {
+				targets = append(targets, pid)
+			}
+		}
 		pid, known := o.routes[dst]
 		o.mu.Unlock()
+		if fanout {
+			// Broadcast/multicast → replicate to EVERY LAN peer so their game's kernel sees the discovery packet.
+			for _, t := range targets {
+				if err := o.forward(ctx, t, pkt); err != nil {
+					fmt.Fprintf(os.Stderr, "[overlay] fan-out to %s failed: %v\n", t, err)
+				}
+			}
+			continue
+		}
 		if !known {
-			continue // no session member owns this address
+			continue // no LAN friend owns this address
 		}
 		if err := o.forward(ctx, pid, pkt); err != nil {
 			fmt.Fprintf(os.Stderr, "[overlay] forward to %s failed: %v\n", pid, err)
