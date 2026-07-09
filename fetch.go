@@ -89,6 +89,12 @@ func shortCid(c cid.Cid) string {
 // from the on-disk bitmap (a dead peer shouldn't hang the download). Longer than the UI's 6s "Stalled" hint.
 const stallTimeout = 20 * time.Second
 
+// fetchWindow bounds how many leaves are requested from bitswap at once — and thus how many received blocks are buffered
+// (in the channel + the plain blockstore) before they're written to disk and dropped. It caps a fetch's resident memory
+// at ~fetchWindow × chunkSize (512 × 256 KiB = 128 MiB) REGARDLESS of file size, so a multi-GB runner (e.g. GE-Proton)
+// can't grow the blockstore to the whole file and OOM-thrash a small-RAM machine. Below this, memory scaled with size.
+const fetchWindow = 512
+
 // zeroChunk backs refLeaf.RawData() — FileManager.Put only reads len(RawData()), never the bytes, so a shared
 // read-only buffer of the max chunk size avoids allocating per leaf.
 var zeroChunk = make([]byte, chunkSize)
@@ -582,38 +588,71 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			}
 		}()
 
-		// One long-lived bitswap SESSION for the want-list (keeps peers warm + pipelines to link speed). Blocks arrive
-		// out of order → written straight to their offset(s); the bitmap + a periodically fsync'd sidecar make it resumable.
-		fdbg("writeThrough: opening bitswap session for %d leaves cid=%s", len(need), cidStr)
+		// One long-lived bitswap SESSION (keeps peers warm + pipelines to link speed), but its want-list is issued in
+		// BOUNDED WINDOWS of fetchWindow leaves. Blocks arrive out of order → written straight to their offset(s); the
+		// bitmap + a periodically fsync'd sidecar make it resumable. As soon as a window's blocks are on disk they're
+		// dropped from the plain blockstore, so the resident block set stays ~one window instead of growing to the whole
+		// file (the OOM that thrashed a small machine on a multi-GB runner). Safe: the bytes are durable on disk (WriteAt +
+		// Sync) and finalize builds the filestore refs from the FILE via the FileManager, not from these blocks — an
+		// ungraceful stop just re-fetches the un-synced tail via the .part bitmap.
+		fdbg("writeThrough: opening bitswap session for %d leaves (window=%d) cid=%s", len(need), fetchWindow, cidStr)
 		sess := blockservice.NewSession(fctx, n.bserv)
 		lastSave := time.Now()
 		recv := 0
 		sessStart := time.Now()
-		for blk := range sess.GetBlocks(fctx, need) {
-			lastBlk.Store(time.Now().UnixNano())
-			recv++
-			data := blk.RawData()
-			for _, o := range offsets[blk.Cid()] {
-				if _, werr := out.WriteAt(data, o); werr != nil {
-					_ = out.Close()
-					fdbg("writeThrough: WriteAt IO error cid=%s err=%v", cidStr, werr)
-					return werr // IO error — keep the partial for a later retry
+		dropBlocks := func(cids []cid.Cid) {
+			if len(cids) == 0 {
+				return
+			}
+			if batch, berr := n.ds.Batch(n.ctx); berr == nil {
+				for _, c := range cids {
+					_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(dshelp.MultihashToDsKey(c.Hash())))
 				}
-				written += int64(len(data))
-				if total > 0 && onProgress != nil {
-					onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+				_ = batch.Commit(n.ctx)
+			}
+		}
+	windows:
+		for start := 0; start < len(need); start += fetchWindow {
+			end := start + fetchWindow
+			if end > len(need) {
+				end = len(need)
+			}
+			drop := make([]cid.Cid, 0, end-start)
+			for blk := range sess.GetBlocks(fctx, need[start:end]) {
+				lastBlk.Store(time.Now().UnixNano())
+				recv++
+				data := blk.RawData()
+				for _, o := range offsets[blk.Cid()] {
+					if _, werr := out.WriteAt(data, o); werr != nil {
+						_ = out.Close()
+						fdbg("writeThrough: WriteAt IO error cid=%s err=%v", cidStr, werr)
+						return werr // IO error — keep the partial for a later retry
+					}
+					written += int64(len(data))
+					if total > 0 && onProgress != nil {
+						onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+					}
+				}
+				for _, i := range idxOf[blk.Cid()] {
+					bits.set(i)
+				}
+				drop = append(drop, blk.Cid())
+				if recv%256 == 0 { // periodic heartbeat so throughput/stall is visible in the log
+					fdbg("writeThrough: recv %d/%d leaves, written=%d/%d (%.1f%%) cid=%s", recv, len(need), written, total, 100.0*float64(written)/float64(total), cidStr)
+				}
+				if time.Since(lastSave) > 2*time.Second { // durability: fsync the data BEFORE persisting the bitmap
+					_ = out.Sync()
+					_ = savePart(dest, bits)
+					lastSave = time.Now()
 				}
 			}
-			for _, i := range idxOf[blk.Cid()] {
-				bits.set(i)
-			}
-			if recv%256 == 0 { // periodic heartbeat so throughput/stall is visible in the log
-				fdbg("writeThrough: recv %d/%d leaves, written=%d/%d (%.1f%%) cid=%s", recv, len(need), written, total, 100.0*float64(written)/float64(total), cidStr)
-			}
-			if time.Since(lastSave) > 2*time.Second { // durability: fsync the data BEFORE persisting the bitmap
-				_ = out.Sync()
-				_ = savePart(dest, bits)
-				lastSave = time.Now()
+			// Window drained (or the session was torn down mid-window): persist progress, then drop these blocks' redundant
+			// blockstore copies so the resident set stays bounded to ~one window.
+			_ = out.Sync()
+			_ = savePart(dest, bits)
+			dropBlocks(drop)
+			if fctx.Err() != nil || isCancelled(cidStr) {
+				break windows // stalled/cancelled — stop issuing windows; the checks below persist + return errIncomplete
 			}
 		}
 		fdbg("writeThrough: session ended cid=%s recv=%d/%d elapsed=%s stalled=%v cancelled=%v allSet=%v", cidStr, recv, len(need), time.Since(sessStart).Round(time.Millisecond), stalled.Load(), isCancelled(cidStr), bits.allSet())
