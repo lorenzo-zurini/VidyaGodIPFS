@@ -93,6 +93,23 @@ func VgAddNoCopy(path *C.char, outCid **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+//export VgAddNoCopyMeta
+// Seed a TEXT-ONLY Meta-CID for a package dir/collection: references the *.json manifests IN PLACE (no staging copy),
+// skipping content files + DEFPREFIX/USERDATA runtime subtrees. Same CID as adding a JSON-only mirror of the tree.
+func VgAddNoCopyMeta(path *C.char, outCid **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := n.addMetaNoCopy(C.GoString(path))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(outCid, c.String())
+	return 0
+}
+
 // ---- status ----
 
 //export VgDebugCounts
