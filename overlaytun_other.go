@@ -1,9 +1,9 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package main
 
-// overlaytun_other.go — stub so the package compiles off Linux. The embedded node ships only on Linux (the TUN
-// overlay is a Linux feature), so these never run in production.
+// overlaytun_other.go — stub so the package compiles on platforms with no TUN backend. Linux has a real /dev/net/tun
+// impl (overlaytun_linux.go) and Windows has a real Wintun impl (overlaytun_windows.go); this covers everything else.
 
 import "errors"
 
