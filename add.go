@@ -233,6 +233,17 @@ func (n *node) addMetaNoCopy(path string) (cid.Cid, error) {
 	if root == nil {
 		return cid.Undef, fmt.Errorf("no JSON manifests under %s", abs)
 	}
+	// Re-point across a moved/removed staging dir: identical *.json content seeded earlier at a different path (e.g. an
+	// old <Name>.meta mirror that has since been deleted) leaves stale filestore references, and Filestore.Put skips a
+	// block it already has — so the just-built DAG still points at the gone path and the recursive Pin (or any later
+	// serve) would read it. If the reference is stale, drop the closure and rebuild once so it re-points in place.
+	// Mirrors addNoCopy's drop-and-retry (fetch.go dropRef).
+	if n.cidMissing(root.Cid()) {
+		n.dropRef(root.Cid())
+		if root, err = n.buildMetaDirNode(abs); err != nil {
+			return cid.Undef, err
+		}
+	}
 	if err := n.pinner.Pin(n.ctx, root, true, abs); err != nil {
 		return cid.Undef, err
 	}
