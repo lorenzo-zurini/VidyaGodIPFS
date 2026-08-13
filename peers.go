@@ -8,11 +8,41 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+// connsDump returns one line per live libp2p connection: direction, whether it is RELAYED (a /p2p-circuit addr — the
+// throttled fallback), the transport, and the remote multiaddr. The download-speed diagnostic: if the connection to a
+// seeder is relayed, throughput is capped by the public relay (a few KB/s); a direct QUIC/TCP conn runs at link speed.
+func (n *node) connsDump() string {
+	if n.host == nil {
+		return "offline"
+	}
+	conns := n.host.Network().Conns()
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d connection(s):\n", len(conns))
+	for _, c := range conns {
+		ra := c.RemoteMultiaddr()
+		relayed := strings.Contains(ra.String(), "p2p-circuit")
+		kind := "DIRECT"
+		if relayed {
+			kind = "RELAYED"
+		}
+		transport := "tcp"
+		if _, err := ra.ValueForProtocol(ma.P_QUIC_V1); err == nil {
+			transport = "quic"
+		} else if _, err := ra.ValueForProtocol(ma.P_WS); err == nil {
+			transport = "ws"
+		}
+		fmt.Fprintf(&b, "  %-7s %-5s %-3s %s peer=%s\n", kind, transport, c.Stat().Direction.String(), ra, c.RemotePeer())
+	}
+	return b.String()
+}
 
 // peerID is this node's libp2p peer ID ("" if offline).
 func (n *node) peerID() string {
