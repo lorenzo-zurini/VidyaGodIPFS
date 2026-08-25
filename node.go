@@ -9,10 +9,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -137,11 +139,44 @@ func openNode(repoPath string) error {
 
 	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays
 	// fully usable offline (local filestore reads, add-by-reference) — fetch of remote content just won't work.
+	// A failed first attempt (machine still bringing its network up at login, transient DNS) retries in the
+	// background with backoff instead of leaving the node offline for the whole session.
 	// VIDYAGOD_IPFS_OFFLINE forces a purely-local node (used by the tests and as a no-network escape hatch).
 	if os.Getenv("VIDYAGOD_IPFS_OFFLINE") == "" {
-		_ = gNode.goOnline()
+		if err := gNode.goOnline(); err != nil {
+			fmt.Fprintf(os.Stderr, "[node] goOnline failed: %v — retrying in background\n", err)
+			go retryOnline(gNode)
+		}
 	}
 	return nil
+}
+
+// retryOnline keeps attempting goOnline with backoff until it succeeds, the node is torn down, or a different
+// node instance replaces this one. Runs unlocked between attempts; each attempt re-checks identity under gMu.
+func retryOnline(n *node) {
+	delay := 5 * time.Second
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		gMu.Lock()
+		if gNode != n {
+			gMu.Unlock()
+			return
+		}
+		err := n.goOnline()
+		gMu.Unlock()
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "[node] goOnline retry succeeded\n")
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[node] goOnline retry failed: %v\n", err)
+		if delay *= 2; delay > 60*time.Second {
+			delay = 60 * time.Second
+		}
+	}
 }
 
 // closeNode tears the node down.

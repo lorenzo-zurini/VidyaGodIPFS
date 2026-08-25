@@ -234,6 +234,19 @@ func VgCidSize(cidStr *C.char) C.longlong {
 	return C.longlong(n.cidSize(c))
 }
 
+//export VgCidSizeLocal
+func VgCidSizeLocal(cidStr *C.char) C.longlong {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	return C.longlong(n.cidSizeLocal(c))
+}
+
 //export VgPinLs
 func VgPinLs(outJson **C.char, errOut **C.char) C.int {
 	n := get()

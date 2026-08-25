@@ -47,6 +47,23 @@ func (n *node) cidSize(c cid.Cid) int64 {
 	return n.gatewaySize(sctx, c)
 }
 
+// cidSizeLocal is cidSize restricted to the LOCAL store: no bitswap, no gateway. Returns -1 immediately when the
+// root block isn't locally readable (absent, or an orphaned filestore reference). This is what periodic status
+// refresh must use — the network-falling cidSize blocks up to 35s per un-readable pin, and a repo with hundreds of
+// orphaned references turns the first GUI refresh into hours of "off" (the bug this fixed).
+func (n *node) cidSizeLocal(c cid.Cid) int64 {
+	ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second) // disk read; the bound is just a safety net
+	defer cancel()
+	nd, err := n.localDserv.Get(ctx, c)
+	if err != nil {
+		return -1
+	}
+	if sz, serr := nd.Size(); serr == nil {
+		return int64(sz)
+	}
+	return -1
+}
+
 // pinLs returns the recursively-pinned (seeded) CIDs (drains the streaming pinner API).
 func (n *node) pinLs() ([]cid.Cid, error) {
 	var out []cid.Cid
