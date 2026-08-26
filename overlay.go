@@ -39,6 +39,10 @@ import (
 
 const overlayProtoID = protocol.ID("/vidyagod/overlay/1.0.0")
 
+// forceStreamOverlay (VG_OVERLAY_FORCE_STREAM=1) disables the QUIC-datagram fast path so ALL overlay packets ride the
+// reliable stream — a diagnostic A/B lever to measure the datagram fix's effect on latency/jitter/freezes under loss.
+var forceStreamOverlay = os.Getenv("VG_OVERLAY_FORCE_STREAM") != ""
+
 // overlayMTU bounds a single IP packet. Kept under a typical path MTU so the framed packet rides one libp2p/QUIC
 // datagram-sized write comfortably; the local link (TUN) is configured with the same MTU so the kernel never hands
 // us anything larger.
@@ -283,6 +287,9 @@ func (o *overlayService) forward(ctx context.Context, pid peer.ID, pkt []byte) e
 // connection or the packet exceeds the datagram size — signalling the caller to use the reliable stream instead.
 // No length framing: QUIC datagrams preserve message boundaries, so one datagram IS one IP packet.
 func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
+	if forceStreamOverlay {
+		return false // A/B harness: force the old reliable-stream path to compare against datagrams
+	}
 	qc := quicConnTo(o.host, pid)
 	if qc == nil {
 		return false // no direct QUIC connection (relayed/TCP, or not connected yet) → stream fallback
