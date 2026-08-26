@@ -272,6 +272,13 @@ func (n *node) announce(c cid.Cid) {
 	if n.provider == nil {
 		return // offline node / provider not wired
 	}
+	// Freshly added/downloaded content is being seeded + announced NOW — mark it so the GUI shows "seeding" immediately
+	// instead of "queued for seeding" (which is for pins awaiting the next 3-pass sweep after a restart).
+	n.seedMu.Lock()
+	if n.seedDone != nil {
+		n.seedDone[c.String()] = struct{}{}
+	}
+	n.seedMu.Unlock()
 	go func() {
 		if err := n.provider.Provide(n.ctx, c, true); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
