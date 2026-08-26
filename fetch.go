@@ -228,15 +228,54 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 	}
 }
 
-// fetchDirToPath materializes a UnixFS DIRECTORY CID (a folder of dehydrated packages) recursively to dest, writing the
-// whole tree — files and subdirs — to disk. Missing blocks arrive over the network via bitswap through n.dserv (online).
-// Unlike fetchToPath (a single file, no-dup filestore reference), this is a plain recursive materialize: the fetched
-// tree is intentionally SMALL (node JSON + cover images, no content bytes — the folder is dehydrated), and each
-// package's large per-layer content is hydrated later, on demand, by fetchToPath. Writes to a temp dir then renames
-// into place so a partial/cancelled fetch never leaves a half dir at dest.
-// onProgress is called with 0..100 while the tree streams in (indeterminate until the first tick); onFinalize(-1) fires
-// once the bytes are down and the pin/reference step runs. Both may be nil (e.g. the offline test path).
+// dirFetchAttempts bounds the retry loop of one fetchDirToPath call. Unlike file fetches (torrent-like, retry forever
+// in a background worker), a source sync runs INSIDE the app's sequential sync worker — an unbounded loop there would
+// wedge every source behind one dead CID. The C++ side re-runs syncSources periodically while a source is missing, so
+// bounded-here + periodic-there = indefinite retry overall with bounded workers.
+const dirFetchAttempts = 4
+
+// fetchDirToPath materializes a UnixFS DIRECTORY CID with the same resilience as file fetches: each attempt is
+// stall-guarded (no byte written for stallTimeout tears the attempt down instead of hanging forever), failures back
+// off and retry, and every fetched block persists in the blockstore between attempts — so a retry refills instantly
+// to where the last attempt died and continues from there (natural resume, no sidecar needed for a small meta tree).
 func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+	clearCancel(cidStr)
+	backoff := 2 * time.Second
+	var err error
+	for attempt := 1; ; attempt++ {
+		if isCancelled(cidStr) {
+			return errors.New("cancelled")
+		}
+		err = n.fetchDirOnce(cidStr, dest, onProgress, onFinalize)
+		if err == nil || err == errMissingFiles || n.ctx.Err() != nil {
+			return err
+		}
+		// Offline (tests / local-only materialize): the error is not transient, retrying is pure delay.
+		if n.dht == nil {
+			return err
+		}
+		if attempt >= dirFetchAttempts {
+			return err
+		}
+		fdbg("fetchDirToPath attempt %d failed (%v) → backoff %s then retry cid=%s", attempt, err, backoff, cidStr)
+		select {
+		case <-time.After(backoff):
+		case <-n.ctx.Done():
+			return n.ctx.Err()
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// fetchDirOnce is one attempt: root fetch (bounded, with gateway fallback), then a stall-guarded tree materialize.
+// The fetched tree is intentionally SMALL (node JSON + cover images, no content bytes — the folder is dehydrated);
+// each package's large per-layer content is hydrated later, on demand, by fetchToPath. Writes to a temp dir then
+// renames into place so a partial/cancelled fetch never leaves a half dir at dest.
+// onProgress is called with 0..100 while the tree streams in (indeterminate until the first tick); onFinalize(-1)
+// fires once the bytes are down and the pin/reference step runs. Both may be nil (e.g. the offline test path).
+func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	c, err := cid.Decode(cidStr)
 	if err != nil {
 		return err
@@ -252,7 +291,11 @@ func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64),
 		}
 		return err
 	}
-	fnode, err := unixfile.NewUnixfsFile(n.ctx, n.dserv, root)
+	// Per-attempt context: the stall watchdog cancels it to abort a tree stream that has gone quiet, so a dead peer
+	// mid-materialize surfaces as a retryable error instead of hanging the sync forever (observed: "stuck at 36%").
+	actx, acancel := context.WithCancel(n.ctx)
+	defer acancel()
+	fnode, err := unixfile.NewUnixfsFile(actx, n.dserv, root)
 	if err != nil {
 		return err
 	}
@@ -264,34 +307,49 @@ func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64),
 	tmp := dest + ".tmp"
 	_ = os.RemoveAll(tmp)
 
-	// Report download progress by polling bytes-on-disk vs the folder's cumulative size while WriteTo streams the tree.
+	// One poller drives both progress reporting (bytes-on-disk vs the folder's cumulative size) and the stall
+	// watchdog (no growth for stallTimeout → cancel the attempt). Growth-based, so a slow-but-moving stream is
+	// never killed; the root-fetch wait is already bounded by getRoot.
 	var total int64
 	if sz, serr := fnode.Size(); serr == nil {
 		total = sz
 	}
 	stop := make(chan struct{})
-	if onProgress != nil && total > 0 {
-		go func() {
-			t := time.NewTicker(250 * time.Millisecond)
-			defer t.Stop()
-			for {
-				select {
-				case <-stop:
+	var stalled atomic.Bool
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		last, lastGrow := int64(-1), time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				sz := dirSize(tmp)
+				if sz != last {
+					last, lastGrow = sz, time.Now()
+				} else if time.Since(lastGrow) > stallTimeout {
+					stalled.Store(true)
+					acancel()
 					return
-				case <-t.C:
-					pct := 100.0 * float64(dirSize(tmp)) / float64(total)
+				}
+				if onProgress != nil && total > 0 {
+					pct := 100.0 * float64(sz) / float64(total)
 					if pct > 99 {
 						pct = 99 // leave the last 1% for the pin/finalize step
 					}
 					onProgress(pct)
 				}
 			}
-		}()
-	}
+		}
+	}()
 	werr := files.WriteTo(fnode, tmp)
 	close(stop)
 	if werr != nil {
 		_ = os.RemoveAll(tmp)
+		if stalled.Load() {
+			return fmt.Errorf("stalled mid-transfer: %w", werr)
+		}
 		return werr
 	}
 	_ = os.RemoveAll(dest)
