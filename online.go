@@ -173,6 +173,12 @@ func (n *node) goOnline() error {
 		bitswap.MaxOutstandingBytesPerPeer(128<<20),
 		bitswap.TaskWorkerCount(16),
 		bitswap.EngineTaskWorkerCount(16),
+		// The engine TRUNCATES each peer's queued wantlist at 1024 entries by default, SILENTLY dropping the rest —
+		// a >256MB single-file fetch (or a few concurrent ones) overflows it, and the client limps through the tail
+		// on periodic rebroadcasts: measured ON LOOPBACK as 177 MB/s for the first 1024 blocks, then 0.3-3 MB/s for
+		// the rest — the GUI's "pulsing" download speed. Raise it so our seeders pipeline entire game layers; the
+		// client ALSO windows its wants (fetch.go wantChunk) to stay under THIRD-PARTY seeders' default cap.
+		bitswap.MaxQueuedWantlistEntriesPerPeer(1<<16),
 		// A bitswap session broadcasts its wants once, then only RE-REQUESTS unfulfilled ones after RebroadcastDelay
 		// (default 60s). So the TAIL of a large fetch (last blocks not served in the first pass) sits idle for up to a
 		// minute — looking "stalled — waiting for peers" — until the rebroadcast (or our 20s watchdog tears the

@@ -15,6 +15,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ import (
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 	"golang.org/x/sync/singleflight"
@@ -679,6 +681,31 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		recv := 0
 		sessStart := time.Now()
 
+		// VG_FETCH_RATE=1: per-second receive trace — bytes/s, blocks/s and the LARGEST inter-block gap inside each
+		// second — the ground-truth for diagnosing "pulsing" download speed (is the silence on the wire, and how long).
+		var rateBytes, rateBlocks atomic.Int64
+		var rateMaxGapMs atomic.Int64
+		if os.Getenv("VG_FETCH_RATE") != "" {
+			go func() {
+				t := time.NewTicker(1 * time.Second)
+				defer t.Stop()
+				sec := 0
+				for {
+					select {
+					case <-fctx.Done():
+						return
+					case <-t.C:
+						sec++
+						b := rateBytes.Swap(0)
+						k := rateBlocks.Swap(0)
+						g := rateMaxGapMs.Swap(0)
+						fmt.Fprintf(os.Stderr, "[rate %s] t=%03ds %8.3f MB/s blk=%3d maxgap=%4dms\n",
+							shortCid(root), sec, float64(b)/1e6, k, g)
+					}
+				}
+			}()
+		}
+
 		const dropBatch = 256 // ~64 MiB of received blocks before the flusher reclaims them → bounded residency
 		var mu sync.Mutex     // guards bits (set + snapshot) and dropQ
 		var dropQ []cid.Cid
@@ -726,10 +753,65 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			}
 		}()
 
-		for blk := range sess.GetBlocks(fctx, need) {
-			lastBlk.Store(time.Now().UnixNano())
+		// WANT WINDOWING: bitswap SERVERS truncate each peer's queued wantlist (boxo default: 1024 entries, silently
+		// dropping the overflow), and the cap is PER PEER across ALL sessions — so one big file, or three concurrent
+		// downloads, overflow it and the tail crawls in on periodic rebroadcasts (the "pulsing" download). Feed the
+		// want-list through the session in bounded chunks instead: ≤ wantChunks chunks of wantChunk leaves in flight
+		// (receipt-refilled — a chunk's channel closes when its blocks are in, admitting the next), so this fetch
+		// keeps ≤ wantChunks×wantChunk wants queued server-side and 3 concurrent fetches stay under even a
+		// DEFAULT-config seeder's cap. 256 in-flight × 256 KiB = 64 MiB of pipeline — far above any link's BDP, so
+		// throughput is unaffected. Stragglers (a lost want) delay only their own chunk's slot; the 10s rebroadcast
+		// recovers them while later chunks keep streaming through the other slot.
+		wantChunk, wantChunks := 128, 2
+		if v, _ := strconv.Atoi(os.Getenv("VG_WANT_CHUNK")); v > 0 {
+			wantChunk = v // experiment override (see the pulsing investigation)
+		}
+		if v, _ := strconv.Atoi(os.Getenv("VG_WANT_CHUNKS")); v > 0 {
+			wantChunks = v
+		}
+		blkCh := make(chan blocks.Block, 64)
+		go func() {
+			defer close(blkCh)
+			slots := make(chan struct{}, wantChunks)
+			var cwg sync.WaitGroup
+			for start := 0; start < len(need); start += wantChunk {
+				end := start + wantChunk
+				if end > len(need) {
+					end = len(need)
+				}
+				select {
+				case slots <- struct{}{}:
+				case <-fctx.Done():
+					cwg.Wait()
+					return
+				}
+				ch := sess.GetBlocks(fctx, need[start:end])
+				cwg.Add(1)
+				go func(ch <-chan blocks.Block) {
+					defer cwg.Done()
+					for b := range ch {
+						select {
+						case blkCh <- b:
+						case <-fctx.Done():
+							return
+						}
+					}
+					<-slots
+				}(ch)
+			}
+			cwg.Wait()
+		}()
+
+		for blk := range blkCh {
+			now := time.Now().UnixNano()
+			if gap := (now - lastBlk.Load()) / 1e6; gap > rateMaxGapMs.Load() {
+				rateMaxGapMs.Store(gap) // benign race with the reporter's Swap — diagnostic only
+			}
+			lastBlk.Store(now)
 			recv++
 			data := blk.RawData()
+			rateBytes.Add(int64(len(data)))
+			rateBlocks.Add(1)
 			c := blk.Cid()
 			for _, o := range offsets[c] {
 				if _, werr := out.WriteAt(data, o); werr != nil {
