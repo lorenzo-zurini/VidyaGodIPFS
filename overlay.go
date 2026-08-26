@@ -3,10 +3,18 @@ package main
 // overlay.go — the packet datapath that turns a session's vIP roster into a real virtual LAN. It is a plain L3
 // (IP) forwarder: it reads IP packets off a local link (a TUN device inside the game's bubblewrap netns in
 // production; a fake channel link in tests), looks at each packet's destination IP, maps it to the session peer that
-// owns that vIP, and ships the raw packet to them over a libp2p stream (/vidyagod/overlay/1.0.0). Inbound packets
-// from peers are injected back into the local link. The game's own kernel does TCP/IP — we only move IP packets
-// between peers — so NO userspace TCP/IP stack (gVisor etc.) is needed, and libp2p gives us the encrypted,
-// NAT-traversing (DCUtR/relay), authenticated transport for free.
+// owns that vIP, and ships the raw packet to them. Inbound packets from peers are injected back into the local link.
+// The game's own kernel does TCP/IP — we only move IP packets between peers — so NO userspace TCP/IP stack (gVisor
+// etc.) is needed, and libp2p gives us the encrypted, NAT-traversing (DCUtR/relay), authenticated transport for free.
+//
+// TRANSPORT — datagram fast path over a reliable-stream fallback. Real-time game traffic is UDP-native: loss-tolerant
+// but latency-sensitive. Carrying it over a RELIABLE ORDERED libp2p stream is the wrong model — a single lost packet
+// on a hostile link head-of-line-blocks everything behind it AND drives QUIC's CUBIC congestion window to collapse,
+// turning packet loss into multi-second tunnel freezes. So when the peer is reachable over a DIRECT QUIC connection we
+// ship each IP packet as an UNRELIABLE QUIC DATAGRAM (RFC 9221): no retransmit, no HoL-blocking, no cwnd-collapse
+// stall — a lost game packet is simply lost, exactly as on a real LAN. We fall back to the reliable stream
+// (/vidyagod/overlay/1.0.0) when there is no direct QUIC connection (relayed/TCP peer, e.g. before DCUtR upgrades) or
+// when a packet exceeds the QUIC datagram size — so delivery still works everywhere, just without the datagram win.
 //
 // overlayService is decoupled from the node singleton so two instances can be wired to an in-memory libp2p host pair
 // and a fake link each, and a packet injected on one must emerge on the other (overlay_test.go) — Spike 0, proven
@@ -15,6 +23,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +34,7 @@ import (
 	network "github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	protocol "github.com/libp2p/go-libp2p/core/protocol"
+	quic "github.com/quic-go/quic-go"
 )
 
 const overlayProtoID = protocol.ID("/vidyagod/overlay/1.0.0")
@@ -59,6 +69,10 @@ type overlayService struct {
 	sendMu sync.Mutex
 	sends  map[peer.ID]network.Stream // cached outbound stream per peer (reopened on error)
 
+	dgMu    sync.Mutex            // guards dgRecv
+	dgRecv  map[network.Conn]bool // direct-QUIC conns with a datagram receive loop already running (dedup)
+	notifee network.Notifiee      // starts a datagram receive loop on each new direct-QUIC conn to a session peer
+
 	writeMu sync.Mutex // serialize WritePacket into the link (inbound arrives on many goroutines)
 	running bool
 
@@ -87,7 +101,8 @@ func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return er
 func (l *fdLink) Close() error               { return l.f.Close() }
 
 func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
-	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{}, sends: map[peer.ID]network.Stream{}}
+	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
+		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{}}
 }
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
@@ -105,9 +120,15 @@ func dialPeer(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) 
 	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
 
-// start registers the inbound handler once (idempotent). Forwarding only happens while a link is attached.
+// start registers the inbound stream handler (the fallback path) and a network notifiee that spins a datagram
+// receive loop on each new direct-QUIC connection to a session peer. Idempotent; forwarding only happens while a link
+// is attached (the receive paths drop when o.link is nil).
 func (o *overlayService) start() {
 	o.host.SetStreamHandler(overlayProtoID, o.handleInbound)
+	o.notifee = &network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) { o.maybeStartDatagramLoop(c) },
+	}
+	o.host.Network().Notify(o.notifee)
 }
 
 // configure sets the local vIP, the /N subnet, and the vIP→peer routing table (peerByVIP maps each remote friend's vIP
@@ -135,6 +156,13 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 	o.routes = routes
 	o.bcast = bcast
 	o.mu.Unlock()
+	// Existing direct-QUIC connections to these peers (e.g. a fetch already holepunched to a friend) need a datagram
+	// receive loop too — the notifiee only catches connections that appear AFTER this point.
+	for _, pid := range routes {
+		for _, c := range o.host.Network().ConnsToPeer(pid) {
+			o.maybeStartDatagramLoop(c)
+		}
+	}
 	return nil
 }
 
@@ -240,8 +268,115 @@ func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
 	}
 }
 
-// forward writes one packet to a peer over a cached (lazily opened) stream, reopening on a broken stream once.
+// forward ships one packet to a peer: an unreliable QUIC datagram over a direct connection (the fast path), else the
+// reliable stream (relayed/TCP peer, or an oversized packet). Datagram sends that "fail" as loss are the intended
+// behaviour for game traffic — only a MISSING datagram transport (no direct QUIC conn / too large) falls through.
 func (o *overlayService) forward(ctx context.Context, pid peer.ID, pkt []byte) error {
+	if o.sendDatagram(pid, pkt) {
+		return nil
+	}
+	return o.forwardStream(ctx, pid, pkt)
+}
+
+// sendDatagram tries to ship pkt as one QUIC datagram over a direct connection to pid. Returns true if a direct QUIC
+// connection carried it (or dropped it as tolerable game-traffic loss), false if there is no datagram-capable
+// connection or the packet exceeds the datagram size — signalling the caller to use the reliable stream instead.
+// No length framing: QUIC datagrams preserve message boundaries, so one datagram IS one IP packet.
+func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
+	qc := quicConnTo(o.host, pid)
+	if qc == nil {
+		return false // no direct QUIC connection (relayed/TCP, or not connected yet) → stream fallback
+	}
+	if err := qc.SendDatagram(pkt); err != nil {
+		var tooLarge *quic.DatagramTooLargeError
+		if errors.As(err, &tooLarge) {
+			return false // packet bigger than the path's datagram size → send it reliably over the stream
+		}
+		// Transient (send queue momentarily full, MTU shrank): a real LAN would drop it too. Drop, don't reliably
+		// resend — resending game traffic is what we're trying to avoid. Count it as handled by the datagram path.
+		return true
+	}
+	return true
+}
+
+// quicConnTo returns the underlying *quic.Conn of a DIRECT QUIC connection to pid, or nil if the only connections are
+// relayed/TCP (whose transport conn does not unwrap to a *quic.Conn). network.Conn.As delegates through the swarm to
+// the QUIC transport's As, which sets the pointer.
+func quicConnTo(h host.Host, pid peer.ID) *quic.Conn {
+	for _, c := range h.Network().ConnsToPeer(pid) {
+		var qc *quic.Conn
+		if c.As(&qc) && qc != nil {
+			return qc
+		}
+	}
+	return nil
+}
+
+// maybeStartDatagramLoop starts a datagram receive loop on c if it is a direct-QUIC connection to a session peer and
+// no loop is running on it yet. Idempotent (deduped by conn); the loop lives until the connection closes.
+func (o *overlayService) maybeStartDatagramLoop(c network.Conn) {
+	o.mu.Lock()
+	_, isRoute := routesContain(o.routes, c.RemotePeer())
+	o.mu.Unlock()
+	if !isRoute {
+		return
+	}
+	var qc *quic.Conn
+	if !c.As(&qc) || qc == nil {
+		return // relayed/TCP conn — inbound arrives on the stream handler instead
+	}
+	o.dgMu.Lock()
+	if o.dgRecv[c] {
+		o.dgMu.Unlock()
+		return
+	}
+	o.dgRecv[c] = true
+	o.dgMu.Unlock()
+	go o.datagramRecvLoop(c, qc)
+}
+
+// datagramRecvLoop injects each inbound QUIC datagram (one IP packet) into the local link, until the connection closes.
+func (o *overlayService) datagramRecvLoop(c network.Conn, qc *quic.Conn) {
+	defer func() {
+		o.dgMu.Lock()
+		delete(o.dgRecv, c)
+		o.dgMu.Unlock()
+	}()
+	for {
+		pkt, err := qc.ReceiveDatagram(o.parent)
+		if err != nil {
+			return // connection closed or service shutting down
+		}
+		if _, ok := ipv4Dst(pkt); !ok {
+			continue // not an IP packet we forward (junk / non-overlay datagram) — drop
+		}
+		o.mu.Lock()
+		link := o.link
+		o.mu.Unlock()
+		if link == nil {
+			continue // no session link attached — drop
+		}
+		o.writeMu.Lock()
+		werr := link.WritePacket(pkt)
+		o.writeMu.Unlock()
+		if werr != nil {
+			return
+		}
+	}
+}
+
+// routesContain reports whether pid owns any vIP in the routing table.
+func routesContain(routes map[string]peer.ID, pid peer.ID) (string, bool) {
+	for vip, p := range routes {
+		if p == pid {
+			return vip, true
+		}
+	}
+	return "", false
+}
+
+// forwardStream writes one packet to a peer over a cached (lazily opened) stream, reopening on a broken stream once.
+func (o *overlayService) forwardStream(ctx context.Context, pid peer.ID, pkt []byte) error {
 	s, err := o.sendStream(ctx, pid)
 	if err != nil {
 		return err

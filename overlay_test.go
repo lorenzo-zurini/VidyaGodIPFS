@@ -11,6 +11,9 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	libp2p "github.com/libp2p/go-libp2p"
+	host "github.com/libp2p/go-libp2p/core/host"
 )
 
 // chanLink is a fake packetLink: ReadPacket drains `in` (packets the "OS/game" sent), WritePacket pushes to `out`
@@ -129,6 +132,78 @@ func TestOverlayForwardsPacketToOwningPeer(t *testing.T) {
 		t.Fatal("packet to an unrouted vIP should not have been delivered")
 	case <-time.After(300 * time.Millisecond):
 		// expected: dropped
+	}
+}
+
+// quicHost is a real libp2p host on QUIC (not TCP), so the overlay's datagram fast path is exercisable — quicConnTo
+// unwraps a direct QUIC connection to a *quic.Conn, and quic-go datagrams (RFC 9221) carry the packets.
+func quicHost(t *testing.T) host.Host {
+	t.Helper()
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"))
+	if err != nil {
+		t.Fatalf("quic host: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	return h
+}
+
+// The datagram fast path: over a DIRECT QUIC connection the overlay must ship IP packets as unreliable QUIC datagrams
+// (no reliable stream), and they must still arrive byte-for-byte on the peer's link. Proves the new transport works,
+// not just the stream fallback that the TCP-host tests cover.
+func TestOverlayDatagramFastPathOverQUIC(t *testing.T) {
+	hA, hB := quicHost(t), quicHost(t)
+	connectHosts(t, hA, hB)
+
+	// Precondition: a direct QUIC connection unwraps to a *quic.Conn on BOTH sides (else we'd be testing the fallback).
+	if quicConnTo(hA, hB.ID()) == nil || quicConnTo(hB, hA.ID()) == nil {
+		t.Fatal("expected a direct QUIC connection so the datagram path is used")
+	}
+
+	ctx := context.Background()
+	oA, oB := newOverlayService(ctx, hA, nil), newOverlayService(ctx, hB, nil)
+	oA.start()
+	oB.start()
+	if err := oA.configure("10.66.9.1", "10.66.0.0/16", map[string]string{"10.66.9.2": hB.ID().String()}); err != nil {
+		t.Fatalf("configure A: %v", err)
+	}
+	if err := oB.configure("10.66.9.2", "10.66.0.0/16", map[string]string{"10.66.9.1": hA.ID().String()}); err != nil {
+		t.Fatalf("configure B: %v", err)
+	}
+
+	// configure() must have started a datagram receive loop on the existing direct QUIC conn (else inbound would only
+	// arrive via the stream handler and this wouldn't test datagrams).
+	oB.dgMu.Lock()
+	nLoops := len(oB.dgRecv)
+	oB.dgMu.Unlock()
+	if nLoops == 0 {
+		t.Fatal("B did not start a datagram receive loop on its direct QUIC conn to A")
+	}
+
+	lA, lB := newChanLink(), newChanLink()
+	oA.attach(lA)
+	oB.attach(lB)
+	defer oA.detach()
+	defer oB.detach()
+
+	// A datagram is unreliable: retry a few packets to tolerate a startup-race drop, but each MUST arrive intact.
+	payload := []byte("datagram-hello")
+	pkt := ipv4Packet([4]byte{10, 66, 9, 1}, [4]byte{10, 66, 9, 2}, payload)
+	var got []byte
+	deadline := time.After(5 * time.Second)
+	for got == nil {
+		select {
+		case <-deadline:
+			t.Fatal("no datagram arrived at B within 5s")
+		default:
+		}
+		lA.in <- pkt
+		select {
+		case got = <-lB.out:
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	if !bytes.Equal(got, pkt) {
+		t.Fatalf("B received a mangled datagram: %d bytes, want %d", len(got), len(pkt))
 	}
 }
 
