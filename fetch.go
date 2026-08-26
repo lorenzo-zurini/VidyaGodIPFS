@@ -175,6 +175,12 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 	backoff := 2 * time.Second
 	missTries := 0
 	fdbg("fetchToPath ENTER cid=%s dest=%s", cidStr, dest)
+	// Proactively freshen provider addresses (warm.go): a live DHT walk + connect in parallel with bitswap, so a stale
+	// cached relay address for the provider can't stall discovery past the deadline. No-op offline / when already
+	// connected on a working addr.
+	if c, derr := cid.Decode(cidStr); derr == nil {
+		n.warmProviders(c)
+	}
 	for attempt := 1; ; attempt++ {
 		if isCancelled(cidStr) {
 			fdbg("fetchToPath cancelled before attempt %d cid=%s", attempt, cidStr)
