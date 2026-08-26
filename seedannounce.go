@@ -93,10 +93,37 @@ func (n *node) runSeedAnnounce() {
 	}
 
 	fmt.Fprintf(os.Stderr, "[seed] announce: %d collection + %d package + %d content CID(s)\n", len(colls), len(pkgs), len(content))
+	// Meta levels are FEW and the shareable units, so provide them with a blocking DHT walk (ordered, exact "announced"
+	// signal). Content is MANY (thousands) — a blocking provide each took ~an hour — so hand it to the boxo provider's
+	// batched queue instead (Provide enqueues + returns); it stays "queued for seeding" only across the fast meta
+	// passes, then flips to seeding as it's enqueued.
 	n.announcePass("collections", colls)
 	n.announcePass("packages", pkgs)
-	n.announcePass("content", content)
-	fmt.Fprintf(os.Stderr, "[seed] announce complete — %d CID(s) live on the DHT\n", n.seedCount())
+	n.announceContentBulk(content)
+	fmt.Fprintf(os.Stderr, "[seed] announce complete — %d CID(s) marked seeding\n", n.seedCount())
+}
+
+// announceContentBulk enqueues every content root into the boxo provider's efficient batched provide queue rather than
+// blocking on a per-CID DHT walk, and marks each seeded now (it's pinned, servable, and queued to announce). Falls
+// back to the blocking pass if the provider isn't wired.
+func (n *node) announceContentBulk(cids []cid.Cid) {
+	if len(cids) == 0 {
+		return
+	}
+	if n.provider == nil {
+		n.announcePass("content", cids)
+		return
+	}
+	for _, c := range cids {
+		if n.ctx.Err() != nil {
+			return
+		}
+		_ = n.provider.Provide(n.ctx, c, true)
+		n.seedMu.Lock()
+		n.seedDone[c.String()] = struct{}{}
+		n.seedMu.Unlock()
+	}
+	fmt.Fprintf(os.Stderr, "[seed] pass 'content' enqueued %d CID(s) to the provider queue\n", len(cids))
 }
 
 // announcePass provides every CID in cids to the DHT concurrently, marking each done as its blocking Provide returns.
