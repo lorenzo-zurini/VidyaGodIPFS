@@ -77,6 +77,9 @@ type overlayService struct {
 	dgRecv  map[network.Conn]bool // direct-QUIC conns with a datagram receive loop already running (dedup)
 	notifee network.Notifiee      // starts a datagram receive loop on each new direct-QUIC conn to a session peer
 
+	logDatagram sync.Once // one-shot "[overlay] TX path: DATAGRAM" the first time a datagram carries a packet
+	logStream   sync.Once // one-shot "[overlay] TX path: STREAM"   the first time the stream fallback carries a packet
+
 	writeMu sync.Mutex // serialize WritePacket into the link (inbound arrives on many goroutines)
 	running bool
 
@@ -303,6 +306,7 @@ func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
 		// resend — resending game traffic is what we're trying to avoid. Count it as handled by the datagram path.
 		return true
 	}
+	o.logDatagram.Do(func() { fmt.Fprintln(os.Stderr, "[overlay] TX path: DATAGRAM (unreliable QUIC datagrams)") })
 	return true
 }
 
@@ -384,6 +388,10 @@ func routesContain(routes map[string]peer.ID, pid peer.ID) (string, bool) {
 
 // forwardStream writes one packet to a peer over a cached (lazily opened) stream, reopening on a broken stream once.
 func (o *overlayService) forwardStream(ctx context.Context, pid peer.ID, pkt []byte) error {
+	o.logStream.Do(func() {
+		fmt.Fprintf(os.Stderr, "[overlay] TX path: STREAM (reliable fallback%s)\n",
+			map[bool]string{true: ", forced via VG_OVERLAY_FORCE_STREAM", false: ""}[forceStreamOverlay])
+	})
 	s, err := o.sendStream(ctx, pid)
 	if err != nil {
 		return err
