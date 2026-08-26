@@ -237,6 +237,10 @@ func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64),
 	if err != nil {
 		return err
 	}
+	// A meta/collection CID is a DIRECTORY, and fetching one on a hostile network needs the same proactive provider
+	// warming that single-file fetches get (warm.go): a live DHT provider walk + connect in parallel with bitswap, so a
+	// NAT'd provider is holepunched before getRoot's deadline instead of relying on bitswap's slower passive connect.
+	n.warmProviders(c)
 	root, err := n.getRoot(c, cidStr, onProgress) // libp2p, or an HTTPS trustless-gateway CAR fallback on hostile nets
 	if err != nil {
 		if err == errMissingFiles || isMissingFile(err) {
