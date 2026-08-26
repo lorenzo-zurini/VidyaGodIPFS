@@ -29,8 +29,12 @@ func benchNoTunnel() bool { return os.Getenv("VG_BENCH_NO_TUNNEL") != "" }
 func benchObserve() bool  { return os.Getenv("VG_BENCH_OBSERVE") != "" }
 
 // benchBlockedCIDRs is the tunnel/overlay subnets to exclude from benchmark traffic, plus any from VG_BENCH_BLOCK_CIDRS.
+// Includes fc00::/7 (ALL IPv6 ULA) because ZeroTier assigns RFC4193 (fd…) + 6PLANE (fc…) ULAs in addition to its IPv4
+// range — an IPv4-only block leaks: libp2p finds the peer over the ULA overlay and dials direct, so a "gated" run
+// silently rides the tunnel. ULA is never internet-routable, so blocking the whole /7 can't remove a legit open-internet
+// path (that is 2000::/3 global unicast, untouched). fe80::/10 (link-local) blocked for the same reason.
 func benchBlockedCIDRs() []*net.IPNet {
-	spec := "10.10.0.0/24,172.25.0.0/16" // WireGuard wg0, ZeroTier ztksezll47 — the paths this pair shares
+	spec := "10.10.0.0/24,172.25.0.0/16,fc00::/7,fe80::/10" // WireGuard wg0 + ZeroTier ztksezll47 (IPv4 range + all ULA)
 	if extra := os.Getenv("VG_BENCH_BLOCK_CIDRS"); extra != "" {
 		spec += "," + extra
 	}
