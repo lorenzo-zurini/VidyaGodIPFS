@@ -19,7 +19,34 @@ import (
 // upTracer implements boxo/bitswap/tracer.Tracer.
 type upTracer struct{ n *node }
 
-func (upTracer) MessageReceived(peer.ID, bsmsg.BitSwapMessage) {}
+// MessageReceived — ANNOUNCE ON DEMAND: when a peer asks for one of our pinned roots that we haven't announced to the
+// DHT yet (e.g. the periodic 3-pass sweep hasn't reached it), publish it RIGHT NOW so it — and every other peer —
+// can discover it, instead of waiting for the sweep. Cheap on the hot path: a map lookup per want; announce() (which
+// also marks it seeding) only fires for an as-yet-unannounced pinned root, and marks seedDone synchronously so a burst
+// of wants for the same CID triggers exactly one publish.
+func (t upTracer) MessageReceived(_ peer.ID, m bsmsg.BitSwapMessage) {
+	wl := m.Wantlist()
+	if len(wl) == 0 {
+		return
+	}
+	ps, _ := t.n.pinnedSet.Load().(map[string]struct{})
+	if len(ps) == 0 {
+		return
+	}
+	for _, e := range wl {
+		if e.Cancel {
+			continue
+		}
+		cs := e.Cid.String()
+		if _, isPinned := ps[cs]; !isPinned {
+			continue // only our pinned roots are discovered by CID; leaves ride the root's provider record
+		}
+		if t.n.seedAnnounced(cs) {
+			continue // already live on the DHT
+		}
+		t.n.announce(e.Cid)
+	}
+}
 
 func (t upTracer) MessageSent(_ peer.ID, m bsmsg.BitSwapMessage) {
 	blocks := m.Blocks()
