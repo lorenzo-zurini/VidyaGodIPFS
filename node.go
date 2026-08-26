@@ -25,6 +25,7 @@ import (
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	provider "github.com/ipfs/boxo/provider"
+	cid "github.com/ipfs/go-cid"
 	datastore "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 	leveldb "github.com/ipfs/go-ds-leveldb"
@@ -73,6 +74,15 @@ type node struct {
 	upMu      sync.Mutex
 	upSeen    map[string]int64 // pinned-root CID → last-served unix-ms
 	pinnedSet atomic.Value     // holds map[string]struct{} of pinned root CIDs
+
+	// seed announce (seedannounce.go): a 3-pass, level-ordered DHT announce of every pinned CID (collection meta →
+	// package meta → content) run on start + periodically, with per-CID completion tracking so the GUI shows "queued
+	// for seeding" until a CID is announced, then "seeding". Levels come from the app via setSeedLevels.
+	seedMu      sync.RWMutex
+	seedDone    map[string]struct{} // CIDs whose DHT announce has completed at least once
+	seedColls   []cid.Cid           // level-3 collection meta-CIDs (announced first)
+	seedPkgs    []cid.Cid           // level-2 package meta-CIDs (announced second)
+	seedStarted bool                // the announce loop is running (setSeedLevels was called)
 }
 
 var (
@@ -132,6 +142,7 @@ func openNode(repoPath string) error {
 		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,
+		seedDone:   map[string]struct{}{},
 	}
 	// The address book loads independently of the network so contacts survive offline; the live protocol attaches
 	// in goOnline.

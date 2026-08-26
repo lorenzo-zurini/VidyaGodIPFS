@@ -93,9 +93,10 @@ func VgAddNoCopy(path *C.char, outCid **C.char, errOut **C.char) C.int {
 	return 0
 }
 
-//export VgAddNoCopyMeta
 // Seed a TEXT-ONLY Meta-CID for a package dir/collection: references the *.json manifests IN PLACE (no staging copy),
 // skipping content files + DEFPREFIX/USERDATA runtime subtrees. Same CID as adding a JSON-only mirror of the tree.
+//
+//export VgAddNoCopyMeta
 func VgAddNoCopyMeta(path *C.char, outCid **C.char, errOut **C.char) C.int {
 	n := get()
 	if n == nil {
@@ -200,7 +201,7 @@ func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	if err != nil {
 		return fail(errOut, err)
 	}
-	n.dropClosure(c)      // delete the partial's cached blocks (offline walk; absent leaves skipped)
+	n.dropClosure(c)       // delete the partial's cached blocks (offline walk; absent leaves skipped)
 	n.scheduleCompaction() // reclaim the tombstone disk
 	return 0
 }
@@ -320,8 +321,47 @@ func VgProviderCount(cidStr *C.char, timeoutMs C.int) C.int {
 	return C.int(n.providerCount(c, int(timeoutMs)))
 }
 
-//export VgBandwidthRates
+// Record the level-3 collection + level-2 package meta-CIDs (JSON arrays of CID strings) and start/refresh the 3-pass
+// level-ordered seed announce (seedannounce.go). Content = every other pinned root. Idempotent.
+//
+//export VgSetSeedLevels
+func VgSetSeedLevels(collectionsJson *C.char, packagesJson *C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	parse := func(s string) []cid.Cid {
+		var arr []string
+		_ = json.Unmarshal([]byte(s), &arr)
+		out := make([]cid.Cid, 0, len(arr))
+		for _, x := range arr {
+			if c, e := cid.Decode(x); e == nil {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	n.setSeedLevels(parse(C.GoString(collectionsJson)), parse(C.GoString(packagesJson)))
+	return 0
+}
+
+// 1 if a pinned CID's DHT announce has completed (→ "seeding"), 0 if still queued (or unknown). Cheap in-memory lookup.
+//
+//export VgSeedAnnounced
+func VgSeedAnnounced(cidStr *C.char) C.int {
+	n := get()
+	if n == nil {
+		return 0
+	}
+	if n.seedAnnounced(C.GoString(cidStr)) {
+		return 1
+	}
+	return 0
+}
+
 // Writes the node's current global receive/send rates (bytes/sec) into *inBps/*outBps. Zero when offline.
+//
+//export VgBandwidthRates
 func VgBandwidthRates(inBps *C.double, outBps *C.double) {
 	n := get()
 	if n == nil {
@@ -336,8 +376,9 @@ func VgBandwidthRates(inBps *C.double, outBps *C.double) {
 	}
 }
 
-//export VgActiveUploads
 // JSON array of pinned-root CIDs served to a peer within the last windowMs (the items currently being uploaded).
+//
+//export VgActiveUploads
 func VgActiveUploads(windowMs C.int, outJson **C.char) C.int {
 	n := get()
 	if n == nil {
@@ -349,10 +390,11 @@ func VgActiveUploads(windowMs C.int, outJson **C.char) C.int {
 	return 0
 }
 
-//export VgOrphanedRefPaths
 // JSON array of DISTINCT filestore backing paths whose file is gone — orphaned no-copy references the node can't
 // serve. Empty = nothing to heal. Cheap probe (one filestore scan, one stat per distinct file) the app polls to
 // trigger an on-demand re-seed/heal without waiting for the next launch.
+//
+//export VgOrphanedRefPaths
 func VgOrphanedRefPaths(outJson **C.char) C.int {
 	n := get()
 	if n == nil {
@@ -409,9 +451,10 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	return 0
 }
 
-//export VgFetchDirToPath
 // Recursively materialize a UnixFS DIRECTORY CID (a folder of dehydrated packages) to dest. Fetches the small manifest
 // tree only — no per-layer content hydration. Requires the node's network stack to be up (blocks arrive via bitswap).
+//
+//export VgFetchDirToPath
 func VgFetchDirToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	n := get()
 	if n == nil {

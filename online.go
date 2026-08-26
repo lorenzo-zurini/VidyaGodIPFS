@@ -23,14 +23,14 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
-	metrics "github.com/libp2p/go-libp2p/core/metrics"
-	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
-	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
-	swarm "github.com/libp2p/go-libp2p/p2p/net/swarm"
 	host "github.com/libp2p/go-libp2p/core/host"
+	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	connmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	swarm "github.com/libp2p/go-libp2p/p2p/net/swarm"
 )
 
 // loadOrCreateIdentity persists a stable Ed25519 peer key under the repo so the peer ID is consistent across runs.
@@ -247,7 +247,13 @@ func (n *node) goOnline() error {
 		case <-n.ctx.Done():
 			return
 		}
-		if n.provider != nil {
+		// FALLBACK only: if the app hasn't driven the level-ordered 3-pass seed announce (seedannounce.go), do a plain
+		// boxo reprovide of all pinned roots. When the app calls setSeedLevels (GUI / long-lived seeder) that runs
+		// instead, giving ordered + tracked announcing; the boxo 22h reprovider remains the long-term backstop either way.
+		n.seedMu.RLock()
+		started := n.seedStarted
+		n.seedMu.RUnlock()
+		if !started && n.provider != nil {
 			if err := n.provider.Reprovide(n.ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "[node] startup reprovide failed: %v\n", err)
 			} else {
