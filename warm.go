@@ -47,7 +47,7 @@ func (n *node) warmProviders(c cid.Cid) {
 				fdbg("warm: first provider %s after %s (walk)", shortPeer(pi.ID.String()), time.Since(t0).Round(time.Millisecond))
 				first = false
 			}
-			n.freshenAndConnect(ctx, pi)
+			go n.freshenAndConnect(ctx, pi) // one goroutine per provider — never serialize behind a slow FindPeer
 		}
 	}()
 }
@@ -60,28 +60,38 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	if n.host.Network().Connectedness(pi.ID) == network.Connected {
 		return
 	}
-	// Live routing walk for current addresses. This is the key step: peers close to pi.ID return the addresses they
-	// have most recently seen it on (relays it currently holds reservations with, its current public ip:port), which
-	// supersedes whatever stale relay addr our peerstore cached from a previous run.
-	tf := time.Now()
-	fresh, err := n.dht.FindPeer(ctx, pi.ID)
-	fdbg("warm: FindPeer %s → %d addr in %s (err=%v)", shortPeer(pi.ID.String()), len(fresh.Addrs), time.Since(tf).Round(time.Millisecond), err)
-	if err == nil && len(fresh.Addrs) > 0 {
-		pi = fresh
-	} else if len(pi.Addrs) == 0 {
-		return // no cached addrs and the walk found none — nothing to dial
+	// FAST PATH: FindProvidersAsync already handed us the provider's advertised addresses (from its provider record).
+	// Dial them immediately — the common case where the record is current — concurrently with bitswap's own dial;
+	// whichever connects first wins, the other no-ops.
+	if len(pi.Addrs) > 0 {
+		n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, 10*time.Minute)
+		go n.dialWarm(ctx, peer.AddrInfo{ID: pi.ID, Addrs: pi.Addrs}, "record")
 	}
-	// Refresh the peerstore with the current addresses at a short TTL, so a stale entry can't out-live a good one.
-	n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, 10*time.Minute)
+	// REFRESH PATH (bounded): a live FindPeer walk gets CURRENT addresses when the record is stale (an old relay
+	// reservation). On a hostile DHT this walk can take tens of seconds — longer than the whole fetch — so it MUST be
+	// bounded and off the critical path. Cap it hard; if it returns newer addrs and we're still not connected, dial those.
+	fctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	tf := time.Now()
+	fresh, err := n.dht.FindPeer(fctx, pi.ID)
+	fdbg("warm: FindPeer %s → %d addr in %s (err=%v)", shortPeer(pi.ID.String()), len(fresh.Addrs), time.Since(tf).Round(time.Millisecond), err)
+	if err == nil && len(fresh.Addrs) > 0 && n.host.Network().Connectedness(pi.ID) != network.Connected {
+		n.host.Peerstore().AddAddrs(fresh.ID, fresh.Addrs, 10*time.Minute)
+		n.dialWarm(ctx, fresh, "findpeer")
+	}
+}
+
+// dialWarm connects to pi with a bounded timeout, logging the outcome (VG_FETCH_DEBUG) + a bench line (VG_BENCH_OBSERVE).
+func (n *node) dialWarm(ctx context.Context, pi peer.AddrInfo, via string) {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	td := time.Now()
 	if err := n.host.Connect(cctx, pi); err != nil {
-		fdbg("warm: connect to provider %s failed after %s: %v", shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond), err)
+		fdbg("warm: connect(%s) to %s failed after %s: %v", via, shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond), err)
 		return
 	}
-	fdbg("warm: connected %s (relay/direct) in %s", shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond))
+	fdbg("warm: connected(%s) %s in %s", via, shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond))
 	if benchObserve() {
-		fmt.Fprintf(os.Stderr, "[warm] connected fresh to provider %s (%d addr)\n", shortPeer(pi.ID.String()), len(pi.Addrs))
+		fmt.Fprintf(os.Stderr, "[warm] connected via %s to provider %s (%d addr)\n", via, shortPeer(pi.ID.String()), len(pi.Addrs))
 	}
 }

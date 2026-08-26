@@ -840,7 +840,12 @@ func (n *node) dropClosure(root cid.Cid) {
 // network. Only the small dag-pb intermediate nodes need reading to enumerate leaf CIDs; the leaves themselves are
 // deleted by CID without reading their (possibly gone) content.
 func (n *node) dropRef(root cid.Cid) {
+	// Enumerate the closure first (reading only the small dag-pb intermediates), then delete every leaf in ONE
+	// datastore batch. Per-leaf fstore.DeleteBlock was O(leaves) sync writes to leveldb — ~21 ms each, so a 763-leaf
+	// file stalled ~16 s. A single batched commit is ~one sync. Each leaf may live as a filestore reference
+	// (/filestore/<mh>) AND/OR a plain block (/blocks/<mh>); delete both keys so neither layout survives.
 	seen := cid.NewSet()
+	var cids []cid.Cid
 	var walk func(c cid.Cid)
 	walk = func(c cid.Cid) {
 		if !seen.Visit(c) {
@@ -851,9 +856,25 @@ func (n *node) dropRef(root cid.Cid) {
 				walk(l.Cid)
 			}
 		}
-		_ = n.fstore.DeleteBlock(n.ctx, c)
+		cids = append(cids, c)
 	}
 	walk(root)
+	if batch, err := n.ds.Batch(n.ctx); err == nil {
+		for _, c := range cids {
+			k := dshelp.MultihashToDsKey(c.Hash())
+			_ = batch.Delete(n.ctx, filestore.FilestorePrefix.Child(k))
+			_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(k))
+		}
+		if cerr := batch.Commit(n.ctx); cerr != nil { // batch failed → fall back to the per-block path (correctness over speed)
+			for _, c := range cids {
+				_ = n.fstore.DeleteBlock(n.ctx, c)
+			}
+		}
+	} else {
+		for _, c := range cids {
+			_ = n.fstore.DeleteBlock(n.ctx, c)
+		}
+	}
 	_ = n.unpin(root) // drop the stale recursive pin; the re-add re-pins against the new backing file
 	n.scheduleCompaction()
 }
