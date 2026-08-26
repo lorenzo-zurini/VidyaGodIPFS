@@ -135,6 +135,11 @@ func (n *node) goOnline() error {
 	if mr, merr := dohMultiaddrResolver(); merr == nil {
 		libp2pOpts = append(libp2pOpts, libp2p.MultiaddrResolver(swarm.ResolverFromMaDNS{Resolver: mr}))
 	}
+	// Benchmark control (bench.go): VG_BENCH_NO_TUNNEL forces open-internet paths by gating out the WireGuard/ZeroTier
+	// subnets this machine pair shares, so a measured throughput can't secretly be riding the tunnel. No-op otherwise.
+	if gater := newBenchGater(); gater != nil {
+		libp2pOpts = append(libp2pOpts, libp2p.ConnectionGater(gater))
+	}
 	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return err
@@ -229,6 +234,7 @@ func (n *node) goOnline() error {
 	n.online = true
 	go n.bootstrap()
 	go n.refreshPinnedSet(n.ctx) // keep the pinned-root set warm for the upload tracer
+	n.startBenchObserver()       // bench.go: periodic path/bandwidth ground-truth log when VG_BENCH_OBSERVE is set
 
 	// Announce EVERYTHING we seed to the DHT shortly after startup (once the routing table is warm), instead of waiting
 	// up to ReproviderInterval (22h) for the first scheduled sweep. Without this, a just-launched seeder's content —
