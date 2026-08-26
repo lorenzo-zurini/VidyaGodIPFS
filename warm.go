@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	cid "github.com/ipfs/go-cid"
@@ -26,13 +27,22 @@ import (
 // warmProviderCount bounds how many providers we actively freshen — enough to find a reachable one without fanning out.
 const warmProviderCount = 6
 
+// warmInflight dedupes concurrent warms of the same CID: retry loops call warmProviders every attempt (backoff can be
+// as low as 2s) while a walk runs up to 40s — without this, walks for one CID would pile up.
+var warmInflight sync.Map
+
 // warmProviders runs a live provider+address refresh for c and connects to reachable providers. Non-blocking: launches
-// a bounded goroutine and returns. Safe to call on every fetch; no-op if the node is offline or the DHT isn't wired.
+// a bounded goroutine and returns. Safe to call on every fetch; no-op if the node is offline or the DHT isn't wired,
+// or when a walk for this CID is already in flight.
 func (n *node) warmProviders(c cid.Cid) {
 	if n.dht == nil || n.host == nil {
 		return
 	}
+	if _, busy := warmInflight.LoadOrStore(c.String(), struct{}{}); busy {
+		return
+	}
 	go func() {
+		defer warmInflight.Delete(c.String())
 		ctx, cancel := context.WithTimeout(n.ctx, 40*time.Second)
 		defer cancel()
 		self := n.host.ID()

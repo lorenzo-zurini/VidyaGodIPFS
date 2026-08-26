@@ -166,6 +166,18 @@ func (n *node) announcePass(label string, cids []cid.Cid) {
 	fmt.Fprintf(os.Stderr, "[seed] pass '%s' done (%d CID(s))\n", label, len(cids))
 }
 
+// warmSeedLevelProviders warms the providers of our COLLECTION meta-CIDs (warm.go) — the discovery anchors of the
+// 3-level schema. Content fetches call this each attempt so a file whose own DHT record hasn't propagated yet is
+// still reachable through the peers seeding its source. Cheap: ≤ a handful of CIDs, async walks, connect no-ops.
+func (n *node) warmSeedLevelProviders() {
+	n.seedMu.RLock()
+	colls := append([]cid.Cid(nil), n.seedColls...)
+	n.seedMu.RUnlock()
+	for _, c := range colls {
+		n.warmProviders(c)
+	}
+}
+
 func (n *node) seedAnnounced(c string) bool {
 	n.seedMu.RLock()
 	_, ok := n.seedDone[c]
