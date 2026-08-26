@@ -214,7 +214,9 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 				return err
 			}
 			if c, derr := cid.Decode(cidStr); derr == nil {
+				tdr := time.Now()
 				n.dropRef(c) // clear stale refs (+ cached blocks) so the retry fetches over the network
+				fdbg("fetchToPath dropRef closure cleared in %s cid=%s", time.Since(tdr).Round(time.Millisecond), cidStr)
 			}
 		default:
 			return err // hard io/decode error, or "cancelled"

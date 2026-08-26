@@ -36,10 +36,16 @@ func (n *node) warmProviders(c cid.Cid) {
 		ctx, cancel := context.WithTimeout(n.ctx, 40*time.Second)
 		defer cancel()
 		self := n.host.ID()
+		t0 := time.Now()
 		provs := n.dht.FindProvidersAsync(ctx, c, warmProviderCount)
+		first := true
 		for pi := range provs {
 			if pi.ID == self || pi.ID == "" {
 				continue
+			}
+			if first {
+				fdbg("warm: first provider %s after %s (walk)", shortPeer(pi.ID.String()), time.Since(t0).Round(time.Millisecond))
+				first = false
 			}
 			n.freshenAndConnect(ctx, pi)
 		}
@@ -57,7 +63,9 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	// Live routing walk for current addresses. This is the key step: peers close to pi.ID return the addresses they
 	// have most recently seen it on (relays it currently holds reservations with, its current public ip:port), which
 	// supersedes whatever stale relay addr our peerstore cached from a previous run.
+	tf := time.Now()
 	fresh, err := n.dht.FindPeer(ctx, pi.ID)
+	fdbg("warm: FindPeer %s → %d addr in %s (err=%v)", shortPeer(pi.ID.String()), len(fresh.Addrs), time.Since(tf).Round(time.Millisecond), err)
 	if err == nil && len(fresh.Addrs) > 0 {
 		pi = fresh
 	} else if len(pi.Addrs) == 0 {
@@ -67,10 +75,12 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, 10*time.Minute)
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	td := time.Now()
 	if err := n.host.Connect(cctx, pi); err != nil {
-		fdbg("warm: connect to provider %s failed: %v", shortPeer(pi.ID.String()), err)
+		fdbg("warm: connect to provider %s failed after %s: %v", shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond), err)
 		return
 	}
+	fdbg("warm: connected %s (relay/direct) in %s", shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond))
 	if benchObserve() {
 		fmt.Fprintf(os.Stderr, "[warm] connected fresh to provider %s (%d addr)\n", shortPeer(pi.ID.String()), len(pi.Addrs))
 	}
