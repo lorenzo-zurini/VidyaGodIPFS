@@ -230,6 +230,28 @@ func (n *node) goOnline() error {
 		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
 		n.friend.start()
 		n.friend.startPresence(45 * time.Second)
+		// ALWAYS-ON link maintainer (overlaylink.go): heartbeat + auto-reconnect + hole-repunch per accepted
+		// friend for the app's lifetime — the LAN's links are warm BEFORE any game launches, and the UI gets
+		// live per-friend link state. Membership is re-read from the address book every beat.
+		n.linkm = newLinkMaintainer(n.ctx, h, kad, func() map[peer.ID]string {
+			out := map[peer.ID]string{}
+			for _, c := range n.social.list() {
+				if c.State != stAccepted {
+					continue
+				}
+				pid, err := peer.Decode(c.PeerID)
+				if err != nil {
+					continue
+				}
+				nick := c.Nick
+				if nick == "" {
+					nick = shortPeer(c.PeerID)
+				}
+				out[pid] = nick
+			}
+			return out
+		})
+		go n.linkm.run()
 		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
 		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.

@@ -32,7 +32,7 @@ func TestLanConfigFromFriends(t *testing.T) {
 		"blocked":   {PeerID: "blocked", State: stBlocked, online: true},     // blocked — excluded
 	}}
 
-	myVIP, subnet, routes, ok := lanConfigFrom("me", s)
+	myVIP, subnet, routes, ok := lanConfigFrom("me", s, nil)
 	if !ok {
 		t.Fatal("lanConfigFrom not ok")
 	}
@@ -42,14 +42,16 @@ func TestLanConfigFromFriends(t *testing.T) {
 	if subnet != lanSubnet {
 		t.Fatalf("subnet = %s, want %s", subnet, lanSubnet)
 	}
-	if len(routes) != 1 {
-		t.Fatalf("want 1 route (the online accepted friend), got %d: %v", len(routes), routes)
+	// v2: ALL accepted friends are routed — including offline ones (packets to them just drop; the always-on link
+	// maintainer brings them live so a friend can join MID-GAME instead of "next launch").
+	if len(routes) != 2 {
+		t.Fatalf("want 2 routes (every accepted friend, online or not), got %d: %v", len(routes), routes)
 	}
-	if routes[lanVIP("friendOn")] != "friendOn" {
-		t.Fatalf("route missing/wrong for friendOn: %v", routes)
+	if routes[lanVIP("friendOn")] != "friendOn" || routes[lanVIP("friendOff")] != "friendOff" {
+		t.Fatalf("routes missing/wrong: %v", routes)
 	}
 
-	vars, ok := lanLaunchVarsFrom("me", s)
+	vars, ok := lanLaunchVarsFrom("me", s, nil)
 	if !ok {
 		t.Fatal("lanLaunchVarsFrom not ok")
 	}
@@ -59,7 +61,26 @@ func TestLanConfigFromFriends(t *testing.T) {
 	if vars["VIDYAGOD_SELF_VIP"] != lanVIP("me") || vars["VIDYAGOD_SUBNET"] != lanSubnet {
 		t.Fatalf("bad self/subnet vars: %v", vars)
 	}
-	if vars["VIDYAGOD_PEER_VIPS"] != lanVIP("friendOn") || vars["VIDYAGOD_PEER_NAMES"] != "Al" {
+	// v2: both accepted friends appear (offline included) — the LAN emulator's peer list matches the route table.
+	gotVips := strings.Split(vars["VIDYAGOD_PEER_VIPS"], ",")
+	gotNames := strings.Split(vars["VIDYAGOD_PEER_NAMES"], ",")
+	if len(gotVips) != 2 || len(gotNames) != 2 {
 		t.Fatalf("bad peer vars: vips=%q names=%q", vars["VIDYAGOD_PEER_VIPS"], vars["VIDYAGOD_PEER_NAMES"])
+	}
+	found := map[string]string{}
+	for i := range gotVips {
+		found[gotVips[i]] = gotNames[i]
+	}
+	if found[lanVIP("friendOn")] != "Al" {
+		t.Fatalf("friendOn missing/wrong nick: %v", found)
+	}
+	if _, ok := found[lanVIP("friendOff")]; !ok {
+		t.Fatalf("offline accepted friend missing from peer vars: %v", found)
+	}
+
+	// The roster's excluded set drops a friend from routes AND launch vars alike.
+	_, _, exRoutes, _ := lanConfigFrom("me", s, map[string]bool{"friendOff": true})
+	if len(exRoutes) != 1 || exRoutes[lanVIP("friendOn")] != "friendOn" {
+		t.Fatalf("excluded set not applied: %v", exRoutes)
 	}
 }

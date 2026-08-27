@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	peer "github.com/libp2p/go-libp2p/core/peer"
 )
 
 //export VgOverlayStart
@@ -120,4 +122,50 @@ func VgLanLaunchVars(outJson **C.char) C.int {
 	}
 	setStr(outJson, string(b))
 	return 0
+}
+
+//export VgLanPeers
+// Per-friend virtual-LAN link state for the UI (Friends tab + the launch window's Virtual LAN panel):
+// [{peer, nick, vip, online, link:"direct"|"relayed"|"connecting"|"down", rttMs}]. -1 when the maintainer isn't up.
+func VgLanPeers(outJson **C.char) C.int {
+	n := get()
+	if n == nil || n.linkm == nil {
+		return -1
+	}
+	infos := n.linkm.snapshot(func(p peer.ID) string { return lanVIP(p.String()) })
+	b, err := json.Marshal(infos)
+	if err != nil {
+		return -1
+	}
+	setStr(outJson, string(b))
+	return 0
+}
+
+//export VgLanSetExcluded
+// Replace the GLOBAL LAN roster's excluded set (comma-separated peer ids — the launch window's un-ticked members).
+// Applies immediately: excluded peers stop receiving/announcing game traffic (mid-game too) and disappear from the
+// LAN launch vars of subsequent launches. They remain friends and remain link-maintained.
+func VgLanSetExcluded(csv *C.char) {
+	n := get()
+	if n == nil {
+		return
+	}
+	raw := map[string]bool{}
+	pids := map[peer.ID]bool{}
+	for _, s := range strings.Split(C.GoString(csv), ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		raw[s] = true
+		if pid, err := peer.Decode(s); err == nil {
+			pids[pid] = true
+		}
+	}
+	n.lanExclMu.Lock()
+	n.lanExcluded = raw
+	n.lanExclMu.Unlock()
+	if n.overlay != nil {
+		n.overlay.setExcluded(pids)
+	}
 }

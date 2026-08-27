@@ -35,15 +35,17 @@ func lanVIP(peerID string) string {
 }
 
 // lanConfigFrom builds the overlay parameters for the friend LAN: our own vIP, the /16 subnet, and the vIP→peer route
-// table for every accepted, currently-online friend. ok is false only if there is no social state. The peer set is a
-// snapshot at call time (overlay-start); a friend who comes online later is picked up on the next launch.
-func lanConfigFrom(self string, social *socialState) (myVIP, subnet string, peerByVIP map[string]string, ok bool) {
+// table for EVERY accepted friend — deliberately including currently-offline ones: routing to an offline peer just
+// drops packets, while the always-on link maintainer (overlaylink.go) brings them live the moment they appear, so a
+// friend can join MID-GAME instead of "next launch". excluded (peer-id set, may be nil) is the launch-window
+// roster's un-ticked members. ok is false only if there is no social state.
+func lanConfigFrom(self string, social *socialState, excluded map[string]bool) (myVIP, subnet string, peerByVIP map[string]string, ok bool) {
 	if social == nil {
 		return "", "", nil, false
 	}
 	peerByVIP = map[string]string{}
 	for _, c := range social.list() {
-		if c.State != stAccepted || !c.online || c.PeerID == self {
+		if c.State != stAccepted || c.PeerID == self || excluded[c.PeerID] {
 			continue
 		}
 		peerByVIP[lanVIP(c.PeerID)] = c.PeerID
@@ -54,8 +56,8 @@ func lanConfigFrom(self string, social *socialState) (myVIP, subnet string, peer
 // lanLaunchVarsFrom maps the friend LAN into the custom variables a sandboxed game launch consumes to join the overlay
 // and configure its LAN emulator (Goldberg et al.): the sandbox toggle, ISOLATED net (the LAN is sandbox-only, never
 // the host stack), our vIP + the /16 subnet, and the parallel comma-lists of peer vIPs + nicknames.
-func lanLaunchVarsFrom(self string, social *socialState) (map[string]string, bool) {
-	myVIP, subnet, peerByVIP, ok := lanConfigFrom(self, social)
+func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]bool) (map[string]string, bool) {
+	myVIP, subnet, peerByVIP, ok := lanConfigFrom(self, social, excluded)
 	if !ok {
 		return nil, false
 	}
@@ -89,12 +91,23 @@ func (n *node) lanConfig() (string, string, map[string]string, bool) {
 	if n.social == nil || n.host == nil {
 		return "", "", nil, false
 	}
-	return lanConfigFrom(n.host.ID().String(), n.social)
+	return lanConfigFrom(n.host.ID().String(), n.social, n.lanExcludedSnapshot())
 }
 
 func (n *node) lanLaunchVars() (map[string]string, bool) {
 	if n.social == nil || n.host == nil {
 		return nil, false
 	}
-	return lanLaunchVarsFrom(n.host.ID().String(), n.social)
+	return lanLaunchVarsFrom(n.host.ID().String(), n.social, n.lanExcludedSnapshot())
+}
+
+// lanExcludedSnapshot copies the roster's excluded set (peer-id strings) under the lock.
+func (n *node) lanExcludedSnapshot() map[string]bool {
+	n.lanExclMu.Lock()
+	defer n.lanExclMu.Unlock()
+	out := make(map[string]bool, len(n.lanExcluded))
+	for k := range n.lanExcluded {
+		out[k] = true
+	}
+	return out
 }

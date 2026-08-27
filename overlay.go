@@ -80,6 +80,14 @@ type overlayService struct {
 	logDatagram sync.Once // one-shot "[overlay] TX path: DATAGRAM" the first time a datagram carries a packet
 	logStream   sync.Once // one-shot "[overlay] TX path: STREAM"   the first time the stream fallback carries a packet
 
+	linkm *linkMaintainer // always-on per-friend heartbeat/state/repair (overlaylink.go); nil only in old tests
+
+	exclMu   sync.Mutex
+	excluded map[peer.ID]bool // the GLOBAL LAN roster's un-ticked members — carried in routes but never targeted
+
+	sendersMu sync.Mutex
+	senders   map[peer.ID]chan []byte // per-peer async stream-fallback queues (drop-oldest; no dials on the pump)
+
 	writeMu sync.Mutex // serialize WritePacket into the link (inbound arrives on many goroutines)
 	running bool
 
@@ -109,7 +117,8 @@ func (l *fdLink) Close() error               { return l.f.Close() }
 
 func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
 	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
-		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{}}
+		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{},
+		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}}
 }
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
@@ -171,6 +180,13 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 		}
 	}
 	return nil
+}
+
+// setExcluded replaces the roster's excluded set (peer ids). Takes effect on the next packet — live mid-game.
+func (o *overlayService) setExcluded(pids map[peer.ID]bool) {
+	o.exclMu.Lock()
+	o.excluded = pids
+	o.exclMu.Unlock()
 }
 
 // isFanout reports whether a destination IP is a broadcast or multicast address that should be replicated to every LAN
@@ -257,6 +273,22 @@ func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
 		}
 		pid, known := o.routes[dst]
 		o.mu.Unlock()
+		// The GLOBAL roster (launch-window ticks): un-ticked members stay friends and stay routed-in-name, but no
+		// game traffic flows to them in either intention — outbound filtered here, and they simply never announce.
+		o.exclMu.Lock()
+		if fanout {
+			kept := targets[:0]
+			for _, t := range targets {
+				if !o.excluded[t] {
+					kept = append(kept, t)
+				}
+			}
+			targets = kept
+		}
+		if known && o.excluded[pid] {
+			known = false
+		}
+		o.exclMu.Unlock()
 		if fanout {
 			// Broadcast/multicast → replicate to EVERY LAN peer so their game's kernel sees the discovery packet.
 			for _, t := range targets {
@@ -282,7 +314,50 @@ func (o *overlayService) forward(ctx context.Context, pid peer.ID, pkt []byte) e
 	if o.sendDatagram(pid, pkt) {
 		return nil
 	}
-	return o.forwardStream(ctx, pid, pkt)
+	// Stream fallback is ASYNC: sendStream may dial (FindPeer + connect = seconds) and this is called from the TUN
+	// pump — blocking here would stall the whole LAN. Each peer gets a small drop-oldest queue drained by its own
+	// sender goroutine: correct semantics for game traffic (stale announcements are worthless; fresh ones follow).
+	o.enqueueStream(pid, pkt)
+	return nil
+}
+
+// enqueueStream queues pkt for pid's async sender (started lazily; service-lifetime). Drop-oldest on overflow.
+func (o *overlayService) enqueueStream(pid peer.ID, pkt []byte) {
+	o.sendersMu.Lock()
+	ch := o.senders[pid]
+	if ch == nil {
+		ch = make(chan []byte, 64)
+		o.senders[pid] = ch
+		go func() {
+			for {
+				select {
+				case <-o.parent.Done():
+					return
+				case p := <-ch:
+					if err := o.forwardStream(o.parent, pid, p); err != nil {
+						if overlayDebug {
+							fmt.Fprintf(os.Stderr, "[overlay] stream fallback to %s failed: %v\n", pid, err)
+						}
+					} else if o.linkm != nil {
+						o.linkm.noteStream(pid)
+					}
+				}
+			}
+		}()
+	}
+	o.sendersMu.Unlock()
+	select {
+	case ch <- pkt:
+	default:
+		select { // full → drop the OLDEST queued packet, keep the freshest
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- pkt:
+		default:
+		}
+	}
 }
 
 // sendDatagram tries to ship pkt as one QUIC datagram over a direct connection to pid. Returns true if a direct QUIC
@@ -302,9 +377,16 @@ func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
 		if errors.As(err, &tooLarge) {
 			return false // packet bigger than the path's datagram size → send it reliably over the stream
 		}
-		// Transient (send queue momentarily full, MTU shrank): a real LAN would drop it too. Drop, don't reliably
-		// resend — resending game traffic is what we're trying to avoid. Count it as handled by the datagram path.
-		return true
+		// A real send ERROR is a suspect path (the field bug: a zombie conn whose NAT mapping died ate every
+		// packet while this returned "handled"). Tell the maintainer (fast-tracks the zombie verdict + re-punch)
+		// and fall back to the reliable stream so the packet still travels.
+		if o.linkm != nil {
+			o.linkm.suspect(pid)
+		}
+		return false
+	}
+	if o.linkm != nil {
+		o.linkm.noteTx(pid)
 	}
 	o.logDatagram.Do(func() { fmt.Fprintln(os.Stderr, "[overlay] TX path: DATAGRAM (unreliable QUIC datagrams)") })
 	return true
@@ -329,8 +411,8 @@ func (o *overlayService) maybeStartDatagramLoop(c network.Conn) {
 	o.mu.Lock()
 	_, isRoute := routesContain(o.routes, c.RemotePeer())
 	o.mu.Unlock()
-	if !isRoute {
-		return
+	if !isRoute && (o.linkm == nil || !o.linkm.has(c.RemotePeer())) {
+		return // neither a session peer nor a maintained friend
 	}
 	var qc *quic.Conn
 	if !c.As(&qc) || qc == nil {
@@ -358,8 +440,18 @@ func (o *overlayService) datagramRecvLoop(c network.Conn, qc *quic.Conn) {
 		if err != nil {
 			return // connection closed or service shutting down
 		}
+		if isHeartbeat(pkt) {
+			// Maintainer control datagram (overlaylink.go) — never an IPv4 packet ('V' fails the version check).
+			if o.linkm != nil {
+				o.linkm.handleHeartbeat(c.RemotePeer(), pkt, func(b []byte) { _ = qc.SendDatagram(b) })
+			}
+			continue
+		}
 		if _, ok := ipv4Dst(pkt); !ok {
 			continue // not an IP packet we forward (junk / non-overlay datagram) — drop
+		}
+		if o.linkm != nil {
+			o.linkm.noteRx(c.RemotePeer())
 		}
 		o.mu.Lock()
 		link := o.link

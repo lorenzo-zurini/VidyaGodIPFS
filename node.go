@@ -64,9 +64,13 @@ type node struct {
 
 	// friends / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
 	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
-	social  *socialState
-	friend  *friendService
-	overlay *overlayService
+	social *socialState
+	friend *friendService
+	linkm  *linkMaintainer // always-on per-friend link maintainer (overlaylink.go)
+
+	lanExclMu   sync.Mutex
+	lanExcluded map[string]bool // the LAN roster's un-ticked members (peer-id strings), set via VgLanSetExcluded
+	overlay     *overlayService
 
 	// per-CID upload activity: a bitswap tracer records when a PINNED ROOT block is served to a peer, so the GUI can
 	// flag which seeded items are being uploaded right now. pinnedSet is refreshed periodically so the hot MessageSent
