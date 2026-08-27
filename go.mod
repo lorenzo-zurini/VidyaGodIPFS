@@ -1,9 +1,10 @@
 module github.com/lorenzo-zurini/VidyaGodIPFS
 
-go 1.25.7
+go 1.26.3
 
 require (
 	github.com/ipfs/boxo v0.41.0
+	github.com/ipfs/go-block-format v0.2.3
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipfs/go-datastore v0.9.1
 	github.com/ipfs/go-ds-leveldb v0.5.2
@@ -15,9 +16,11 @@ require (
 	github.com/multiformats/go-multiaddr-dns v0.5.0
 	github.com/quic-go/quic-go v0.59.0
 	github.com/syndtr/goleveldb v1.0.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/net v0.58.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+	gvisor.dev/gvisor v0.0.0-20260827182035-0dcc03c94f5c
 )
 
 require (
@@ -40,6 +43,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/snappy v0.0.5-0.20231225225746-43d5d4cd4e0e // indirect
+	github.com/google/btree v1.1.2 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
@@ -48,7 +52,6 @@ require (
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/ipfs/bbloom v0.1.0 // indirect
 	github.com/ipfs/go-bitfield v1.1.0 // indirect
-	github.com/ipfs/go-block-format v0.2.3 // indirect
 	github.com/ipfs/go-cidutil v0.1.1 // indirect
 	github.com/ipfs/go-dsqueue v0.2.0 // indirect
 	github.com/ipfs/go-ipfs-pq v0.0.4 // indirect
@@ -135,14 +138,13 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
-	golang.org/x/mod v0.36.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
-	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/time v0.12.0 // indirect
-	golang.org/x/tools v0.45.0 // indirect
+	golang.org/x/mod v0.38.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260708182218-49f421fb7959 // indirect
+	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect

@@ -62,13 +62,14 @@ type overlayService struct {
 	host   host.Host
 	router peerRouter
 
-	mu       sync.Mutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	link     packetLink
-	localVIP string
-	routes   map[string]peer.ID // dest vIP (e.g. "10.66.42.2") → owning peer
-	bcast    string             // the subnet's directed-broadcast address (e.g. "10.66.255.255"); "" if unknown
+	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	link      packetLink
+	localVIP  string
+	routes    map[string]peer.ID // dest vIP (e.g. "10.66.42.2") → owning peer
+	bcast     string             // the subnet's directed-broadcast address (e.g. "10.66.255.255"); "" if unknown
+	subnetNet *net.IPNet         // the LAN subnet itself — the demux's overlay/host-plane boundary
 
 	sendMu sync.Mutex
 	sends  map[peer.ID]network.Stream // cached outbound stream per peer (reopened on error)
@@ -87,6 +88,12 @@ type overlayService struct {
 
 	sendersMu sync.Mutex
 	senders   map[peer.ID]chan []byte // per-peer async stream-fallback queues (drop-oldest; no dials on the pump)
+
+	// Tri-plane bridging (set before serve/attach): the userspace NAT gateway (internet + real-LAN unicast) and
+	// the real-LAN broadcast reflector. nil = that plane is off for this launch.
+	gwWant, relayWant bool
+	gw                *natGateway
+	relay             *hostRelay
 
 	writeMu sync.Mutex // serialize WritePacket into the link (inbound arrives on many goroutines)
 	running bool
@@ -160,7 +167,9 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 		routes[vip] = pid
 	}
 	bcast := ""
+	var snet *net.IPNet
 	if _, ipnet, err := net.ParseCIDR(subnet); err == nil {
+		snet = ipnet
 		b := make(net.IP, len(ipnet.IP))
 		for i := range ipnet.IP {
 			b[i] = ipnet.IP[i] | ^ipnet.Mask[i]
@@ -171,6 +180,7 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 	o.localVIP = localVIP
 	o.routes = routes
 	o.bcast = bcast
+	o.subnetNet = snet
 	o.mu.Unlock()
 	// Existing direct-QUIC connections to these peers (e.g. a fetch already holepunched to a friend) need a datagram
 	// receive loop too — the notifiee only catches connections that appear AFTER this point.
@@ -212,7 +222,24 @@ func (o *overlayService) attach(link packetLink) {
 	}
 	ctx, cancel := context.WithCancel(o.parent)
 	o.ctx, o.cancel, o.link, o.running = ctx, cancel, link, true
+	gwWant, relayWant := o.gwWant, o.relayWant
+	localVIP := o.localVIP
 	o.mu.Unlock()
+	// Tri-plane bring-up: both planes write into the SAME link through the serialized injector.
+	if gwWant {
+		if gw, err := newNATGateway(ctx, o.injectToLink, nil, nil); err == nil {
+			o.gw = gw
+			fmt.Fprintf(os.Stderr, "[overlay] gateway ON — internet + real-LAN unicast via in-node NAT (no helper)\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "[overlay] gateway failed to start: %v\n", err)
+		}
+	}
+	if relayWant && localVIP != "" {
+		if vip := net.ParseIP(localVIP); vip != nil {
+			o.relay = newHostRelay(o.injectToLink, vip)
+			fmt.Fprintf(os.Stderr, "[overlay] reflector ON — real-LAN broadcasts bridged both ways\n")
+		}
+	}
 	go o.readLoop(ctx, link)
 }
 
@@ -246,6 +273,27 @@ func (o *overlayService) detach() {
 	if link != nil {
 		_ = link.Close()
 	}
+	if o.gw != nil {
+		o.gw.close()
+		o.gw = nil
+	}
+	if o.relay != nil {
+		o.relay.close()
+		o.relay = nil
+	}
+}
+
+// injectToLink writes one synthesized/forwarded packet into the game's TUN, serialized against every other writer.
+func (o *overlayService) injectToLink(pkt []byte) error {
+	o.mu.Lock()
+	link := o.link
+	o.mu.Unlock()
+	if link == nil {
+		return fmt.Errorf("no link attached")
+	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+	return link.WritePacket(pkt)
 }
 
 // readLoop pulls IP packets from the local link and forwards each to the peer that owns its destination vIP.
@@ -290,16 +338,31 @@ func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
 		}
 		o.exclMu.Unlock()
 		if fanout {
-			// Broadcast/multicast → replicate to EVERY LAN peer so their game's kernel sees the discovery packet.
+			// Broadcast/multicast → every LAN peer (overlay plane) AND, when the reflector is up, the REAL LAN.
 			for _, t := range targets {
 				if err := o.forward(ctx, t, pkt); err != nil {
 					fmt.Fprintf(os.Stderr, "[overlay] fan-out to %s failed: %v\n", t, err)
 				}
 			}
+			if o.relay != nil {
+				if u, uok := parseUDP4(pkt); uok {
+					o.relay.fromGame(u)
+				}
+			}
 			continue
 		}
 		if !known {
-			continue // no LAN friend owns this address
+			// Not a LAN address → the HOST plane: hand it to the in-node NAT (internet / real-LAN unicast).
+			// In-subnet addresses with no owning friend stay dropped — the vLAN never leaks into the NAT.
+			o.mu.Lock()
+			snet := o.subnetNet
+			o.mu.Unlock()
+			if o.gw != nil {
+				if ip := net.ParseIP(dst); ip != nil && (snet == nil || !snet.Contains(ip)) {
+					o.gw.inject(pkt)
+				}
+			}
+			continue
 		}
 		if err := o.forward(ctx, pid, pkt); err != nil {
 			fmt.Fprintf(os.Stderr, "[overlay] forward to %s failed: %v\n", pid, err)
