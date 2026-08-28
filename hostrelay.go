@@ -37,6 +37,7 @@ type hostRelay struct {
 
 	hostMu   sync.Mutex
 	hostIPs  map[string]bool // our own addresses — loop prevention
+	bcastTo  []net.IP        // where to re-emit a game broadcast (255.255.255.255 + each iface directed-bcast)
 	hostRefT time.Time
 
 	rxInjected, txReflected, loopDropped atomic.Int64
@@ -66,13 +67,34 @@ func (r *hostRelay) fromGame(u udp4) {
 	if src == nil {
 		return
 	}
-	dst := r.bcastAddr
 	if ip4 := u.Dst.To4(); ip4 != nil && ip4[0] >= 224 && ip4[0] <= 239 {
-		dst = ip4 // multicast group: pass through as-is
+		// Multicast group: pass through as-is (multicast routing is the switch's job, not ours).
+		if _, err := src.WriteToUDP(u.Payload, &net.UDPAddr{IP: ip4, Port: int(u.DstPort)}); err == nil {
+			r.txReflected.Add(1)
+		}
+		return
 	}
-	if _, err := src.WriteToUDP(u.Payload, &net.UDPAddr{IP: dst, Port: int(u.DstPort)}); err == nil {
-		r.txReflected.Add(1)
+	// Broadcast: emit to EVERY broadcast target. Real games send to 255.255.255.255 (the limited broadcast), but
+	// many networks (WiFi↔wired, AP client isolation) DROP that between hosts while passing the SUBNET-DIRECTED
+	// broadcast (e.g. 192.168.1.255) — measured live on this exact machine pair. So we re-emit to both, which is
+	// also what lets two reflector-equipped peers discover each other on such a network.
+	for _, dst := range r.broadcastTargets() {
+		if _, err := src.WriteToUDP(u.Payload, &net.UDPAddr{IP: dst, Port: int(u.DstPort)}); err == nil {
+			r.txReflected.Add(1)
+		}
 	}
+}
+
+// broadcastTargets = the limited broadcast plus each IPv4 interface's directed broadcast (recomputed lazily). In
+// tests bcastAddr overrides this with a single loopback target.
+func (r *hostRelay) broadcastTargets() []net.IP {
+	if r.bcastAddr != nil && !r.bcastAddr.Equal(net.IPv4bcast) {
+		return []net.IP{r.bcastAddr} // test override (loopback stands in for the broadcast domain)
+	}
+	r.hostMu.Lock()
+	defer r.hostMu.Unlock()
+	out := append([]net.IP{net.IPv4bcast}, r.bcastTo...)
+	return out
 }
 
 // ensure returns the host socket bound to :port, creating it (with SO_BROADCAST + its recv loop) on first sight.
@@ -138,15 +160,34 @@ func (r *hostRelay) isHostIP(ip net.IP) bool {
 
 func (r *hostRelay) refreshHostIPs() {
 	m := map[string]bool{}
+	var bcasts []net.IP
+	seen := map[string]bool{}
 	if addrs, err := net.InterfaceAddrs(); err == nil {
 		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok {
-				m[ipn.IP.String()] = true
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			m[ipn.IP.String()] = true
+			// The directed broadcast of each IPv4 subnet (skip loopback + the /32 host routes that have none).
+			if v4 := ipn.IP.To4(); v4 != nil && !v4.IsLoopback() {
+				ones, bits := ipn.Mask.Size()
+				if bits == 32 && ones < 31 {
+					b := make(net.IP, 4)
+					for i := 0; i < 4; i++ {
+						b[i] = v4[i] | ^ipn.Mask[i]
+					}
+					if !seen[b.String()] {
+						seen[b.String()] = true
+						bcasts = append(bcasts, b)
+					}
+				}
 			}
 		}
 	}
 	r.hostMu.Lock()
 	r.hostIPs = m
+	r.bcastTo = bcasts
 	r.hostRefT = time.Now()
 	r.hostMu.Unlock()
 }
