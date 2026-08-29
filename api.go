@@ -206,6 +206,23 @@ func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+//export VgVerifyCid
+// Returns "" when the whole DAG reads cleanly out of the local blockstore, otherwise the first read error
+// ("<cid>: data in file did not match ..."). Unlike VgCidMissing this READS the referenced bytes, so it detects a
+// stale reference whose backing file still exists but no longer matches — the class that makes peers hang.
+// Caller owns the returned string (VgFree).
+func VgVerifyCid(cidStr *C.char) *C.char {
+	n := get()
+	if n == nil {
+		return C.CString("node not started")
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return C.CString("bad cid: " + err.Error())
+	}
+	return C.CString(n.cidUnservable(c))
+}
+
 //export VgCidMissing
 func VgCidMissing(cidStr *C.char) C.int {
 	n := get()
@@ -402,6 +419,23 @@ func VgOrphanedRefPaths(outJson **C.char) C.int {
 		return 0
 	}
 	b, _ := json.Marshal(n.orphanedRefPaths())
+	setStr(outJson, string(b))
+	return 0
+}
+
+// VgUnservableRefs: JSON array of every filestore entry whose bytes no longer verify —
+// [{"cid":…,"path":…,"status":11|12,"err":…}]. status 12 = file contents changed, 11 = backing file gone.
+// This is the check that finds references we ADVERTISE but cannot serve, including ones no manifest points at
+// any more; such a reference makes a requesting peer hang rather than fail over. I/O-bound (reads the bytes).
+//
+//export VgUnservableRefs
+func VgUnservableRefs(outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(outJson, "[]")
+		return 0
+	}
+	b, _ := json.Marshal(n.unservableRefs())
 	setStr(outJson, string(b))
 	return 0
 }

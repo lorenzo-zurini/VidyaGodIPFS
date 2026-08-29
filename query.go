@@ -150,6 +150,72 @@ func (n *node) orphanedRefPaths() []string {
 	return gone
 }
 
+// cidUnservable READS every block of c out of the local blockstore and returns the first read error, or "" if the
+// whole DAG serves cleanly. This is the check cidMissing cannot do: cidMissing only os.Stat()s the backing path, so
+// a reference whose file still EXISTS but whose BYTES have changed passes it while every real bitswap request fails
+// with "data in file did not match ... offset N". Such a ref is worse than a missing one — we advertise the block,
+// a peer asks for it, and the transfer hangs instead of failing over to another provider.
+//
+// Cost: reads the referenced bytes (the filestore verifies each leaf's hash against its backing range on Get), so
+// this is I/O-bound and belongs in an explicit deep pass, never on a background timer.
+func (n *node) cidUnservable(c cid.Cid) string {
+	seen := cid.NewSet()
+	var walk func(c cid.Cid) string
+	walk = func(c cid.Cid) string {
+		if !seen.Visit(c) {
+			return ""
+		}
+		// Get through the filestore-backed blockstore: this is the exact path bitswap serves from, so any
+		// posinfo/hash disagreement surfaces here the same way it would for a remote peer.
+		if _, err := n.bstore.Get(n.ctx, c); err != nil {
+			return fmt.Sprintf("%s: %v", c.String(), err)
+		}
+		if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
+			return "" // a verified filestore leaf has no links to descend into
+		}
+		nd, err := n.localDserv.Get(n.ctx, c)
+		if err != nil {
+			return "" // not a dag-pb node we hold — nothing further to verify locally
+		}
+		for _, l := range nd.Links() {
+			if e := walk(l.Cid); e != "" {
+				return e // short-circuit on the first unservable block
+			}
+		}
+		return ""
+	}
+	return walk(c)
+}
+
+// unservableRefs walks the ENTIRE filestore index and verifies each entry's bytes against its backing range,
+// returning one record per BAD entry. This is broader than verifying the CIDs a manifest records: a stale entry can
+// survive under a CID no node JSON references any more (a superseded delta, a re-published package), and we keep
+// advertising it — so a peer asks for that block and hangs. Nothing that starts from the recorded CIDs can find it;
+// only enumerating the index does. Status 12 = contents changed, 11 = backing file gone.
+func (n *node) unservableRefs() []map[string]interface{} {
+	next, err := filestore.VerifyAll(n.ctx, n.fstore, true) // fileOrder: a file's leaves are contiguous
+	if err != nil || next == nil {
+		return nil
+	}
+	out := []map[string]interface{}{}
+	for {
+		r := next(n.ctx)
+		if r == nil {
+			break
+		}
+		if r.Status == filestore.StatusOk {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"cid":    r.Key.String(),
+			"path":   filepath.Join("/", r.FilePath),
+			"status": int(r.Status),
+			"err":    r.ErrorMsg,
+		})
+	}
+	return out
+}
+
 func (n *node) cidMissing(c cid.Cid) bool {
 	checked := map[string]bool{} // backing path -> exists (memoized across a file's many same-path leaves)
 	seen := cid.NewSet()
