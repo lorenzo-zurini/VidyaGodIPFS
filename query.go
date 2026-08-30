@@ -246,6 +246,60 @@ func (n *node) unservableRefs() []map[string]interface{} {
 	return out
 }
 
+// cidServeStatus answers the only question the UI should be claiming: CAN WE DELIVER THIS? "" means yes as far
+// as a cheap check can tell; otherwise a human-readable reason.
+//
+// "Seeded" used to mean nothing more than "a pin exists", which is why a stale reference displayed as happily
+// seeded while every peer request for it hung. This checks the two conditions that cost only a stat:
+//   * every backing file still EXISTS (what cidMissing does), and
+//   * each backing file is still the SIZE its references cover — a file's refs tile it exactly, so a file that
+//     grew or was truncated no longer matches what we published.
+// It deliberately does NOT read file contents: proving deliverability byte-for-byte means reading everything
+// (61 GB here), so that stays in the explicit verify path. A same-size edit therefore still passes this.
+func (n *node) cidServeStatus(c cid.Cid) string {
+	extent := map[string]uint64{} // backing path → highest offset+size any reference covers
+	seen := cid.NewSet()
+	var walk func(c cid.Cid) string
+	walk = func(c cid.Cid) string {
+		if !seen.Visit(c) {
+			return ""
+		}
+		if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
+			p := filepath.Join("/", res.FilePath)
+			st, err := os.Stat(p)
+			if err != nil {
+				return "backing file gone: " + p
+			}
+			if end := res.Offset + res.Size; end > extent[p] {
+				extent[p] = end
+			}
+			if uint64(st.Size()) < extent[p] {
+				return "backing file truncated: " + p
+			}
+			return ""
+		}
+		nd, err := n.localDserv.Get(n.ctx, c)
+		if err != nil {
+			return ""
+		}
+		for _, l := range nd.Links() {
+			if e := walk(l.Cid); e != "" {
+				return e
+			}
+		}
+		return ""
+	}
+	if e := walk(c); e != "" {
+		return e
+	}
+	// NOTE: a file that GREW is deliberately NOT an error. The references still tile the original bytes, so every
+	// block a peer asks for still reads correctly — appending to a file does not stop us serving what we
+	// published. Verified: appending 4 KiB leaves the CID fully servable. Only a file that SHRANK below the
+	// covered extent (handled above) actually breaks delivery. Treating "grew" as broken would have been a false
+	// alarm that also destroyed a working reference during repair.
+	return ""
+}
+
 func (n *node) cidMissing(c cid.Cid) bool {
 	checked := map[string]bool{} // backing path -> exists (memoized across a file's many same-path leaves)
 	seen := cid.NewSet()

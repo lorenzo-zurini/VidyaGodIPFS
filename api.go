@@ -237,6 +237,22 @@ func VgCidFileSizeLocal(cidStr *C.char) C.longlong {
 	return C.longlong(n.cidFileSizeLocal(c))
 }
 
+// VgCidServeStatus: "" when a CID looks deliverable (all backing files present and still the size their
+// references cover), else the reason. Cheap — stat only, no content read. Caller owns the string (VgFree).
+//
+//export VgCidServeStatus
+func VgCidServeStatus(cidStr *C.char) *C.char {
+	n := get()
+	if n == nil {
+		return C.CString("node not started")
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return C.CString("bad cid: " + err.Error())
+	}
+	return C.CString(n.cidServeStatus(c))
+}
+
 //export VgVerifyCid
 // Returns "" when the whole DAG reads cleanly out of the local blockstore, otherwise the first read error
 // ("<cid>: data in file did not match ..."). Unlike VgCidMissing this READS the referenced bytes, so it detects a
