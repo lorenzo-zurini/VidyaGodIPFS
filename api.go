@@ -206,6 +206,21 @@ func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgComputeCid: what a file's CID WOULD be, with NO side effects (nothing enters the blockstore, filestore or
+// pinset). Same importer settings as VgAddNoCopy, so it answers "do these bytes still match the published CID?".
+// Needs no started node. Returns "" on failure with the reason in errOut.
+//
+//export VgComputeCid
+func VgComputeCid(path *C.char, outCid **C.char, errOut **C.char) C.int {
+	c, err := computeCid(C.GoString(path))
+	if err != nil {
+		setStr(errOut, err.Error())
+		return 1
+	}
+	setStr(outCid, c.String())
+	return 0
+}
+
 //export VgVerifyCid
 // Returns "" when the whole DAG reads cleanly out of the local blockstore, otherwise the first read error
 // ("<cid>: data in file did not match ..."). Unlike VgCidMissing this READS the referenced bytes, so it detects a

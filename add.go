@@ -11,6 +11,12 @@ import (
 	"os"
 	"path/filepath"
 
+	blockservice "github.com/ipfs/boxo/blockservice"
+	blockstore "github.com/ipfs/boxo/blockstore"
+	offline "github.com/ipfs/boxo/exchange/offline"
+	datastore "github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+
 	chunker "github.com/ipfs/boxo/chunker"
 	files "github.com/ipfs/boxo/files"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
@@ -52,6 +58,51 @@ func (n *node) buildFileNode(abs string, st os.FileInfo) (ipld.Node, error) {
 		return nil, err
 	}
 	return balanced.Layout(db)
+}
+
+// computeCid returns what a file's CID WOULD be, without touching the node's blockstore, filestore or pinset —
+// the DAG is built into a throwaway in-memory store and discarded. Same importer settings as addNoCopy, so the
+// answer is identical to what seeding would produce; it just has no side effects. This is the primitive behind
+// `--cid`, for answering "do these bytes still match the CID we published?" without seeding anything.
+func computeCid(path string) (cid.Cid, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return cid.Undef, err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return cid.Undef, err
+	}
+	if st.IsDir() {
+		return cid.Undef, fmt.Errorf("%s is a directory (use --publish-meta for a tree)", abs)
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return cid.Undef, err
+	}
+	defer f.Close()
+	rpf, err := files.NewReaderPathFile(abs, f, st)
+	if err != nil {
+		return cid.Undef, err
+	}
+	mem := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	dserv := merkledag.NewDAGService(blockservice.New(mem, offline.Exchange(mem)))
+	dbp := uih.DagBuilderParams{
+		Maxlinks:   uih.DefaultLinksPerBlock,
+		RawLeaves:  true,
+		NoCopy:     true,                     // keep NoCopy so leaf CIDs match a seeded file exactly
+		CidBuilder: merkledag.V0CidPrefix(),
+		Dagserv:    dserv,
+	}
+	db, err := dbp.New(chunker.NewSizeSplitter(rpf, chunkSize))
+	if err != nil {
+		return cid.Undef, err
+	}
+	nd, err := balanced.Layout(db)
+	if err != nil {
+		return cid.Undef, err
+	}
+	return nd.Cid(), nil
 }
 
 // addNoCopy adds a single regular file by reference and pins it recursively. Returns the root CID.
