@@ -253,11 +253,28 @@ func VgCidServeStatus(cidStr *C.char) *C.char {
 	return C.CString(n.cidServeStatus(c))
 }
 
-//export VgVerifyCid
+// VgServeFailures: JSON [{"cid","err","when"}] of blocks a PEER requested that we could not deliver, draining
+// the list. This is the uploader-side corruption signal BitTorrent lacks — there only the downloader hashes, so a
+// seeder with rotted data never learns. Poll it to turn the offending rows red.
+//
+//export VgServeFailures
+func VgServeFailures(outJson **C.char) C.int {
+	n := get()
+	if n == nil || n.serveFails == nil {
+		setStr(outJson, "[]")
+		return 0
+	}
+	b, _ := json.Marshal(n.serveFails.drain())
+	setStr(outJson, string(b))
+	return 0
+}
+
 // Returns "" when the whole DAG reads cleanly out of the local blockstore, otherwise the first read error
 // ("<cid>: data in file did not match ..."). Unlike VgCidMissing this READS the referenced bytes, so it detects a
 // stale reference whose backing file still exists but no longer matches — the class that makes peers hang.
 // Caller owns the returned string (VgFree).
+//
+//export VgVerifyCid
 func VgVerifyCid(cidStr *C.char) *C.char {
 	n := get()
 	if n == nil {

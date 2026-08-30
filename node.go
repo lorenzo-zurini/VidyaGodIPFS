@@ -52,6 +52,7 @@ type node struct {
 	dserv      ipld.DAGService
 	localDserv ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
 	pinner     ipfspinner.Pinner
+	serveFails *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
 
 	// network (M3) — nil/false until goOnline succeeds
 	online   bool
@@ -129,7 +130,11 @@ func openNode(repoPath string) error {
 	// WriteThrough so an Add always Puts (no Has-skip) — a safety invariant ensuring addNoCopy creates the filestore
 	// reference even if a block already happens to sit in the blockstore. (The online fetch path clears bitswap's
 	// cached blocks via dropClosure before re-adding, which is the primary guard against duplication.)
-	bserv := blockservice.New(fstore, offline.Exchange(fstore), blockservice.WriteThrough(true))
+	// Wrap the filestore so a FAILED serve read is captured, not just logged. This is the moment a leecher asks
+	// for a block whose backing bytes changed — the one instant we can be certain the content is undeliverable.
+	failLog := newFailureLog()
+	served := &recordingBlockstore{Blockstore: fstore, log: failLog}
+	bserv := blockservice.New(served, offline.Exchange(served), blockservice.WriteThrough(true))
 	dserv := merkledag.NewDAGService(bserv)
 
 	pnr, err := dspinner.New(ctx, ds, dserv)
@@ -142,7 +147,7 @@ func openNode(repoPath string) error {
 	gNode = &node{
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
 		ldb: ldb,
-		ds:  ds, fstore: fstore, bstore: fstore, bserv: bserv, dserv: dserv, pinner: pnr,
+		ds:  ds, fstore: fstore, bstore: served, bserv: bserv, dserv: dserv, pinner: pnr, serveFails: failLog,
 		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,
