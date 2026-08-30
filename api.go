@@ -221,6 +221,22 @@ func VgComputeCid(path *C.char, outCid **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgCidFileSizeLocal: the UnixFS FILE size (payload bytes) of a CID from the local store, -1 if unknown. Reads
+// only the root block, so it is the cheap gate for "does the file on disk still match what we published?".
+//
+//export VgCidFileSizeLocal
+func VgCidFileSizeLocal(cidStr *C.char) C.longlong {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	return C.longlong(n.cidFileSizeLocal(c))
+}
+
 //export VgVerifyCid
 // Returns "" when the whole DAG reads cleanly out of the local blockstore, otherwise the first read error
 // ("<cid>: data in file did not match ..."). Unlike VgCidMissing this READS the referenced bytes, so it detects a

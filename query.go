@@ -11,6 +11,8 @@ import (
 	"time"
 
 	filestore "github.com/ipfs/boxo/filestore"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	unixfs "github.com/ipfs/boxo/ipld/unixfs"
 	cid "github.com/ipfs/go-cid"
 )
 
@@ -45,6 +47,34 @@ func (n *node) cidSize(c cid.Cid) int64 {
 	sctx, scancel := context.WithTimeout(n.ctx, 20*time.Second)
 	defer scancel()
 	return n.gatewaySize(sctx, c)
+}
+
+// cidFileSizeLocal returns the UnixFS FILE size (payload bytes) for a CID, from the local store only, or -1.
+//
+// Distinct from cidSizeLocal, which reports the ENCODED DAG size (payload + block/protobuf overhead). Comparing
+// that against st_size would mismatch on essentially every file. This reads only the ROOT block, so it is cheap
+// enough to run before every seed — the point being to notice "the file on disk is no longer the file we
+// published" without reading gigabytes.
+func (n *node) cidFileSizeLocal(c cid.Cid) int64 {
+	ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+	defer cancel()
+	nd, err := n.localDserv.Get(ctx, c)
+	if err != nil {
+		return -1
+	}
+	// Raw leaves (a file smaller than one chunk) carry the payload directly.
+	if c.Type() == cid.Raw {
+		return int64(len(nd.RawData()))
+	}
+	pn, ok := nd.(*merkledag.ProtoNode)
+	if !ok {
+		return -1
+	}
+	fsn, err := unixfs.FSNodeFromBytes(pn.Data())
+	if err != nil {
+		return -1
+	}
+	return int64(fsn.FileSize())
 }
 
 // cidSizeLocal is cidSize restricted to the LOCAL store: no bitswap, no gateway. Returns -1 immediately when the
