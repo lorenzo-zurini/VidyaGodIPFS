@@ -11,6 +11,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -67,19 +68,39 @@ func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]boo
 			nickByPeer[c.PeerID] = c.Nick
 		}
 	}
-	var vips, names []string
+	// Order by peer id, not by map iteration. Ranging peerByVIP directly made both lists come out in a DIFFERENT
+	// order on every call — so anything positional ("the first friend", as cli/cliipfs.cpp takes) silently picked a
+	// different peer each run. Sorting once here also keeps the two lists parallel by construction.
+	pids := make([]string, 0, len(peerByVIP))
+	vipByPeer := make(map[string]string, len(peerByVIP))
 	for vip, pid := range peerByVIP {
-		vips = append(vips, vip)
+		pids = append(pids, pid)
+		vipByPeer[pid] = vip
+	}
+	sort.Strings(pids)
+	vips := make([]string, 0, len(pids))
+	names := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		vips = append(vips, vipByPeer[pid])
 		n := nickByPeer[pid]
 		if n == "" {
-			n = pid[:min(8, len(pid))]
+			// NOT pid[:8]: every Ed25519 peer id starts with the constant "12D3KooW", so that rendered every
+			// nickname-less friend as the same string. shortPeer takes the distinguishing tail.
+			n = shortPeer(pid)
 		}
 		names = append(names, n)
+	}
+	// The local player's own display name, so a package can write it into a game's config and the in-game name is
+	// really theirs. Falls back to something stable and distinct per peer rather than a shared placeholder.
+	selfName := social.getProfile().Nick
+	if selfName == "" {
+		selfName = "Player-" + shortPeer(self)
 	}
 	return map[string]string{
 		"VIDYAGOD_SANDBOX":     "on",
 		"VIDYAGOD_SANDBOX_NET": "isolated", // the LAN lives ONLY in the game's netns — the host stack is never touched
 		"VIDYAGOD_SELF_VIP":    myVIP,
+		"VIDYAGOD_SELF_NAME":   selfName,
 		"VIDYAGOD_SUBNET":      subnet,
 		"VIDYAGOD_PEER_VIPS":   strings.Join(vips, ","),
 		"VIDYAGOD_PEER_NAMES":  strings.Join(names, ","),

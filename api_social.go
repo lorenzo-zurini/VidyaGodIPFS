@@ -48,8 +48,9 @@ func friendSvc() *friendService {
 	return n.friend
 }
 
-//export VgFriendCode
 // This node's shareable friend code — its libp2p peer ID (Ed25519 → embeds the public key). "" if offline.
+//
+//export VgFriendCode
 func VgFriendCode(out **C.char) C.int {
 	n := get()
 	if n == nil {
@@ -85,8 +86,11 @@ func VgGetProfile(outJson **C.char) C.int {
 	return 0
 }
 
+// JSON array of contacts: [{peer,nick,pic,state,online,seen,added,play,plabel,pident,psince,popen}].
+// The play keys MUST match emitContact (friend.go) exactly — the UI re-reads this list on every event, so a field
+// present in only one of the two is erased by the refresh the event triggers.
+//
 //export VgFriendList
-// JSON array of contacts: [{peer,nick,pic,state,online,seen,added}].
 func VgFriendList(outJson **C.char) C.int {
 	n := get()
 	if n == nil || n.social == nil {
@@ -98,11 +102,132 @@ func VgFriendList(outJson **C.char) C.int {
 		arr = append(arr, map[string]any{
 			"peer": c.PeerID, "nick": c.Nick, "pic": c.PicCID,
 			"state": string(c.State), "online": c.online, "seen": c.LastSeen, "added": c.AddedAt,
+			"play": c.play.NodeID, "plabel": c.play.Label, "pident": c.play.Ident,
+			"psince": c.play.Since, "popen": c.play.Open,
 		})
 	}
 	b, _ := json.Marshal(arr)
 	setStr(outJson, string(b))
 	return 0
+}
+
+// announce pushes our play state to friends and re-shares the co-play roster. Every mutator of the play/visibility
+// state ends with this, mirroring how VgSetProfile ends with broadcastProfile.
+func announcePlay(n *node) {
+	if n.friend != nil {
+		n.friend.broadcastPresence()
+		n.friend.shareCoPlay()
+	}
+}
+
+// Record what was just launched. Succeeds with the node offline (the state is local; the broadcast is skipped) —
+// the launch path calls this unconditionally.
+//
+//export VgSetPlaying
+func VgSetPlaying(nodeID *C.char, label *C.char, ident *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	n.social.setPlaying(C.GoString(nodeID), C.GoString(label), C.GoString(ident))
+	announcePlay(n)
+	return 0
+}
+
+//export VgClearPlaying
+func VgClearPlaying() C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	n.social.clearPlaying()
+	announcePlay(n)
+	return 0
+}
+
+// {"node","label","ident","since","open"}
+//
+//export VgGetPlaying
+func VgGetPlaying(outJson **C.char) C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	p := n.social.getPlay()
+	b, _ := json.Marshal(map[string]any{
+		"node": p.NodeID, "label": p.Label, "ident": p.Ident, "since": p.Since, "open": p.Open,
+	})
+	setStr(outJson, string(b))
+	return 0
+}
+
+// Advisory only: it is displayed as a badge and never gates the Join affordance.
+//
+//export VgSetOpenToJoin
+func VgSetOpenToJoin(on C.int) C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	n.social.setOpenToJoin(on != 0)
+	announcePlay(n)
+	return 0
+}
+
+//export VgSetInvisible
+func VgSetInvisible(on C.int) C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	n.social.setInvisible(on != 0)
+	announcePlay(n) // pushes a zeroed play block, so friends stop seeing us immediately
+	return 0
+}
+
+// 1 = hidden, 0 = visible, -1 = no node.
+//
+//export VgInvisible
+func VgInvisible() C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	if n.social.getInvisible() {
+		return 1
+	}
+	return 0
+}
+
+// JSON array of strangers met in a shared game: [{peer,nick,via,game,at}]. These are NOT contacts and never enter
+// the address book — adding one sends an ordinary mutual-consent friend request.
+//
+//export VgFriendSuggestions
+func VgFriendSuggestions(outJson **C.char) C.int {
+	n := get()
+	if n == nil || n.social == nil {
+		return -1
+	}
+	sgs := n.social.listSuggestions()
+	arr := make([]map[string]any, 0, len(sgs))
+	for _, s := range sgs {
+		arr = append(arr, map[string]any{
+			"peer": s.Peer, "nick": s.Nick, "via": s.Via, "game": s.Game, "at": s.At,
+		})
+	}
+	b, _ := json.Marshal(arr)
+	setStr(outJson, string(b))
+	return 0
+}
+
+//export VgDismissSuggestion
+func VgDismissSuggestion(peerID *C.char) {
+	n := get()
+	if n == nil || n.social == nil {
+		return
+	}
+	n.social.dismissSuggestion(C.GoString(peerID))
 }
 
 //export VgFriendAdd
@@ -169,8 +294,9 @@ func VgFriendRemove(peerID *C.char) C.int {
 	return -1
 }
 
-//export VgFriendPing
 // Actively probe whether a friend is reachable right now (returns 1 online, 0 offline, -1 n/a).
+//
+//export VgFriendPing
 func VgFriendPing(peerID *C.char) C.int {
 	f := friendSvc()
 	if f == nil {
