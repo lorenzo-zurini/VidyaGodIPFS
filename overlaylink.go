@@ -17,8 +17,15 @@ package main
 //
 // Wire format (QUIC datagram, intercepted in datagramRecvLoop BEFORE the IPv4 check — 'V' = 0x56 can never be an
 // IPv4 header byte): "VGHB" + kind (0 ping / 1 pong) + 8-byte big-endian unix-nano send-timestamp, echoed verbatim
-// in the pong. Peers on older builds simply never pong — their conn still counts as healthy while libp2p reports
-// it connected (everPonged stays false, so the zombie detector never fires on them).
+// in the pong.
+//
+// A direct link must PROVE itself: it is not reported "direct" until the first pong, and a conn that never pongs
+// within linkProveBeats beats is closed and re-punched just like a zombie. This replaces an earlier leniency for
+// pre-heartbeat builds ("never ponged still counts as healthy") that field-failed 2026-08-31: a half-dead QUIC
+// conn (datagrams silently dropped, e.g. a hairpin-NAT punch) sat in "direct" with rtt=-1 FOREVER on one side
+// while the other flapped — the host advertised a healthy LAN and every join went into the void. An unproven conn
+// is reported "relayed" while it proves (streams retransmit, so presence/announcements still work; only the
+// datagram path is unproven).
 
 import (
 	"context"
@@ -39,6 +46,7 @@ const (
 	linkDialBackoff = 2 * time.Second // reconnect backoff floor (doubles to linkDialMax)
 	linkDialMax     = 30 * time.Second
 	linkUpgradeTry  = 30 * time.Second // how often to nudge a relayed link toward a direct (DCUtR) upgrade
+	linkProveBeats  = 5                // beats a NEW direct conn gets to produce its first pong before re-punch
 	linkProtectTag  = "vg-lan"
 )
 
@@ -70,11 +78,12 @@ type peerLink struct {
 	pid  peer.ID
 	nick string
 
-	state      string
-	rttMs      int64 // -1 = unknown
-	lastPong   time.Time
-	everPonged bool
-	missed     int
+	state       string
+	rttMs       int64 // -1 = unknown
+	lastPong    time.Time
+	everPonged  bool
+	missed      int
+	beatsNoPong int // beats sent on a conn that has NEVER ponged (proving phase; reset on pong / teardown)
 
 	dialing  bool      // an async (re)dial is in flight
 	nextDial time.Time // backoff gate
@@ -140,6 +149,7 @@ func (m *linkMaintainer) handleHeartbeat(pid peer.ID, pkt []byte, sendPong func(
 			l.lastPong = time.Now()
 			l.everPonged = true
 			l.missed = 0
+			l.beatsNoPong = 0
 		}
 		m.mu.Unlock()
 	}
@@ -200,13 +210,16 @@ func (m *linkMaintainer) tick() {
 func (m *linkMaintainer) evaluate(l *peerLink) {
 	connected := m.host.Network().Connectedness(l.pid) == network.Connected
 	direct := directQUICSender(m.host, l.pid)
+	m.mu.Lock()
+	proven := l.everPonged
+	m.mu.Unlock()
 
 	next := l.state
 	switch {
-	case direct != nil:
+	case direct != nil && proven:
 		next = linkDirect
 	case connected:
-		next = linkRelayed
+		next = linkRelayed // includes an UNPROVEN direct conn: streams work (retransmission), datagrams not yet trusted
 	default:
 		m.mu.Lock()
 		dialing := l.dialing
@@ -226,14 +239,21 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		m.mu.Lock()
 		if l.everPonged && time.Since(l.lastPong) > linkBeatEvery {
 			l.missed++
+		} else if !l.everPonged {
+			l.beatsNoPong++
 		}
-		miss := l.missed
+		miss, unproven := l.missed, l.beatsNoPong
 		m.mu.Unlock()
-		if miss >= linkBeatMiss {
-			fmt.Fprintf(os.Stderr, "[lan] %s: direct link went ZOMBIE (%d missed beats) — closing + re-punching\n", l.nick, miss)
+		if miss >= linkBeatMiss || unproven >= linkProveBeats {
+			if miss >= linkBeatMiss {
+				fmt.Fprintf(os.Stderr, "[lan] %s: direct link went ZOMBIE (%d missed beats) — closing + re-punching\n", l.nick, miss)
+			} else {
+				fmt.Fprintf(os.Stderr, "[lan] %s: direct conn NEVER ponged (%d beats) — half-dead punch, closing + re-punching\n", l.nick, unproven)
+			}
 			_ = m.host.Network().ClosePeer(l.pid)
 			m.mu.Lock()
 			l.missed = 0
+			l.beatsNoPong = 0
 			l.everPonged = false // the fresh conn must prove itself again
 			l.repunch++
 			m.mu.Unlock()
@@ -284,6 +304,9 @@ func (m *linkMaintainer) kickDial(l *peerLink) {
 		m.mu.Lock()
 		l.dialing = false
 		if err != nil {
+			// Rate-limited by the backoff itself. This was silent — a peer flapped down↔connecting for an hour
+			// tonight and nothing anywhere said WHY the dial failed.
+			fmt.Fprintf(os.Stderr, "[lan] %s: dial failed (%v) — retrying in %s\n", l.nick, err, l.backoff)
 			l.nextDial = time.Now().Add(l.backoff)
 			if l.backoff < linkDialMax {
 				l.backoff *= 2

@@ -96,3 +96,43 @@ func TestLanVIPStableAndInSubnet(t *testing.T) {
 		t.Fatalf("vIP outside subnet: %s", v)
 	}
 }
+
+// The 2026-08-31 field failure: a half-dead punch (QUIC conn up, datagrams silently dropped) sat in "direct"
+// with rtt=-1 forever on the host side, because the zombie detector only judged links that had ponged at least
+// once. A never-ponging conn must (a) not be reported "direct"/-1, and (b) be closed and re-punched after its
+// proving window, exactly like a zombie.
+func TestLinkMaintainerNeverPongedConnIsNotDirectAndRepunches(t *testing.T) {
+	ha, hb := quicHost(t), quicHost(t)
+	ctx := context.Background()
+
+	// Only A runs the overlay service — B never starts a datagram loop, so A's pings land in the void while the
+	// QUIC connection itself stays perfectly alive. This is the half-dead punch, modeled exactly.
+	oa := newOverlayService(ctx, ha, nil)
+	ma := newLinkMaintainer(ctx, ha, nil, func() map[peer.ID]string { return map[peer.ID]string{hb.ID(): "b"} })
+	oa.linkm = ma
+	oa.start()
+	connectHosts(t, ha, hb)
+	ma.tick()
+
+	// Through the whole proving window the link must read as relayed/connecting — NEVER direct.
+	sawRepunch := false
+	for i := 0; i < linkProveBeats+2; i++ {
+		ma.tick()
+		for _, li := range ma.snapshot(func(peer.ID) string { return "" }) {
+			if li.Link == linkDirect {
+				t.Fatalf("unproven conn reported as direct on beat %d (rtt=%d)", i, li.RttMs)
+			}
+		}
+		ma.mu.Lock()
+		if ma.links[hb.ID()] != nil && ma.links[hb.ID()].repunch > 0 {
+			sawRepunch = true
+		}
+		ma.mu.Unlock()
+		if sawRepunch {
+			break
+		}
+	}
+	if !sawRepunch {
+		t.Fatalf("conn that never ponged was not re-punched within the proving window")
+	}
+}
