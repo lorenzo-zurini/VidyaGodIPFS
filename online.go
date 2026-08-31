@@ -255,7 +255,7 @@ func (n *node) goOnline() error {
 		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
 		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
-		n.overlay = newOverlayService(n.ctx, h, kad)
+		n.overlay = newOverlayService(n.ctx, h, kad, n.linkm)
 		n.overlay.start()
 	}
 
@@ -350,6 +350,11 @@ type mdnsNotifee struct {
 }
 
 func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Keep the discovered same-LAN addrs for an hour (Connect alone records them with a temp TTL of minutes):
+	// the link maintainer's force-direct upgrade dials need them to still be there when a relayed/unproven link
+	// nudges an upgrade — this is what turns "two PCs on the same LAN" into a direct local connection instead of
+	// a hairpin punch.
+	m.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
 	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	defer cancel()
 	_ = m.h.Connect(ctx, pi)

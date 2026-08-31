@@ -122,10 +122,39 @@ func (l *fdLink) ReadPacket() ([]byte, error) {
 func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return err }
 func (l *fdLink) Close() error               { return l.f.Close() }
 
-func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
-	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
+// newOverlayService — lm is the always-on link maintainer, injected HERE because this wiring was once a field
+// assignment ("o.linkm = ...") that every TEST performed and production NEVER did: with linkm nil, no friend
+// connection ever got a datagram receive loop and inbound heartbeats were ignored, so pongs never happened in the
+// field — the LAN ran on stream fallback for its entire life while the state machine guessed. Constructor
+// injection makes the forgotten-wiring class unrepresentable; nil stays legal for overlay-only tests.
+func newOverlayService(ctx context.Context, h host.Host, r peerRouter, lm *linkMaintainer) *overlayService {
+	o := &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
 		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{},
-		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}}
+		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}, linkm: lm}
+	if lm != nil {
+		// The maintainer re-kicks receive loops from its tick: a conn that predated friend membership (a bitswap
+		// dial, a presence stream) would otherwise NEVER get a loop — the dgRecv dedupe means a miss was permanent.
+		lm.ensureRecvLoops = func(pid peer.ID) {
+			for _, c := range h.Network().ConnsToPeer(pid) {
+				o.maybeStartDatagramLoop(c)
+			}
+		}
+	}
+	return o
+}
+
+// dialPeerDirect forces a DIRECT dial attempt even while a relayed/TCP connection exists. dialPeer's
+// Connectedness short-circuit made every "upgrade nudge" a no-op for the maintainer: as long as ANY conn was up
+// (relay, TCP over a tunnel iface), h.Connect returned early and the better path was never tried. This uses the
+// swarm's force-direct escape hatch — mDNS-learned same-LAN addrs in the peerstore finally get dialed.
+func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
+	ctx = network.WithForceDirectDial(ctx, "vg-lan-upgrade")
+	if router != nil {
+		if ai, err := router.FindPeer(ctx, pid); err == nil {
+			return h.Connect(ctx, ai)
+		}
+	}
+	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
