@@ -27,7 +27,7 @@ import (
 	"github.com/libp2p/zeroconf/v2"
 )
 
-const nettestBudget = 15 * time.Second
+const nettestBudget = 30 * time.Second
 
 type netCheck struct {
 	Name   string `json:"name"`
@@ -42,12 +42,13 @@ func (n *node) runNetworkTest() []netCheck {
 	defer cancel()
 
 	// Warm-up grace: a freshly-started node has 0 peers and an empty link table for a few seconds, and judging
-	// during that window produced confident nonsense ("all outbound P2P traffic may be blocked") on a perfectly
-	// healthy machine — observed on the very first live run. Wait (bounded) for the first peer before probing.
-	for waited := 0; len(n.host.Network().Peers()) == 0 && waited < 32; waited++ {
+	// during that window produced confident nonsense on perfectly healthy machines — "all outbound P2P traffic
+	// may be blocked" on the first live run, then "UDP looks BLOCKED" on the second because the single warm-up
+	// peer happened to be TCP. Wait (bounded) for a few peers, not just the first.
+	for waited := 0; len(n.host.Network().Peers()) < 3 && waited < 48; waited++ {
 		select {
 		case <-ctx.Done():
-			waited = 32
+			waited = 48
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
@@ -136,15 +137,24 @@ func (n *node) checkPeers() netCheck {
 // drops UDP" shape — and it silently costs hole-punching, datagram tunnels, and half the throughput.
 func (n *node) checkUDP() netCheck {
 	c := netCheck{Name: "UDP / QUIC"}
-	quic, tcp := 0, 0
-	for _, conn := range n.host.Network().Conns() {
-		a := conn.RemoteMultiaddr().String()
-		switch {
-		case strings.Contains(a, "/quic"):
-			quic++
-		case strings.Contains(a, "/tcp"):
-			tcp++
+	count := func() (quic, tcp int) {
+		for _, conn := range n.host.Network().Conns() {
+			a := conn.RemoteMultiaddr().String()
+			switch {
+			case strings.Contains(a, "/quic"):
+				quic++
+			case strings.Contains(a, "/tcp"):
+				tcp++
+			}
 		}
+		return
+	}
+	quic, tcp := count()
+	// "UDP blocked" is the scariest verdict on the page; do not shout it because the first couple of dials
+	// happened to land on TCP. Give QUIC a bounded window to appear before judging.
+	for waited := 0; quic == 0 && waited < 32; waited++ {
+		time.Sleep(250 * time.Millisecond)
+		quic, tcp = count()
 	}
 	switch {
 	case quic > 0:
