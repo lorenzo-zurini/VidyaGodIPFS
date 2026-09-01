@@ -181,3 +181,21 @@ func VgLanSetExcluded(csv *C.char) {
 		n.overlay.setExcluded(pids)
 	}
 }
+
+// Run the full network/firewall diagnostic sweep (nettest.go): ~15s bounded, concurrent, read-only.
+// outJson: [{"name","status":"ok|warn|fail","detail"}...] in a stable order. -1 when the node is offline —
+// the caller reports that itself (there is nothing meaningful to probe without a host).
+//
+//export VgNetworkTest
+func VgNetworkTest(outJson **C.char) C.int {
+	n := get()
+	if n == nil || !n.online || n.host == nil {
+		return -1
+	}
+	b, err := json.Marshal(n.runNetworkTest())
+	if err != nil {
+		return -1
+	}
+	setStr(outJson, string(b))
+	return 0
+}
