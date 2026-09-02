@@ -150,10 +150,16 @@ func newOverlayService(ctx context.Context, h host.Host, r peerRouter, lm *linkM
 func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
 	ctx = network.WithForceDirectDial(ctx, "vg-lan-upgrade")
 	if router != nil {
-		if ai, err := router.FindPeer(ctx, pid); err == nil {
-			return h.Connect(ctx, ai)
-		}
+		// Best-effort: run the query so any routing-discovered addrs land in the peerstore (a side effect of
+		// FindPeer). We deliberately do NOT `return h.Connect(ctx, ai)` on its result — for a WireGuard/tunnel
+		// -private friend FindPeer yields only relay/circuit addrs, and a force-direct dial can't build a direct
+		// conn from a /p2p-circuit addr, so the old code failed there and NEVER tried the peerstore. That left
+		// every relayed link stuck: the friend's real DIRECT address (its advertised WG/LAN addr) was sitting in
+		// the peerstore the whole time (identify learned it over the relay conn) but was never dialed.
+		_, _ = router.FindPeer(ctx, pid)
 	}
+	// Dial the FULL peerstore addr set for pid. ForceDirectDial makes the swarm skip the circuit addrs and dial
+	// the direct ones — so the identify-learned WG/LAN QUIC address gets tried, upgrading relayed → direct.
 	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
 
@@ -163,11 +169,13 @@ func dialPeer(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) 
 		return nil
 	}
 	if router != nil {
-		ai, err := router.FindPeer(ctx, pid)
-		if err != nil {
-			return fmt.Errorf("locate peer: %w", err)
+		if ai, err := router.FindPeer(ctx, pid); err == nil {
+			return h.Connect(ctx, ai)
 		}
-		return h.Connect(ctx, ai)
+		// FindPeer missed — routine for a WireGuard/tunnel-private friend that isn't published in the public
+		// DHT ("routing: not found"). Don't hard-fail: fall through to any addrs already in the peerstore
+		// (mDNS, or identify from a relay/prior conn). An empty peerstore just yields a clearer no-addrs error
+		// and the maintainer retries — but once a relay conn has exchanged identify, the direct addr is here.
 	}
 	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
