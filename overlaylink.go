@@ -10,9 +10,11 @@ package main
 //     traffic rides. That alone defeats NAT idle timeouts (4s ≪ 30s) and yields live RTT for the UI.
 //   • STATE: direct (QUIC + fresh pongs) / relayed (connected, no direct QUIC) / connecting / down — exposed via
 //     VgLanPeers for the Friends tab and the launch window's Virtual LAN panel.
-//   • REPAIR: linkBeatMiss missed pongs on a previously-responsive peer ⇒ the connection is a zombie — close it,
-//     re-dial (relay first; DCUtR re-punches to direct), with 2s→30s backoff. Stuck on relayed ⇒ gentle periodic
-//     re-dial nudges an upgrade without flapping a working relay.
+//   • REPAIR: linkBeatMiss missed pongs on a previously-responsive peer ⇒ the datagram path is dead. We do NOT
+//     close the connection (that tore down bitswap + friend streams on the same conn — field jank): we demote to
+//     the reliable stream fallback (state: relayed) and nudge a force-direct re-dial for a fresh datagram path,
+//     leaving the working connection alone. quic-go's idle timeout reaps a genuinely-dead conn; the maintainer
+//     re-dials then. Stuck on relayed ⇒ the same gentle periodic upgrade nudge, never flapping a working link.
 //   • PROTECT: maintained peers' connections are pinned in the ConnManager so background churn never trims them.
 //
 // Wire format (QUIC datagram, intercepted in datagramRecvLoop BEFORE the IPv4 check — 'V' = 0x56 can never be an
@@ -268,19 +270,27 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		m.mu.Unlock()
 		switch {
 		case proven && miss >= linkBeatMiss:
-			// A previously-responsive peer that stops ponging has a ZOMBIE connection (dead NAT mapping): the
-			// QUIC stack keeps "sending" into the void until its own idle timeout — meanwhile every game packet
-			// is lost silently. Close it ourselves and re-dial; DCUtR re-punches a fresh direct path.
-			fmt.Fprintf(os.Stderr, "[lan] %s: direct link went ZOMBIE (%d missed beats) — closing + re-punching\n", l.nick, miss)
-			_ = m.host.Network().ClosePeer(l.pid)
+			// The datagram pongs stopped on a previously-responsive peer (its NAT mapping likely died). We used to
+			// ClosePeer here to force a fresh punch — but that ALSO tore down bitswap and the friend/presence
+			// streams riding the SAME connection, flapping downloads and friends offline every time a mapping
+			// blinked (the field jank). Instead: demote to UNPROVEN so traffic rides the reliable stream fallback
+			// (the conn stays up, state → relayed), and nudge a force-direct re-dial on the upgrade cadence for a
+			// fresh datagram path — WITHOUT killing the working connection. If the conn is genuinely dead (streams
+			// too), quic-go's own idle timeout reaps it and the maintainer re-dials then.
+			fmt.Fprintf(os.Stderr, "[lan] %s: datagram pongs stopped (%d misses) — stream fallback, nudging a fresh direct path (no teardown)\n", l.nick, miss)
 			m.mu.Lock()
 			l.missed = 0
 			l.beatsNoPong = 0
-			l.everPonged = false // the fresh conn must prove itself again
+			l.everPonged = false // re-prove datagrams on the next punch
 			l.repunch++
 			m.mu.Unlock()
-			m.kickDial(l, false)
-			next = linkConnecting
+			if connected {
+				next = linkRelayed // usable via stream; datagrams no longer trusted
+			}
+			if time.Since(l.lastUp) > linkUpgradeTry {
+				l.lastUp = time.Now()
+				m.kickDial(l, true) // force-direct upgrade dial — no teardown
+			}
 		case !proven:
 			// UNPROVEN: do NOT tear down — the same connection carries the presence/friend streams, and closing
 			// it flapped friends to offline every proving window (field regression, 2026-08-31). The link stays
