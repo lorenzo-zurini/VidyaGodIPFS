@@ -610,7 +610,11 @@ func (o *overlayService) sendStream(ctx context.Context, pid peer.ID) (network.S
 	if err := dialPeer(ctx, o.host, o.router, pid); err != nil {
 		return nil, err
 	}
-	s, err := o.host.NewStream(ctx, pid, overlayProtoID)
+	// WithAllowLimitedConn: the overlay's whole point is a stream fallback that carries the LAN when the direct
+	// datagram path is unavailable — which is precisely the RELAYED (circuit-v2, "limited") state. Without opting in,
+	// NewStream returns network.ErrLimitedConn on a relayed conn, so the "fallback" the design promises never opens and
+	// a relay-only pair (hole-punch failed) has NO working LAN path at all.
+	s, err := o.host.NewStream(network.WithAllowLimitedConn(ctx, "vidyagod-overlay"), pid, overlayProtoID)
 	if err != nil {
 		return nil, err
 	}

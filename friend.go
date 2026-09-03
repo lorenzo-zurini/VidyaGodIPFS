@@ -299,7 +299,11 @@ func (f *friendService) send(pidStr string, msgs ...friendMsg) error {
 	if err := f.dial(ctx, pid); err != nil {
 		return err
 	}
-	s, err := f.host.NewStream(ctx, pid, friendProtoID)
+	// WithAllowLimitedConn: a friend request is a tiny JSON message that must go through even when the only path to
+	// the peer is a RELAYED (circuit-v2, "limited") connection — the common case when hole-punching hasn't succeeded
+	// yet (strict NAT). Without this, NewStream returns network.ErrLimitedConn and the request silently fails ("open
+	// stream: limited connection to peer") even though we're "connected" and bitswap (which opts in) downloads fine.
+	s, err := f.host.NewStream(network.WithAllowLimitedConn(ctx, "vidyagod-friend"), pid, friendProtoID)
 	if err != nil {
 		return fmt.Errorf("open stream: %w", err)
 	}
