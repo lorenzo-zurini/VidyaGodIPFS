@@ -122,45 +122,10 @@ func (l *fdLink) ReadPacket() ([]byte, error) {
 func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return err }
 func (l *fdLink) Close() error               { return l.f.Close() }
 
-// newOverlayService — lm is the always-on link maintainer, injected HERE because this wiring was once a field
-// assignment ("o.linkm = ...") that every TEST performed and production NEVER did: with linkm nil, no friend
-// connection ever got a datagram receive loop and inbound heartbeats were ignored, so pongs never happened in the
-// field — the LAN ran on stream fallback for its entire life while the state machine guessed. Constructor
-// injection makes the forgotten-wiring class unrepresentable; nil stays legal for overlay-only tests.
-func newOverlayService(ctx context.Context, h host.Host, r peerRouter, lm *linkMaintainer) *overlayService {
-	o := &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
+func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
+	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
 		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{},
-		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}, linkm: lm}
-	if lm != nil {
-		// The maintainer re-kicks receive loops from its tick: a conn that predated friend membership (a bitswap
-		// dial, a presence stream) would otherwise NEVER get a loop — the dgRecv dedupe means a miss was permanent.
-		lm.ensureRecvLoops = func(pid peer.ID) {
-			for _, c := range h.Network().ConnsToPeer(pid) {
-				o.maybeStartDatagramLoop(c)
-			}
-		}
-	}
-	return o
-}
-
-// dialPeerDirect forces a DIRECT dial attempt even while a relayed/TCP connection exists. dialPeer's
-// Connectedness short-circuit made every "upgrade nudge" a no-op for the maintainer: as long as ANY conn was up
-// (relay, TCP over a tunnel iface), h.Connect returned early and the better path was never tried. This uses the
-// swarm's force-direct escape hatch — mDNS-learned same-LAN addrs in the peerstore finally get dialed.
-func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
-	ctx = network.WithForceDirectDial(ctx, "vg-lan-upgrade")
-	if router != nil {
-		// Best-effort: run the query so any routing-discovered addrs land in the peerstore (a side effect of
-		// FindPeer). We deliberately do NOT `return h.Connect(ctx, ai)` on its result — for a WireGuard/tunnel
-		// -private friend FindPeer yields only relay/circuit addrs, and a force-direct dial can't build a direct
-		// conn from a /p2p-circuit addr, so the old code failed there and NEVER tried the peerstore. That left
-		// every relayed link stuck: the friend's real DIRECT address (its advertised WG/LAN addr) was sitting in
-		// the peerstore the whole time (identify learned it over the relay conn) but was never dialed.
-		_, _ = router.FindPeer(ctx, pid)
-	}
-	// Dial the FULL peerstore addr set for pid. ForceDirectDial makes the swarm skip the circuit addrs and dial
-	// the direct ones — so the identify-learned WG/LAN QUIC address gets tried, upgrading relayed → direct.
-	return h.Connect(ctx, peer.AddrInfo{ID: pid})
+		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}}
 }
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
@@ -169,13 +134,11 @@ func dialPeer(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) 
 		return nil
 	}
 	if router != nil {
-		if ai, err := router.FindPeer(ctx, pid); err == nil {
-			return h.Connect(ctx, ai)
+		ai, err := router.FindPeer(ctx, pid)
+		if err != nil {
+			return fmt.Errorf("locate peer: %w", err)
 		}
-		// FindPeer missed — routine for a WireGuard/tunnel-private friend that isn't published in the public
-		// DHT ("routing: not found"). Don't hard-fail: fall through to any addrs already in the peerstore
-		// (mDNS, or identify from a relay/prior conn). An empty peerstore just yields a clearer no-addrs error
-		// and the maintainer retries — but once a relay conn has exchanged identify, the direct addr is here.
+		return h.Connect(ctx, ai)
 	}
 	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
@@ -610,11 +573,7 @@ func (o *overlayService) sendStream(ctx context.Context, pid peer.ID) (network.S
 	if err := dialPeer(ctx, o.host, o.router, pid); err != nil {
 		return nil, err
 	}
-	// WithAllowLimitedConn: the overlay's whole point is a stream fallback that carries the LAN when the direct
-	// datagram path is unavailable — which is precisely the RELAYED (circuit-v2, "limited") state. Without opting in,
-	// NewStream returns network.ErrLimitedConn on a relayed conn, so the "fallback" the design promises never opens and
-	// a relay-only pair (hole-punch failed) has NO working LAN path at all.
-	s, err := o.host.NewStream(network.WithAllowLimitedConn(ctx, "vidyagod-overlay"), pid, overlayProtoID)
+	s, err := o.host.NewStream(ctx, pid, overlayProtoID)
 	if err != nil {
 		return nil, err
 	}

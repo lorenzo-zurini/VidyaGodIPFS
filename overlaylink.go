@@ -10,24 +10,15 @@ package main
 //     traffic rides. That alone defeats NAT idle timeouts (4s ≪ 30s) and yields live RTT for the UI.
 //   • STATE: direct (QUIC + fresh pongs) / relayed (connected, no direct QUIC) / connecting / down — exposed via
 //     VgLanPeers for the Friends tab and the launch window's Virtual LAN panel.
-//   • REPAIR: linkBeatMiss missed pongs on a previously-responsive peer ⇒ the datagram path is dead. We do NOT
-//     close the connection (that tore down bitswap + friend streams on the same conn — field jank): we demote to
-//     the reliable stream fallback (state: relayed) and nudge a force-direct re-dial for a fresh datagram path,
-//     leaving the working connection alone. quic-go's idle timeout reaps a genuinely-dead conn; the maintainer
-//     re-dials then. Stuck on relayed ⇒ the same gentle periodic upgrade nudge, never flapping a working link.
+//   • REPAIR: linkBeatMiss missed pongs on a previously-responsive peer ⇒ the connection is a zombie — close it,
+//     re-dial (relay first; DCUtR re-punches to direct), with 2s→30s backoff. Stuck on relayed ⇒ gentle periodic
+//     re-dial nudges an upgrade without flapping a working relay.
 //   • PROTECT: maintained peers' connections are pinned in the ConnManager so background churn never trims them.
 //
 // Wire format (QUIC datagram, intercepted in datagramRecvLoop BEFORE the IPv4 check — 'V' = 0x56 can never be an
 // IPv4 header byte): "VGHB" + kind (0 ping / 1 pong) + 8-byte big-endian unix-nano send-timestamp, echoed verbatim
-// in the pong.
-//
-// A direct link must PROVE itself: it is not reported "direct" until the first pong, and a conn that never pongs
-// within linkProveBeats beats is closed and re-punched just like a zombie. This replaces an earlier leniency for
-// pre-heartbeat builds ("never ponged still counts as healthy") that field-failed 2026-08-31: a half-dead QUIC
-// conn (datagrams silently dropped, e.g. a hairpin-NAT punch) sat in "direct" with rtt=-1 FOREVER on one side
-// while the other flapped — the host advertised a healthy LAN and every join went into the void. An unproven conn
-// is reported "relayed" while it proves (streams retransmit, so presence/announcements still work; only the
-// datagram path is unproven).
+// in the pong. Peers on older builds simply never pong — their conn still counts as healthy while libp2p reports
+// it connected (everPonged stays false, so the zombie detector never fires on them).
 
 import (
 	"context"
@@ -48,7 +39,6 @@ const (
 	linkDialBackoff = 2 * time.Second // reconnect backoff floor (doubles to linkDialMax)
 	linkDialMax     = 30 * time.Second
 	linkUpgradeTry  = 30 * time.Second // how often to nudge a relayed link toward a direct (DCUtR) upgrade
-	linkProveBeats  = 5                // beats a NEW direct conn gets to produce its first pong before re-punch
 	linkProtectTag  = "vg-lan"
 )
 
@@ -80,13 +70,11 @@ type peerLink struct {
 	pid  peer.ID
 	nick string
 
-	state         string
-	rttMs         int64 // -1 = unknown
-	lastPong      time.Time
-	everPonged    bool
-	missed        int
-	beatsNoPong   int  // beats sent on a conn that has NEVER ponged (proving phase; reset on pong / teardown)
-	sendErrLogged bool // first heartbeat send error named once (reset on pong)
+	state      string
+	rttMs      int64 // -1 = unknown
+	lastPong   time.Time
+	everPonged bool
+	missed     int
 
 	dialing  bool      // an async (re)dial is in flight
 	nextDial time.Time // backoff gate
@@ -105,11 +93,6 @@ type linkMaintainer struct {
 	// peersFn returns the CURRENT accepted-friend set (pid → nick) each tick — the maintainer never caches
 	// membership, so friend add/remove takes effect within one beat with no event plumbing.
 	peersFn func() map[peer.ID]string
-
-	// ensureRecvLoops re-kicks datagram receive loops for a peer's existing conns (set by newOverlayService).
-	// Called every evaluate: idempotent and cheap, it closes the race where a conn established BEFORE the peer
-	// became maintained never got a loop and silently dropped every datagram — including our pings' pongs.
-	ensureRecvLoops func(pid peer.ID)
 
 	mu    sync.Mutex
 	links map[peer.ID]*peerLink
@@ -157,8 +140,6 @@ func (m *linkMaintainer) handleHeartbeat(pid peer.ID, pkt []byte, sendPong func(
 			l.lastPong = time.Now()
 			l.everPonged = true
 			l.missed = 0
-			l.beatsNoPong = 0
-			l.sendErrLogged = false
 		}
 		m.mu.Unlock()
 	}
@@ -219,16 +200,13 @@ func (m *linkMaintainer) tick() {
 func (m *linkMaintainer) evaluate(l *peerLink) {
 	connected := m.host.Network().Connectedness(l.pid) == network.Connected
 	direct := directQUICSender(m.host, l.pid)
-	m.mu.Lock()
-	proven := l.everPonged
-	m.mu.Unlock()
 
 	next := l.state
 	switch {
-	case direct != nil && proven:
+	case direct != nil:
 		next = linkDirect
 	case connected:
-		next = linkRelayed // includes an UNPROVEN direct conn: streams work (retransmission), datagrams not yet trusted
+		next = linkRelayed
 	default:
 		m.mu.Lock()
 		dialing := l.dialing
@@ -240,81 +218,37 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		}
 	}
 
-	// Any conn for a maintained peer must have a datagram receive loop — re-kicked every beat because a conn
-	// established before this peer became maintained never got one (and quic-go silently drops unread datagrams,
-	// which reads as "the network ate my pongs").
-	if m.ensureRecvLoops != nil && connected {
-		m.ensureRecvLoops(l.pid)
-	}
-
 	if direct != nil {
-		// Beat. Send errors were discarded here ('_ ='), so "datagrams not negotiated"-class failures were
-		// indistinguishable from packet loss; now they count as misses and get named once.
-		if err := direct(heartbeatPacket(0, time.Now().UnixNano())); err != nil {
-			m.mu.Lock()
-			l.missed++
-			first := !l.sendErrLogged
-			l.sendErrLogged = true
-			m.mu.Unlock()
-			if first {
-				fmt.Fprintf(os.Stderr, "[lan] %s: heartbeat SEND failed on the direct conn: %v\n", l.nick, err)
-			}
-		}
+		// Beat. A previously-responsive peer that stops ponging has a ZOMBIE connection (dead NAT mapping): the
+		// QUIC stack keeps "sending" into the void until its own idle timeout — meanwhile every game packet is
+		// lost silently. Close it ourselves and re-dial; DCUtR re-punches a fresh direct path.
+		direct(heartbeatPacket(0, time.Now().UnixNano()))
 		m.mu.Lock()
 		if l.everPonged && time.Since(l.lastPong) > linkBeatEvery {
 			l.missed++
-		} else if !l.everPonged {
-			l.beatsNoPong++
 		}
-		miss, unproven, proven := l.missed, l.beatsNoPong, l.everPonged
+		miss := l.missed
 		m.mu.Unlock()
-		switch {
-		case proven && miss >= linkBeatMiss:
-			// The datagram pongs stopped on a previously-responsive peer (its NAT mapping likely died). We used to
-			// ClosePeer here to force a fresh punch — but that ALSO tore down bitswap and the friend/presence
-			// streams riding the SAME connection, flapping downloads and friends offline every time a mapping
-			// blinked (the field jank). Instead: demote to UNPROVEN so traffic rides the reliable stream fallback
-			// (the conn stays up, state → relayed), and nudge a force-direct re-dial on the upgrade cadence for a
-			// fresh datagram path — WITHOUT killing the working connection. If the conn is genuinely dead (streams
-			// too), quic-go's own idle timeout reaps it and the maintainer re-dials then.
-			fmt.Fprintf(os.Stderr, "[lan] %s: datagram pongs stopped (%d misses) — stream fallback, nudging a fresh direct path (no teardown)\n", l.nick, miss)
+		if miss >= linkBeatMiss {
+			fmt.Fprintf(os.Stderr, "[lan] %s: direct link went ZOMBIE (%d missed beats) — closing + re-punching\n", l.nick, miss)
+			_ = m.host.Network().ClosePeer(l.pid)
 			m.mu.Lock()
 			l.missed = 0
-			l.beatsNoPong = 0
-			l.everPonged = false // re-prove datagrams on the next punch
+			l.everPonged = false // the fresh conn must prove itself again
 			l.repunch++
 			m.mu.Unlock()
-			if connected {
-				next = linkRelayed // usable via stream; datagrams no longer trusted
-			}
-			if time.Since(l.lastUp) > linkUpgradeTry {
-				l.lastUp = time.Now()
-				m.kickDial(l, true) // force-direct upgrade dial — no teardown
-			}
-		case !proven:
-			// UNPROVEN: do NOT tear down — the same connection carries the presence/friend streams, and closing
-			// it flapped friends to offline every proving window (field regression, 2026-08-31). The link stays
-			// usable via stream fallback (state: relayed); we keep beating, say so ONCE, and nudge a force-direct
-			// re-dial on the upgrade cadence so a better path can appear without killing the working one.
-			if unproven == linkProveBeats {
-				fmt.Fprintf(os.Stderr, "[lan] %s: direct conn not answering datagram pings (%d beats) — datagram "+
-					"path unproven; traffic rides stream fallback while we keep nudging\n", l.nick, unproven)
-			}
-			if time.Since(l.lastUp) > linkUpgradeTry {
-				l.lastUp = time.Now()
-				m.kickDial(l, true)
-			}
+			m.kickDial(l)
+			next = linkConnecting
 		}
 	} else if connected {
-		// Relayed/TCP: usable (stream fallback carries the LAN at announcement rates) but worth upgrading. The
-		// nudge must FORCE a direct dial — a plain dial no-ops while any conn exists, so this branch never
-		// actually dialed anything before.
+		// Relayed/TCP: usable (stream fallback carries the LAN at announcement rates) but worth upgrading.
+		// A gentle periodic re-dial gives DCUtR fresh chances without flapping the working relay.
 		if time.Since(l.lastUp) > linkUpgradeTry {
 			l.lastUp = time.Now()
-			m.kickDial(l, true)
+			m.kickDial(l)
 		}
 	} else {
-		m.kickDial(l, false)
+		m.kickDial(l)
 	}
 
 	if connected || direct != nil {
@@ -334,10 +268,8 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 	}
 }
 
-// kickDial starts one async (re)dial for l, respecting the backoff and never stacking dials. force uses a
-// direct-only dial that bypasses the "already connected" short-circuit — the upgrade path for relayed/unproven
-// links (a plain dial is a no-op while any connection exists).
-func (m *linkMaintainer) kickDial(l *peerLink, force bool) {
+// kickDial starts one async (re)dial for l, respecting the backoff and never stacking dials.
+func (m *linkMaintainer) kickDial(l *peerLink) {
 	m.mu.Lock()
 	if l.dialing || time.Now().Before(l.nextDial) {
 		m.mu.Unlock()
@@ -347,19 +279,11 @@ func (m *linkMaintainer) kickDial(l *peerLink, force bool) {
 	m.mu.Unlock()
 	go func() {
 		ctx, cancel := context.WithTimeout(m.ctx, 25*time.Second)
-		var err error
-		if force {
-			err = dialPeerDirect(ctx, m.host, m.router, l.pid)
-		} else {
-			err = dialPeer(ctx, m.host, m.router, l.pid)
-		}
+		err := dialPeer(ctx, m.host, m.router, l.pid)
 		cancel()
 		m.mu.Lock()
 		l.dialing = false
 		if err != nil {
-			// Rate-limited by the backoff itself. This was silent — a peer flapped down↔connecting for an hour
-			// tonight and nothing anywhere said WHY the dial failed.
-			fmt.Fprintf(os.Stderr, "[lan] %s: dial failed (%v) — retrying in %s\n", l.nick, err, l.backoff)
 			l.nextDial = time.Now().Add(l.backoff)
 			if l.backoff < linkDialMax {
 				l.backoff *= 2
@@ -374,12 +298,12 @@ func (m *linkMaintainer) kickDial(l *peerLink, force bool) {
 
 // directQUICSender returns a datagram-send closure over a direct QUIC connection to pid, or nil when the only
 // connections are relayed/TCP (heartbeats are datagram-only — their whole point is exercising the direct path).
-func directQUICSender(h host.Host, pid peer.ID) func([]byte) error {
+func directQUICSender(h host.Host, pid peer.ID) func([]byte) {
 	qc := quicConnTo(h, pid)
 	if qc == nil {
 		return nil
 	}
-	return func(b []byte) error { return qc.SendDatagram(b) }
+	return func(b []byte) { _ = qc.SendDatagram(b) }
 }
 
 // snapshot returns the UI view of every maintained link.

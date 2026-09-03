@@ -76,8 +76,8 @@ func TestOverlayForwardsPacketToOwningPeer(t *testing.T) {
 	connectHosts(t, hA, hB)
 
 	ctx := context.Background()
-	oA := newOverlayService(ctx, hA, nil, nil)
-	oB := newOverlayService(ctx, hB, nil, nil)
+	oA := newOverlayService(ctx, hA, nil)
+	oB := newOverlayService(ctx, hB, nil)
 	oA.start()
 	oB.start()
 
@@ -160,7 +160,7 @@ func TestOverlayDatagramFastPathOverQUIC(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	oA, oB := newOverlayService(ctx, hA, nil, nil), newOverlayService(ctx, hB, nil, nil)
+	oA, oB := newOverlayService(ctx, hA, nil), newOverlayService(ctx, hB, nil)
 	oA.start()
 	oB.start()
 	if err := oA.configure("10.66.9.1", "10.66.0.0/16", map[string]string{"10.66.9.2": hB.ID().String()}); err != nil {
@@ -215,7 +215,7 @@ func TestOverlayFansOutBroadcast(t *testing.T) {
 	connectHosts(t, hA, hC)
 
 	ctx := context.Background()
-	oA, oB, oC := newOverlayService(ctx, hA, nil, nil), newOverlayService(ctx, hB, nil, nil), newOverlayService(ctx, hC, nil, nil)
+	oA, oB, oC := newOverlayService(ctx, hA, nil), newOverlayService(ctx, hB, nil), newOverlayService(ctx, hC, nil)
 	oA.start()
 	oB.start()
 	oC.start()
