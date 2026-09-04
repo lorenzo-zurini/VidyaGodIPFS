@@ -163,7 +163,9 @@ func openNode(repoPath string) error {
 	// background with backoff instead of leaving the node offline for the whole session.
 	// VIDYAGOD_IPFS_OFFLINE forces a purely-local node (used by the tests and as a no-network escape hatch).
 	if os.Getenv("VIDYAGOD_IPFS_OFFLINE") == "" {
-		if err := gNode.goOnline(); err != nil {
+		// guardErr: a panic in goOnline (which now wires the whole friend/overlay LAN stack) must not crash the
+		// process — convert it to an error so the existing retry path handles it, leaving a usable offline node.
+		if err := guardErr("goOnline", gNode.goOnline); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] goOnline failed: %v — retrying in background\n", err)
 			go retryOnline(gNode)
 		}
@@ -181,13 +183,21 @@ func retryOnline(n *node) {
 			return
 		case <-time.After(delay):
 		}
-		gMu.Lock()
-		if gNode != n {
-			gMu.Unlock()
+		// Deferred unlock inside a closure: a panic in goOnline must NOT leave gMu held — that would wedge every
+		// get() (and thus the whole node) forever. guardErr turns a panic into a retryable error.
+		stop := false
+		err := func() error {
+			gMu.Lock()
+			defer gMu.Unlock()
+			if gNode != n {
+				stop = true
+				return nil
+			}
+			return guardErr("goOnline", n.goOnline)
+		}()
+		if stop {
 			return
 		}
-		err := n.goOnline()
-		gMu.Unlock()
 		if err == nil {
 			fmt.Fprintf(os.Stderr, "[node] goOnline retry succeeded\n")
 			return

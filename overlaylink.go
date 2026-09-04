@@ -110,7 +110,9 @@ func (m *linkMaintainer) run() {
 		case <-m.ctx.Done():
 			return
 		case <-t.C:
-			m.tick()
+			// guard: a panic in one tick (a bad conn, a nil peerstore entry) is logged and skipped — the
+			// maintainer keeps running and, critically, never takes the whole node down with it.
+			guard("linkm.tick", m.tick)
 		}
 	}
 }
@@ -277,7 +279,7 @@ func (m *linkMaintainer) kickDial(l *peerLink) {
 	}
 	l.dialing = true
 	m.mu.Unlock()
-	go func() {
+	safeGo("linkm.kickDial", func() {
 		ctx, cancel := context.WithTimeout(m.ctx, 25*time.Second)
 		err := dialPeer(ctx, m.host, m.router, l.pid)
 		cancel()
@@ -293,7 +295,7 @@ func (m *linkMaintainer) kickDial(l *peerLink) {
 			l.nextDial = time.Time{}
 		}
 		m.mu.Unlock()
-	}()
+	})
 }
 
 // directQUICSender returns a datagram-send closure over a direct QUIC connection to pid, or nil when the only

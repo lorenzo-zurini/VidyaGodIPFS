@@ -262,7 +262,7 @@ func (f *friendService) shareCoPlay() {
 			roster = roster[:maxCoPlay]
 		}
 		msg := friendMsg{Type: "coplay", Game: mine.NodeID, CoPlay: roster}
-		go func(p string, m friendMsg) { _ = f.send(p, m) }(target.PeerID, msg)
+		safeGo("friend.coplaySend", func() { _ = f.send(target.PeerID, msg) })
 	}
 }
 
@@ -412,7 +412,7 @@ func (f *friendService) pingPresence(pidStr string) bool {
 
 // startPresence runs a background loop that periodically pings accepted friends so the UI reflects who is reachable.
 func (f *friendService) startPresence(interval time.Duration) {
-	go func() {
+	safeGo("friend.presenceLoop", func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -421,9 +421,9 @@ func (f *friendService) startPresence(interval time.Duration) {
 				return
 			case <-t.C:
 				for _, pid := range f.social.acceptedPeers() {
-					go f.pingPresence(pid)
+					safeGo("friend.pingPresence", func() { f.pingPresence(pid) })
 				}
 			}
 		}
-	}()
+	})
 }

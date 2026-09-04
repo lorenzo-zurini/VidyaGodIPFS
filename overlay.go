@@ -240,7 +240,7 @@ func (o *overlayService) attach(link packetLink) {
 			fmt.Fprintf(os.Stderr, "[overlay] reflector ON — real-LAN broadcasts bridged both ways\n")
 		}
 	}
-	go o.readLoop(ctx, link)
+	safeGo("overlay.readLoop", func() { o.readLoop(ctx, link) })
 }
 
 // detach stops forwarding and tears down the link + cached streams + any pending fd-handoff socket.
@@ -391,7 +391,7 @@ func (o *overlayService) enqueueStream(pid peer.ID, pkt []byte) {
 	if ch == nil {
 		ch = make(chan []byte, 64)
 		o.senders[pid] = ch
-		go func() {
+		safeGo("overlay.streamPump", func() {
 			for {
 				select {
 				case <-o.parent.Done():
@@ -406,7 +406,7 @@ func (o *overlayService) enqueueStream(pid peer.ID, pkt []byte) {
 					}
 				}
 			}
-		}()
+		})
 	}
 	o.sendersMu.Unlock()
 	select {
@@ -488,7 +488,7 @@ func (o *overlayService) maybeStartDatagramLoop(c network.Conn) {
 	}
 	o.dgRecv[c] = true
 	o.dgMu.Unlock()
-	go o.datagramRecvLoop(c, qc)
+	safeGo("overlay.datagramRecvLoop", func() { o.datagramRecvLoop(c, qc) })
 }
 
 // datagramRecvLoop injects each inbound QUIC datagram (one IP packet) into the local link, until the connection closes.

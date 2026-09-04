@@ -196,12 +196,12 @@ func (n *node) goOnline() error {
 	}
 	// Re-log addresses once AutoNAT/UPnP/relay have settled — these are what the node ACTUALLY advertises to the
 	// public network (a public ip4/ip6 = directly reachable; only /p2p-circuit = relay-only → slow downloads).
-	go func() {
+	safeGo("node.addrLogger", func() {
 		time.Sleep(45 * time.Second)
 		for _, a := range h.Addrs() {
 			fmt.Fprintf(os.Stderr, "[node] advertised=%s\n", a)
 		}
-	}()
+	})
 	// WriteThrough(true): see node.go — addNoCopy must create filestore refs even when bitswap already cached blocks.
 	n.bserv = blockservice.New(n.fstore, bswap, blockservice.WriteThrough(true))
 	n.dserv = merkledag.NewDAGService(n.bserv)
@@ -251,7 +251,7 @@ func (n *node) goOnline() error {
 			}
 			return out
 		})
-		go n.linkm.run()
+		safeGo("linkm.run", n.linkm.run)
 		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
 		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
@@ -260,16 +260,16 @@ func (n *node) goOnline() error {
 	}
 
 	n.online = true
-	go n.bootstrap()
-	go n.refreshPinnedSet(n.ctx) // keep the pinned-root set warm for the upload tracer
-	n.startBenchObserver()       // bench.go: periodic path/bandwidth ground-truth log when VG_BENCH_OBSERVE is set
+	safeGo("node.bootstrap", n.bootstrap)
+	safeGo("node.refreshPinnedSet", func() { n.refreshPinnedSet(n.ctx) }) // keep the pinned-root set warm for the upload tracer
+	n.startBenchObserver()                                                // bench.go: periodic path/bandwidth ground-truth log when VG_BENCH_OBSERVE is set
 
 	// Announce EVERYTHING we seed to the DHT shortly after startup (once the routing table is warm), instead of waiting
 	// up to ReproviderInterval (22h) for the first scheduled sweep. Without this, a just-launched seeder's content —
 	// and anything added while it was down — stays undiscoverable for up to 22h, so a pin-by-CID (Pinata) or a peer
 	// just "searches" forever. A short-lived process's one-shot provide barely propagates (immature routing table);
 	// this robust batch sweep runs from the long-lived node once it has peers.
-	go func() {
+	safeGo("node.startupReprovide", func() {
 		select {
 		case <-time.After(45 * time.Second): // let bootstrap + DHT routing settle so the provides actually stick
 		case <-n.ctx.Done():
@@ -288,7 +288,7 @@ func (n *node) goOnline() error {
 				fmt.Fprintf(os.Stderr, "[node] startup reprovide: announced seeded content to the DHT\n")
 			}
 		}
-	}()
+	})
 	return nil
 }
 
