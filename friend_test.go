@@ -133,3 +133,28 @@ func TestSocialPersistenceRoundTrip(t *testing.T) {
 		t.Fatalf("contact not persisted: %+v ok=%v", c, ok)
 	}
 }
+
+// Presence is online/offline LIVENESS only (no play-state anymore): toggling it reports a change once per
+// transition, updates the contact snapshot, and is transient (never persisted).
+func TestPresenceLivenessToggles(t *testing.T) {
+	dir := t.TempDir()
+	s := newSocialState(dir)
+	s.upsert("12D3KooWFriend", func(c *contact) { c.State = stAccepted })
+
+	if changed, c := s.setPresence("12D3KooWFriend", true); !changed || !c.online {
+		t.Fatalf("going online should change + report online: changed=%v online=%v", changed, c.online)
+	}
+	if changed, _ := s.setPresence("12D3KooWFriend", true); changed {
+		t.Fatal("staying online should not report a change")
+	}
+	if changed, c := s.setPresence("12D3KooWFriend", false); !changed || c.online {
+		t.Fatalf("going offline should change + report offline: changed=%v online=%v", changed, c.online)
+	}
+	if changed, _ := s.setPresence("nobody", true); changed {
+		t.Fatal("presence for an unknown peer must be a no-op")
+	}
+	// online is transient: a reload never resurrects it.
+	if c, _ := newSocialState(dir).get("12D3KooWFriend"); c.online {
+		t.Fatal("online state must not persist across reload")
+	}
+}

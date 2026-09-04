@@ -32,42 +32,20 @@ const (
 	evFriendPresence = 3 // a friend's online state changed
 	evFriendProfile  = 4 // a friend updated their nickname / picture
 	evFriendRemoved  = 5 // local removal (echoed for UI symmetry)
-	evFriendSuggest  = 6 // a stranger co-present in our game was suggested by a mutual friend
 )
 
-// coPlayer is one stranger named in a coplay message: who they are, and what to call them in the prompt.
-type coPlayer struct {
-	Peer string `json:"peer"`
-	Nick string `json:"nick,omitempty"`
-}
-
 // friendMsg is the framed wire message. One JSON value per message; a stream may carry several (a decoder loop reads
-// until EOF), so a single connection can, e.g., send hello then presence.
+// until EOF), so a single connection can, e.g., send request then profile.
 //
 // Adding fields is backward compatible in both directions: an old peer ignores unknown keys, and a new peer decoding
-// an old message gets zero values — which read correctly as "not playing".
+// an old message gets zero values. In particular a peer on an OLDER build still sends a "play" block — we simply
+// ignore those keys now (no lobby/join/what-are-you-playing model anymore; see social.go).
 type friendMsg struct {
-	Type   string `json:"t"`              // request | accept | decline | profile | presence | ping | coplay
+	Type   string `json:"t"`              // request | accept | decline | profile | presence | ping
 	Nick   string `json:"nick,omitempty"` // sender's nickname (on request/accept/profile)
 	PicCID string `json:"pic,omitempty"`  // sender's profile-picture content CID
 	Note   string `json:"note,omitempty"` // optional greeting on a request
-
-	// The play block — what the sender is running. Playing and PlayOpen deliberately have NO omitempty: with it,
-	// "I stopped playing" (empty) would be indistinguishable from "this message carries no play info", and a peer
-	// who quit would appear in-game to their friends forever. The cost is `"play":""` on every message.
-	Playing   string `json:"play"`
-	PlayLabel string `json:"plabel,omitempty"`
-	PlayIdent string `json:"pident,omitempty"`
-	PlaySince int64  `json:"psince,omitempty"`
-	PlayOpen  bool   `json:"popen"`
-
-	// coplay only: the node id the roster is scoped to, and the peers co-present in it.
-	Game   string     `json:"cgame,omitempty"`
-	CoPlay []coPlayer `json:"coplay,omitempty"`
 }
-
-// maxCoPlay caps how many strangers one message may name, so a chatty or hostile peer cannot flood the prompt.
-const maxCoPlay = 32
 
 // peerRouter is the subset of the DHT the friend service needs: resolve a peer ID to its current addresses. Optional
 // (nil in tests where hosts are pre-connected) — dialing then relies on the peerstore / an existing connection.
@@ -102,8 +80,6 @@ func (f *friendService) emitContact(kind int, c contact) {
 	b, _ := json.Marshal(map[string]any{
 		"peer": c.PeerID, "nick": c.Nick, "pic": c.PicCID,
 		"state": string(c.State), "online": c.online, "seen": c.LastSeen,
-		"play": c.play.NodeID, "plabel": c.play.Label, "pident": c.play.Ident,
-		"psince": c.play.Since, "popen": c.play.Open,
 	})
 	f.emit(kind, string(b))
 }
@@ -159,10 +135,6 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 				c.PicCID = m.PicCID
 			}
 		})
-		// A brand-new friend learns what we are playing immediately, and we theirs, without waiting for the poll.
-		if _, withPlay := f.absorbPlay(remote, m); withPlay.PeerID != "" {
-			c = withPlay
-		}
 		f.emitContact(evFriendAccept, c)
 	case "decline":
 		if c, ok := f.social.get(remote); ok {
@@ -175,94 +147,13 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 				c.Nick = m.Nick
 				c.PicCID = m.PicCID
 			})
-			if _, withPlay := f.absorbPlay(remote, m); withPlay.PeerID != "" {
-				c = withPlay
-			}
 			f.emitContact(evFriendProfile, c)
 		}
 	case "ping", "presence":
-		onlineChanged, _ := f.social.setPresence(remote, true)
-		playChanged, c := f.absorbPlay(remote, m)
-		if onlineChanged || playChanged {
+		// Liveness only: a successful inbound ping/presence marks the friend online. No play payload anymore.
+		if changed, c := f.social.setPresence(remote, true); changed {
 			f.emitContact(evFriendPresence, c)
 		}
-		// Their game changed relative to ours — if we are now co-present, tell everyone in that game about each
-		// other. Cheap to re-send; shareCoPlay is a no-op when we are not playing or are invisible.
-		if playChanged {
-			f.shareCoPlay()
-		}
-	case "coplay":
-		f.handleCoPlay(remote, m)
-	}
-}
-
-// handleCoPlay records strangers a mutual friend says are in OUR game, so the UI can offer "add them?".
-//
-// Guards, all load-bearing: the sender must be an accepted friend (not a stranger injecting names), the roster must
-// be scoped to the node WE are playing (so a friend cannot narrate a game we are not in), we must not be invisible,
-// and the batch is capped. Critically this NEVER sends anything in response — a coplay must not cascade, which is
-// what keeps the mechanism social rather than a transitive routing protocol.
-func (f *friendService) handleCoPlay(remote string, m friendMsg) {
-	if c, ok := f.social.get(remote); !ok || c.State != stAccepted {
-		return
-	}
-	mine := f.social.getPlay()
-	if m.Game == "" || mine.NodeID == "" || m.Game != mine.NodeID || f.social.getInvisible() {
-		return
-	}
-	self := f.host.ID().String()
-	list := m.CoPlay
-	if len(list) > maxCoPlay {
-		list = list[:maxCoPlay]
-	}
-	for _, cp := range list {
-		if cp.Peer == "" || cp.Peer == self || cp.Peer == remote {
-			continue
-		}
-		sg := suggestion{Peer: cp.Peer, Nick: cp.Nick, Via: remote, Game: m.Game}
-		if !f.social.addSuggestion(sg) {
-			continue // already a contact, already suggested, or the store is full
-		}
-		if f.emit != nil {
-			b, _ := json.Marshal(map[string]any{
-				"peer": sg.Peer, "nick": sg.Nick, "via": sg.Via, "game": sg.Game,
-			})
-			f.emit(evFriendSuggest, string(b))
-		}
-	}
-}
-
-// shareCoPlay tells each friend who is in the same game as us about the OTHER friends in that same game. Only peers
-// we can verify are co-present are ever named — never the address book at large.
-func (f *friendService) shareCoPlay() {
-	mine := f.playBlock() // zeroed when invisible → no-op, as intended
-	if mine.NodeID == "" {
-		return
-	}
-	var here []contact
-	for _, c := range f.social.list() {
-		if c.State == stAccepted && c.online && c.play.NodeID == mine.NodeID {
-			here = append(here, c)
-		}
-	}
-	if len(here) < 2 {
-		return // nobody to introduce
-	}
-	for _, target := range here {
-		roster := make([]coPlayer, 0, len(here)-1)
-		for _, other := range here {
-			if other.PeerID != target.PeerID { // never tell someone about themselves
-				roster = append(roster, coPlayer{Peer: other.PeerID, Nick: other.Nick})
-			}
-		}
-		if len(roster) == 0 {
-			continue
-		}
-		if len(roster) > maxCoPlay {
-			roster = roster[:maxCoPlay]
-		}
-		msg := friendMsg{Type: "coplay", Game: mine.NodeID, CoPlay: roster}
-		safeGo("friend.coplaySend", func() { _ = f.send(target.PeerID, msg) })
 	}
 }
 
@@ -320,27 +211,7 @@ func (f *friendService) send(pidStr string, msgs ...friendMsg) error {
 // helloMsg builds a message of the given type carrying our current profile.
 func (f *friendService) helloMsg(t string) friendMsg {
 	p := f.social.getProfile()
-	m := friendMsg{Type: t, Nick: p.Nick, PicCID: p.PicCID}
-	pl := f.playBlock()
-	m.Playing, m.PlayLabel, m.PlayIdent, m.PlaySince, m.PlayOpen = pl.NodeID, pl.Label, pl.Ident, pl.Since, pl.Open
-	return m
-}
-
-// playBlock is the ONE place invisibility is enforced: it returns a zeroed state when hidden, so no other code path
-// has to remember. A consequence that falls out for free: an invisible peer reports no game, is therefore never
-// co-present with anyone, and so is never named in a coplay message either.
-func (f *friendService) playBlock() playState {
-	if f.social.getInvisible() {
-		return playState{}
-	}
-	return f.social.getPlay()
-}
-
-// absorbPlay records the play block carried by an inbound message. Returns whether anything changed.
-func (f *friendService) absorbPlay(remote string, m friendMsg) (bool, contact) {
-	return f.social.setPeerPlay(remote, playState{
-		NodeID: m.Playing, Label: m.PlayLabel, Ident: m.PlayIdent, Since: m.PlaySince, Open: m.PlayOpen,
-	})
+	return friendMsg{Type: t, Nick: p.Nick, PicCID: p.PicCID}
 }
 
 // addFriend records an outgoing request and sends it (with our profile) to the peer.
@@ -388,19 +259,7 @@ func (f *friendService) broadcastProfile() {
 	}
 }
 
-// broadcastPresence pushes our play state to every accepted friend (best-effort, async) — the push-on-change half
-// of presence, modelled on broadcastProfile.
-func (f *friendService) broadcastPresence() {
-	for _, pid := range f.social.acceptedPeers() {
-		safeGo("friend.helloPresence", func() { _ = f.send(pid, f.helloMsg("presence")) })
-	}
-}
-
-// pingPresence pings one friend; success marks them online (and updates their view of us). Returns reachability.
-//
-// It carries the play block: send() is fire-and-forget with no retry, so this 45s loop is the ONLY backstop for a
-// friend who was unreachable at the moment we launched. Sending a bare ping here would silently degrade
-// push-on-change into never-for-that-peer.
+// pingPresence pings one friend; success marks them online (and refreshes their view of us). Returns reachability.
 func (f *friendService) pingPresence(pidStr string) bool {
 	err := f.send(pidStr, f.helloMsg("ping"))
 	online := err == nil

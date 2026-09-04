@@ -90,7 +90,7 @@ func computeCid(path string) (cid.Cid, error) {
 	dbp := uih.DagBuilderParams{
 		Maxlinks:   uih.DefaultLinksPerBlock,
 		RawLeaves:  true,
-		NoCopy:     true,                     // keep NoCopy so leaf CIDs match a seeded file exactly
+		NoCopy:     true, // keep NoCopy so leaf CIDs match a seeded file exactly
 		CidBuilder: merkledag.V0CidPrefix(),
 		Dagserv:    dserv,
 	}

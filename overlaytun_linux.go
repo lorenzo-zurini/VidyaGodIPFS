@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	iffTun   = 0x0001     // IFF_TUN — a layer-3 (IP) device
-	iffNoPI  = 0x1000     // IFF_NO_PI — no 4-byte packet-info prefix; reads/writes are raw IP packets
+	iffTun    = 0x0001     // IFF_TUN — a layer-3 (IP) device
+	iffNoPI   = 0x1000     // IFF_NO_PI — no 4-byte packet-info prefix; reads/writes are raw IP packets
 	tunSetIff = 0x400454ca // TUNSETIFF
 )
 

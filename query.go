@@ -251,9 +251,10 @@ func (n *node) unservableRefs() []map[string]interface{} {
 //
 // "Seeded" used to mean nothing more than "a pin exists", which is why a stale reference displayed as happily
 // seeded while every peer request for it hung. This checks the two conditions that cost only a stat:
-//   * every backing file still EXISTS (what cidMissing does), and
-//   * each backing file is still the SIZE its references cover — a file's refs tile it exactly, so a file that
+//   - every backing file still EXISTS (what cidMissing does), and
+//   - each backing file is still the SIZE its references cover — a file's refs tile it exactly, so a file that
 //     grew or was truncated no longer matches what we published.
+//
 // It deliberately does NOT read file contents: proving deliverability byte-for-byte means reading everything
 // (61 GB here), so that stays in the explicit verify path. A same-size edit therefore still passes this.
 func (n *node) cidServeStatus(c cid.Cid) string {
