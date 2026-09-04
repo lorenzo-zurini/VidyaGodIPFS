@@ -125,6 +125,14 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 			}
 		})
 		f.emitContact(kind, c)
+		// Mutual crossing: we just flipped THEM to accepted off their inbound request because WE were already
+		// pending. They, however, only know they sent a request — our matching request may never have reached them
+		// (common: whoever started second couldn't yet resolve the other, so their initial send failed). Tell them
+		// explicitly so both sides converge to accepted instead of the initiator hanging in "pending" forever.
+		if kind == evFriendAccept {
+			vlog("friend", "crossing with %s → sending accept back", shortPeer(remote))
+			safeGo("friend.crossAccept", func() { _ = f.send(remote, f.helloMsg("accept")) })
+		}
 	case "accept":
 		// The peer we'd requested accepted. Mark accepted + absorb their profile.
 		c := f.social.upsert(remote, func(c *contact) {

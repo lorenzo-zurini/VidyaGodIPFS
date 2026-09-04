@@ -93,6 +93,41 @@ func TestFriendHandshakeAndProfileExchange(t *testing.T) {
 	})
 }
 
+// TestFriendMutualCrossingConverges models the field case where BOTH peers add each other but one side's initial
+// request never lands (the second-to-start peer can't yet resolve the first, so its send fails) — leaving that side
+// stuck in "pending". When the delivered request crosses the pending contact, the crosser must notify back so BOTH
+// converge to accepted. Regression for the cross-network handshake hang seen 2026-09-04.
+func TestFriendMutualCrossingConverges(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+
+	sA := newSocialState(t.TempDir())
+	sB := newSocialState(t.TempDir())
+	ctx := context.Background()
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA.start()
+	fB.start()
+
+	// Bob "tried to add Alice first" but his send failed before they were connected — model that as a local pending
+	// contact with no message ever delivered to Alice.
+	sB.upsert(hA.ID().String(), func(c *contact) { c.State = stPending })
+
+	// Alice now adds Bob for real (her request reaches him). It crosses Bob's pending contact → Bob accepted.
+	if err := fA.addFriend(hB.ID().String(), "hi"); err != nil {
+		t.Fatalf("addFriend: %v", err)
+	}
+	// Both sides must end accepted: Bob by crossing, Alice by the accept-back the crossing now sends.
+	waitFor(t, "bob accepted by crossing", func() bool {
+		c, ok := sB.get(hA.ID().String())
+		return ok && c.State == stAccepted
+	})
+	waitFor(t, "alice converges to accepted (was left pending before the fix)", func() bool {
+		c, ok := sA.get(hB.ID().String())
+		return ok && c.State == stAccepted
+	})
+}
+
 func TestFriendBlockedPeerIgnored(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
