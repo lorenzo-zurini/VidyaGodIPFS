@@ -9,7 +9,7 @@ invariants any future change must preserve.*
 | Layer | Files | Job |
 |---|---|---|
 | **Substrate** | `online.go`, `doh.go`, `peers.go` | libp2p host (TCP/QUIC/WS/WebTransport), Kademlia DHT + delegated HTTP routing, AutoRelay + DCUtR hole-punching, mDNS same-LAN discovery, bitswap (tuned), DoH for filtered networks. |
-| **Social** | `friend.go`, `social.go` | `/vidyagod/friend/1.0.0`: mutual-consent friendship, profiles, presence (45 s) + play-state, co-play suggestions. Address book survives offline (`social.json`). |
+| **Social** | `friend.go`, `social.go` | `/vidyagod/friend/1.0.0`: mutual-consent friendship, profiles, online/offline liveness (45 s pings). No play-state/lobby/join — excised 2026-09-04. Address book survives offline (`social.json`). |
 | **Link** | `overlaylink.go` | ALWAYS-ON per-friend heartbeat/state machine: proves + repairs each friend link for the app's lifetime. The trust oracle for the datagram fast path. |
 | **Datapath** | `overlay.go` | `/vidyagod/overlay/1.0.0`: L3 forwarder between a TUN (in the game's netns) and friends. TX = proven-QUIC-datagram fast path over reliable-stream fallback. |
 | **Tri-plane** | `natgateway.go`, `hostrelay.go` | Plane 2: userspace NAT (gVisor-style, in-process) for internet + host-LAN unicast. Plane 3: broadcast reflector bridging the real LAN. Both attach at overlay serve time. |
@@ -23,21 +23,28 @@ invariants any future change must preserve.*
    downloads on a zombie *verdict* (not a zombie *fact*) — the "downloading at direct 5 ms, then node down"
    incident. The maintainer observes, dials and routes. It never closes.
 
-2. **Datagrams must prove themselves.** A direct QUIC conn can be half-dead (one-way hole punch, asymmetric
-   firewall, idled-out NAT mapping): sends report success while every packet vanishes — measured live as 100%
-   one-way loss with the link showing "direct". The datagram fast path is an *upgrade*, never a prerequisite:
-   TX consults `linkMaintainer.datagramsTrusted()` and rides the reliable stream until pongs prove the path,
-   demoting back the moment they stop. Delivery must never depend on an unverified path.
+2. **Datagrams must prove themselves — per CONNECTION.** A direct QUIC conn can be half-dead (one-way hole
+   punch, asymmetric firewall, idled-out NAT mapping): sends report success while every packet vanishes —
+   measured live as 100% one-way loss with the link showing "direct". The datagram fast path is an *upgrade*,
+   never a prerequisite: TX consults `linkMaintainer.datagramsTrusted()` and rides the reliable stream until
+   pongs prove the path. Trust binds to the SPECIFIC connection the pong arrived on (`trustedConnID`) — a
+   sibling conn from a re-punch is an untested path; the proven conn vanishing demotes instantly, and stopped
+   pongs demote within the miss window (up to ~linkBeatMiss×linkBeatEvery ≈ 12 s worst case — bounded, not
+   instant). Delivery must never depend on an unverified path.
 
 3. **The stream fallback must work over ANY connection.** `NewStream` refuses relayed (circuit-v2 "limited")
    conns unless the ctx carries `network.WithAllowLimitedConn`. Both custom protocols (`friend.go`,
    `overlay.go sendStream`) opt in — without it, a relay-only pair has *no* path at all.
 
-4. **No panic may cross a goroutine boundary unguarded.** The node is a c-shared library: an unrecovered panic
-   in any goroutine kills the whole process (node + bitswap + GUI) — the "whole node just went off" incident.
-   Every `go` in node code goes through `safeGo`/`guard`; fallible steps that may panic use `guardErr` so the
-   caller's existing error path (e.g. the goOnline retry) handles it. `retryOnline` specifically must never
-   hold `gMu` across a panic (deferred-unlock closure).
+4. **No panic may cross a NODE-AUTHORED goroutine boundary unguarded.** The node is a c-shared library: an
+   unrecovered panic in any goroutine kills the whole process (node + bitswap + GUI) — the "whole node just
+   went off" incident. Every `go` in THIS repo's code goes through `safeGo`/`guard` (library-internal
+   goroutines — libp2p, quic-go, boxo — are NOT covered and remain fatal); fallible steps use `guardErr` so
+   the caller's error path (e.g. the goOnline retry) handles it. Two corollaries paid for in review blood:
+   LONG-LIVED LOOPS take the guard PER ITERATION (a whole-loop guard converts a panic into a silently dead
+   pump), and every recovery increments the panic counter surfaced as the "Panic guard" health row — a
+   recovered panic is still a bug, and it must be visible. Flag/lock protocols around guarded code must be
+   panic-safe (deferred resets), e.g. `retryOnline`'s gMu and `kickDial`'s dialing flag.
 
 5. **Every link state has an exit.** down →dial(backoff 2 s→30 s)→ connecting → relayed (usable via stream)
    →force-direct nudge (30 s cadence)→ direct-unproven (stream) →first pong→ direct-proven (datagrams)

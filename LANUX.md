@@ -26,9 +26,11 @@ Verdict: for the games this targets (LAN-era, designed around 100 ms modems), th
 The overlay's ~10 ms cross-internet is *better* than the real LANs some of these games were played on.
 
 Path quality is adaptive and invisible: the datagram fast path carries traffic only after heartbeat pongs
-PROVE it (one-way punches can't silently eat packets); otherwise the reliable stream carries everything at
-~8 ms — the fallback was measured lossless under both ping and bulk load. Which transport the hole-punch
-lands (QUIC → datagrams; TCP → stream) varies per punch; both deliver.
+PROVE it — per connection, so a re-punched sibling conn is never silently trusted; a dead proven conn demotes
+instantly and stopped pongs demote within ~12 s worst case (bounded, not instant). Otherwise the reliable
+stream carries everything at ~8 ms — measured lossless under both ping and bulk load. Which transport the
+hole-punch lands (QUIC → datagrams; TCP → stream) varies per punch; both deliver. (Recovery numbers above were
+measured with a cooperating app restart; a mid-game path swap rides the demote window, not the 5 s figure.)
 
 ## The friend flow, honestly
 

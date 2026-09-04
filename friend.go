@@ -299,7 +299,7 @@ func (f *friendService) pingPresence(pidStr string) bool {
 
 // startPresence runs a background loop that periodically pings accepted friends so the UI reflects who is reachable.
 func (f *friendService) startPresence(interval time.Duration) {
-	safeGo("friend.presenceLoop", func() {
+	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -307,10 +307,14 @@ func (f *friendService) startPresence(interval time.Duration) {
 			case <-f.ctx.Done():
 				return
 			case <-t.C:
-				for _, pid := range f.social.acceptedPeers() {
-					safeGo("friend.pingPresence", func() { f.pingPresence(pid) })
-				}
+				// Per-tick guard: a panic must cost one tick, never the loop — a dead presence loop means every
+				// friend drifts to "offline" forever with nothing reporting it (adversarial H5/C1 class).
+				guard("friend.presenceTick", func() {
+					for _, pid := range f.social.acceptedPeers() {
+						safeGo("friend.pingPresence", func() { f.pingPresence(pid) })
+					}
+				})
 			}
 		}
-	})
+	}()
 }

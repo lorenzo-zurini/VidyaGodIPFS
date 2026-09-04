@@ -15,14 +15,62 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// Recovered-panic accounting: a recovered panic keeps the process alive but is STILL a bug — and a recovered
+// panic that killed a loop is a silently-degraded service. Every recovery is counted and named here so the
+// health report (health.go) can surface "N panic(s) recovered, last: <name>" instead of the failure vanishing
+// into one stderr stack trace nobody is watching.
+var (
+	panicCount atomic.Int64
+	panicMu    sync.Mutex
+	panicLast  struct {
+		name string
+		when time.Time
+	}
+	panicPerSite = map[string]int64{}
+)
+
+// notePanic counts a recovery and reports whether the full stack trace should still be printed for this site.
+// After panicStackCap recoveries at one site the stacks are suppressed (one line still logs, the counter still
+// counts): a deterministic per-packet panic at game rates would otherwise write a stack per packet into an
+// unbuffered --log file (adversarial round-2).
+const panicStackCap = 5
+
+func notePanic(name string) (printStack bool) {
+	panicCount.Add(1)
+	panicMu.Lock()
+	panicLast.name, panicLast.when = name, time.Now()
+	panicPerSite[name]++
+	printStack = panicPerSite[name] <= panicStackCap
+	suppressNote := panicPerSite[name] == panicStackCap+1
+	panicMu.Unlock()
+	if suppressNote {
+		fmt.Fprintf(os.Stderr, "[node] PANIC in %s recurring — further stack traces suppressed (still counted)\n", name)
+	}
+	return printStack
+}
+
+// panicStats returns (total recovered, last site, last time) for the health report.
+func panicStats() (int64, string, time.Time) {
+	panicMu.Lock()
+	defer panicMu.Unlock()
+	return panicCount.Load(), panicLast.name, panicLast.when
+}
 
 // guard runs fn synchronously, recovering (and logging, with stack) any panic so it cannot propagate to crash the
 // process. Wrap the body of a long-lived loop with it to keep the loop alive across a bad iteration.
 func guard(name string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v\n%s\n", name, r, debug.Stack())
+			if notePanic(name) {
+				fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v\n%s\n", name, r, debug.Stack())
+			} else {
+				fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v (stack suppressed)\n", name, r)
+			}
 		}
 	}()
 	fn()
@@ -36,7 +84,11 @@ func safeGo(name string, fn func()) { go guard(name, fn) }
 func guardErr(name string, fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v\n%s\n", name, r, debug.Stack())
+			if notePanic(name) {
+				fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v\n%s\n", name, r, debug.Stack())
+			} else {
+				fmt.Fprintf(os.Stderr, "[node] PANIC recovered in %s: %v (stack suppressed)\n", name, r)
+			}
 			err = fmt.Errorf("panic in %s: %v", name, r)
 		}
 	}()

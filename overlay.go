@@ -247,7 +247,10 @@ func (o *overlayService) isFanout(dst string) bool {
 // attach begins forwarding over the given link (the TUN). Idempotent-safe: a second attach replaces the link.
 func (o *overlayService) attach(link packetLink) {
 	o.mu.Lock()
-	if o.running {
+	// Gate on ANY leftover state, not just running: readLoop's defer clears running while link/gw/relay may
+	// still exist (fd-handoff attach racing an instant game death) — replacing without teardown would leak the
+	// old TUN fd + gateway and bind a SECOND reflector on the real LAN (adversarial round-3).
+	if o.running || o.link != nil || o.gw != nil || o.relay != nil {
 		o.mu.Unlock()
 		o.detach()
 		o.mu.Lock()
@@ -258,18 +261,41 @@ func (o *overlayService) attach(link packetLink) {
 	localVIP := o.localVIP
 	o.mu.Unlock()
 	// Tri-plane bring-up: both planes write into the SAME link through the serialized injector.
+	// Conditional installs: a concurrent detach between our unlock above and here has already snapshotted
+	// gw/relay as nil and closed the link — installing now would leave a live gateway/reflector behind a dead
+	// TUN with nothing to tear them down until the next attach (adversarial round-4). If we lost the race,
+	// close the fresh instance instead of installing it.
 	if gwWant {
 		if gw, err := newNATGateway(ctx, o.injectToLink, nil, nil); err == nil {
-			o.gw = gw
-			fmt.Fprintf(os.Stderr, "[overlay] gateway ON — internet + real-LAN unicast via in-node NAT (no helper)\n")
+			o.mu.Lock()
+			stillOurs := o.running && o.link == link
+			if stillOurs {
+				o.gw = gw // under o.mu: healthSnapshot reads it concurrently (adversarial M1b)
+			}
+			o.mu.Unlock()
+			if stillOurs {
+				fmt.Fprintf(os.Stderr, "[overlay] gateway ON — internet + real-LAN unicast via in-node NAT (no helper)\n")
+			} else {
+				gw.close()
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "[overlay] gateway failed to start: %v\n", err)
 		}
 	}
 	if relayWant && localVIP != "" {
 		if vip := net.ParseIP(localVIP); vip != nil {
-			o.relay = newHostRelay(o.injectToLink, vip)
-			fmt.Fprintf(os.Stderr, "[overlay] reflector ON — real-LAN broadcasts bridged both ways\n")
+			r := newHostRelay(o.injectToLink, vip)
+			o.mu.Lock()
+			stillOurs := o.running && o.link == link
+			if stillOurs {
+				o.relay = r
+			}
+			o.mu.Unlock()
+			if stillOurs {
+				fmt.Fprintf(os.Stderr, "[overlay] reflector ON — real-LAN broadcasts bridged both ways\n")
+			} else {
+				r.close()
+			}
 		}
 	}
 	safeGo("overlay.readLoop", func() { o.readLoop(ctx, link) })
@@ -281,8 +307,9 @@ func (o *overlayService) detach() {
 	o.mu.Lock()
 	cancel, link := o.cancel, o.link
 	sockL, sockPath := o.sockL, o.sockPath
-	wasRunning := o.running
-	o.running, o.link, o.sockL, o.sockPath = false, nil, nil, ""
+	gw, relay := o.gw, o.relay
+	o.running, o.link, o.cancel, o.sockL, o.sockPath = false, nil, nil, nil, ""
+	o.gw, o.relay = nil, nil // cleared under o.mu — healthSnapshot reads them concurrently (adversarial M1b)
 	o.mu.Unlock()
 	// Always tear down the fd-handoff socket (the accept goroutine may still be waiting even if no link attached yet).
 	if sockL != nil {
@@ -291,9 +318,10 @@ func (o *overlayService) detach() {
 	if sockPath != "" {
 		_ = os.Remove(sockPath)
 	}
-	if !wasRunning {
-		return
-	}
+	// NO running-gate here: teardown is driven by what actually exists (snapshot above), not by a flag another
+	// path may have cleared — gating on wasRunning leaked gw/relay/link when readLoop noticed the TUN die first
+	// (adversarial round-2 HIGH-1). Everything below is nil-checked and the fields were nil'd under o.mu, so a
+	// second detach is a no-op by construction.
 	if cancel != nil {
 		cancel()
 	}
@@ -306,13 +334,11 @@ func (o *overlayService) detach() {
 	if link != nil {
 		_ = link.Close()
 	}
-	if o.gw != nil {
-		o.gw.close()
-		o.gw = nil
+	if gw != nil {
+		gw.close()
 	}
-	if o.relay != nil {
-		o.relay.close()
-		o.relay = nil
+	if relay != nil {
+		relay.close()
 	}
 }
 
@@ -331,6 +357,22 @@ func (o *overlayService) injectToLink(pkt []byte) error {
 
 // readLoop pulls IP packets from the local link and forwards each to the peer that owns its destination vIP.
 func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
+	// On ANY exit (link death, detach, ctx cancel) the datapath is factually down: say so and clear running,
+	// otherwise healthSnapshot keeps reporting "forwarding (game active)" over a dead pump (adversarial C2).
+	// ONLY running is cleared — link/gw/relay teardown stays detach's job: clearing o.link here made detach's
+	// old wasRunning gate skip cancel/gw/relay/link cleanup entirely, leaking the tri-plane and letting the
+	// next launch start a SECOND reflector on the same LAN (adversarial round-2 HIGH-1).
+	defer func() {
+		o.mu.Lock()
+		wasRunning := o.running && o.link == link // detach() already cleared/replaced these on a normal teardown
+		if wasRunning {
+			o.running = false
+		}
+		o.mu.Unlock()
+		if wasRunning {
+			fmt.Fprintf(os.Stderr, "[overlay] readLoop exited while attached — TUN datapath DOWN (detach pending)\n")
+		}
+	}()
 	for {
 		pkt, err := link.ReadPacket()
 		if err != nil {
@@ -339,67 +381,75 @@ func (o *overlayService) readLoop(ctx context.Context, link packetLink) {
 		if ctx.Err() != nil {
 			return
 		}
-		dst, ok := ipv4Dst(pkt)
-		if !ok {
-			continue // not IPv4 (e.g. IPv6 ND) — drop for now
+		// Per-packet guard: a panic on one hostile/garbled packet (parse, gateway inject, reflector) must cost
+		// that packet only — a dead readLoop is the game's entire outbound datapath gone (adversarial C2).
+		guard("overlay.readPacket", func() { o.handleOutbound(ctx, pkt) })
+	}
+}
+
+// handleOutbound routes ONE packet from the game's TUN: fan-out, LAN unicast, or the host-plane NAT.
+func (o *overlayService) handleOutbound(ctx context.Context, pkt []byte) {
+	dst, ok := ipv4Dst(pkt)
+	if !ok {
+		return // not IPv4 (e.g. IPv6 ND) — drop for now
+	}
+	o.mu.Lock()
+	fanout := o.isFanout(dst)
+	var targets []peer.ID
+	if fanout {
+		targets = make([]peer.ID, 0, len(o.routes))
+		for _, pid := range o.routes {
+			targets = append(targets, pid)
 		}
+	}
+	pid, known := o.routes[dst]
+	gw, relay := o.gw, o.relay // snapshot with routes: detach nils them concurrently (adversarial M1b)
+	o.mu.Unlock()
+	// The GLOBAL roster (launch-window ticks): un-ticked members stay friends and stay routed-in-name, but no
+	// game traffic flows to them in either intention — outbound filtered here, and they simply never announce.
+	o.exclMu.Lock()
+	if fanout {
+		kept := targets[:0]
+		for _, t := range targets {
+			if !o.excluded[t] {
+				kept = append(kept, t)
+			}
+		}
+		targets = kept
+	}
+	if known && o.excluded[pid] {
+		known = false
+	}
+	o.exclMu.Unlock()
+	if fanout {
+		// Broadcast/multicast → every LAN peer (overlay plane) AND, when the reflector is up, the REAL LAN.
+		for _, t := range targets {
+			if err := o.forward(ctx, t, pkt); err != nil {
+				fmt.Fprintf(os.Stderr, "[overlay] fan-out to %s failed: %v\n", t, err)
+			}
+		}
+		if relay != nil {
+			if u, uok := parseUDP4(pkt); uok {
+				relay.fromGame(u)
+			}
+		}
+		return
+	}
+	if !known {
+		// Not a LAN address → the HOST plane: hand it to the in-node NAT (internet / real-LAN unicast).
+		// In-subnet addresses with no owning friend stay dropped — the vLAN never leaks into the NAT.
 		o.mu.Lock()
-		fanout := o.isFanout(dst)
-		var targets []peer.ID
-		if fanout {
-			targets = make([]peer.ID, 0, len(o.routes))
-			for _, pid := range o.routes {
-				targets = append(targets, pid)
-			}
-		}
-		pid, known := o.routes[dst]
+		snet := o.subnetNet
 		o.mu.Unlock()
-		// The GLOBAL roster (launch-window ticks): un-ticked members stay friends and stay routed-in-name, but no
-		// game traffic flows to them in either intention — outbound filtered here, and they simply never announce.
-		o.exclMu.Lock()
-		if fanout {
-			kept := targets[:0]
-			for _, t := range targets {
-				if !o.excluded[t] {
-					kept = append(kept, t)
-				}
+		if gw != nil {
+			if ip := net.ParseIP(dst); ip != nil && (snet == nil || !snet.Contains(ip)) {
+				gw.inject(pkt)
 			}
-			targets = kept
 		}
-		if known && o.excluded[pid] {
-			known = false
-		}
-		o.exclMu.Unlock()
-		if fanout {
-			// Broadcast/multicast → every LAN peer (overlay plane) AND, when the reflector is up, the REAL LAN.
-			for _, t := range targets {
-				if err := o.forward(ctx, t, pkt); err != nil {
-					fmt.Fprintf(os.Stderr, "[overlay] fan-out to %s failed: %v\n", t, err)
-				}
-			}
-			if o.relay != nil {
-				if u, uok := parseUDP4(pkt); uok {
-					o.relay.fromGame(u)
-				}
-			}
-			continue
-		}
-		if !known {
-			// Not a LAN address → the HOST plane: hand it to the in-node NAT (internet / real-LAN unicast).
-			// In-subnet addresses with no owning friend stay dropped — the vLAN never leaks into the NAT.
-			o.mu.Lock()
-			snet := o.subnetNet
-			o.mu.Unlock()
-			if o.gw != nil {
-				if ip := net.ParseIP(dst); ip != nil && (snet == nil || !snet.Contains(ip)) {
-					o.gw.inject(pkt)
-				}
-			}
-			continue
-		}
-		if err := o.forward(ctx, pid, pkt); err != nil {
-			fmt.Fprintf(os.Stderr, "[overlay] forward to %s failed: %v\n", pid, err)
-		}
+		return
+	}
+	if err := o.forward(ctx, pid, pkt); err != nil {
+		fmt.Fprintf(os.Stderr, "[overlay] forward to %s failed: %v\n", pid, err)
 	}
 }
 
@@ -424,22 +474,28 @@ func (o *overlayService) enqueueStream(pid peer.ID, pkt []byte) {
 	if ch == nil {
 		ch = make(chan []byte, 64)
 		o.senders[pid] = ch
-		safeGo("overlay.streamPump", func() {
+		// The guard sits INSIDE the loop, per packet: a panic in forwardStream must cost one packet, not the
+		// pump. A dead pump with its channel still registered would silently drop-oldest EVERY future packet to
+		// this peer for the process lifetime — the worst possible failure for the "reliable" path. (Adversarial
+		// review C1: the original whole-loop wrap did exactly that.)
+		go func() {
 			for {
 				select {
 				case <-o.parent.Done():
 					return
 				case p := <-ch:
-					if err := o.forwardStream(o.parent, pid, p); err != nil {
-						if overlayDebug {
-							fmt.Fprintf(os.Stderr, "[overlay] stream fallback to %s failed: %v\n", pid, err)
+					guard("overlay.streamPump", func() {
+						if err := o.forwardStream(o.parent, pid, p); err != nil {
+							if overlayDebug {
+								fmt.Fprintf(os.Stderr, "[overlay] stream fallback to %s failed: %v\n", pid, err)
+							}
+						} else if o.linkm != nil {
+							o.linkm.noteStream(pid)
 						}
-					} else if o.linkm != nil {
-						o.linkm.noteStream(pid)
-					}
+					})
 				}
 			}
-		})
+		}()
 	}
 	o.sendersMu.Unlock()
 	select {
@@ -469,12 +525,31 @@ func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
 	// send-success while eating every packet — measured live as 100% one-way loss with the link showing
 	// "direct". Until proven (and whenever pongs stop) the packet rides the reliable stream instead: delivery
 	// is never entrusted to an unverified path; the datagram win is an upgrade, not a prerequisite.
-	if o.linkm != nil && !o.linkm.datagramsTrusted(pid) {
-		return false
+	var qc *quic.Conn
+	if o.linkm != nil {
+		// ONE lock take per packet (adversarial round-2 L9). Trust is PER-CONN: ride the exact connection the
+		// pongs proved, never a sibling that happens to sort first — a fresh re-punch coexisting with the
+		// proven conn is an untested path (adversarial H2). Untracked peers under a live maintainer are
+		// UNTRUSTED (adversarial M2) — the stream fallback still delivers.
+		id, tracked := o.linkm.trustedConnFor(pid)
+		if tracked && id == "" {
+			return false
+		}
+		if tracked {
+			for _, c := range o.host.Network().ConnsToPeer(pid) {
+				if c.ID() == id {
+					_ = c.As(&qc)
+					break
+				}
+			}
+		} else {
+			return false // maintainer live but peer unknown: never trust (removed friend's stale route)
+		}
+	} else {
+		qc = quicConnTo(o.host, pid) // maintainer-less (tests): old behavior
 	}
-	qc := quicConnTo(o.host, pid)
 	if qc == nil {
-		return false // no direct QUIC connection (relayed/TCP, or not connected yet) → stream fallback
+		return false // no (proven) direct QUIC connection → stream fallback
 	}
 	if err := qc.SendDatagram(pkt); err != nil {
 		var tooLarge *quic.DatagramTooLargeError
@@ -548,7 +623,7 @@ func (o *overlayService) datagramRecvLoop(c network.Conn, qc *quic.Conn) {
 		if isHeartbeat(pkt) {
 			// Maintainer control datagram (overlaylink.go) — never an IPv4 packet ('V' fails the version check).
 			if o.linkm != nil {
-				o.linkm.handleHeartbeat(c.RemotePeer(), pkt, func(b []byte) { _ = qc.SendDatagram(b) })
+				o.linkm.handleHeartbeat(c.RemotePeer(), c.ID(), pkt, func(b []byte) { _ = qc.SendDatagram(b) })
 			}
 			continue
 		}
@@ -646,10 +721,34 @@ func (o *overlayService) dropStream(pid peer.ID, s network.Stream) {
 // handleInbound reads framed packets from a peer and injects them into the local link.
 func (o *overlayService) handleInbound(s network.Stream) {
 	defer s.Close()
+	// AUTHORIZATION (adversarial M8): the datagram RX path is gated on routes/maintained peers, but this stream
+	// handler is registered on the public host at goOnline — without this check ANY dialable peer could open
+	// /vidyagod/overlay/1.0.0 and inject arbitrary L3 frames into the game's netns. Only friends may speak here.
+	remote := s.Conn().RemotePeer()
+	authorized := func() bool {
+		o.mu.Lock()
+		_, isRoute := routesContain(o.routes, remote)
+		o.mu.Unlock()
+		return isRoute || (o.linkm != nil && o.linkm.has(remote))
+	}
+	if !authorized() {
+		vlog("overlay", "REJECT inbound overlay stream from non-friend %s", shortPeer(remote.String()))
+		return
+	}
 	for {
 		pkt, err := readFrame(s)
 		if err != nil {
 			return
+		}
+		// Re-checked PER FRAME, not just at open: a friend removed mid-session keeps their long-lived stream,
+		// and the never-ClosePeer policy means the conn won't die on its own — revocation must close this door
+		// (adversarial round-2). One mutex + map hit per frame; the stream path is not the fast path.
+		if !authorized() {
+			vlog("overlay", "REJECT: %s lost authorization mid-stream", shortPeer(remote.String()))
+			return
+		}
+		if _, ok := ipv4Dst(pkt); !ok {
+			continue // not an IPv4 packet — never inject junk into the TUN
 		}
 		o.mu.Lock()
 		link := o.link

@@ -43,16 +43,22 @@ type node struct {
 
 	repoPath string
 
-	ldb        *leveldb.Datastore // the underlying leveldb (for explicit compaction to reclaim tombstone disk)
-	compacting atomic.Bool        // coalesces overlapping compaction requests into one in-flight run
-	ds         datastore.Batching
-	fstore     *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
-	bstore     blockstore.Blockstore
-	bserv      blockservice.BlockService
-	dserv      ipld.DAGService
-	localDserv ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
-	pinner     ipfspinner.Pinner
-	serveFails *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
+	ldb *leveldb.Datastore // the underlying leveldb (for explicit compaction to reclaim tombstone disk)
+	// Compaction lifecycle: coalesce overlapping requests, refuse new ones once closing, and let closeNode WAIT
+	// for the in-flight run — closing the datastore under a live CompactRange races goleveldb's internal
+	// compaction/close machinery (-race caught it as a pre-existing flake once CI ran with -race).
+	compactMu     sync.Mutex
+	compactBusy   bool
+	compactClosed bool
+	compactWG     sync.WaitGroup
+	ds            datastore.Batching
+	fstore        *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
+	bstore        blockstore.Blockstore
+	bserv         blockservice.BlockService
+	dserv         ipld.DAGService
+	localDserv    ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
+	pinner        ipfspinner.Pinner
+	serveFails    *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
 
 	// network (M3) — nil/false until goOnline succeeds
 	online   bool
@@ -229,6 +235,12 @@ func closeNode() {
 		_ = gNode.host.Close()
 	}
 	gNode.cancel()
+	// Bar new compactions and WAIT for the in-flight one: closing leveldb under a live CompactRange is a race
+	// inside goleveldb (compaction ack vs close). Wait happens before the datastore close, deliberately.
+	gNode.compactMu.Lock()
+	gNode.compactClosed = true
+	gNode.compactMu.Unlock()
+	gNode.compactWG.Wait()
 	if c, ok := gNode.ds.(datastore.Datastore); ok {
 		_ = c.Close()
 	}
@@ -240,11 +252,21 @@ func closeNode() {
 // though the logical block set is tiny). The datastore only ever holds references + small intermediate nodes, so a
 // full-range compaction is cheap. Coalesced via compacting: overlapping requests collapse into one in-flight run.
 func (n *node) scheduleCompaction() {
-	if n.ldb == nil || !n.compacting.CompareAndSwap(false, true) {
+	n.compactMu.Lock()
+	if n.ldb == nil || n.compactBusy || n.compactClosed {
+		n.compactMu.Unlock()
 		return
 	}
+	n.compactBusy = true
+	n.compactWG.Add(1)
+	n.compactMu.Unlock()
 	safeGo("node.compaction", func() {
-		defer n.compacting.Store(false)
+		defer func() {
+			n.compactMu.Lock()
+			n.compactBusy = false
+			n.compactMu.Unlock()
+			n.compactWG.Done()
+		}()
 		_ = n.ldb.DB.CompactRange(goleveldbutil.Range{})
 	})
 }

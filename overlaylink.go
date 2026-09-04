@@ -53,6 +53,7 @@ import (
 	host "github.com/libp2p/go-libp2p/core/host"
 	network "github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	quic "github.com/quic-go/quic-go"
 )
 
 const (
@@ -92,11 +93,13 @@ type peerLink struct {
 	pid  peer.ID
 	nick string
 
-	state      string
-	rttMs      int64 // -1 = unknown
-	lastPong   time.Time
-	everPonged bool // true while the CURRENT direct path is proven (reset on demote)
-	missed     int
+	state        string
+	rttMs        int64 // -1 = unknown
+	lastPong     time.Time
+	everPonged   bool   // true while the CURRENT direct path is proven (reset on demote)
+	provenConnID string // the network.Conn.ID() the last pong arrived on — trust is PER-CONN (adversarial H2):
+	// pongs prove one specific connection; a different QUIC conn to the same peer is a different, untested path.
+	missed int
 
 	dialing  bool      // an async (re)dial is in flight
 	nextDial time.Time // backoff gate
@@ -155,20 +158,40 @@ func (m *linkMaintainer) has(pid peer.ID) bool {
 
 // datagramsTrusted is the overlay TX gate (Invariant 2): the datagram fast path may carry pid's packets only
 // while the direct path is PROVEN — pongs arrived and haven't stopped. Everything else (fresh conn, one-way
-// path, pongs gone quiet, peer without heartbeat support) rides the reliable stream, so delivery never depends
-// on an unverified path. Returns true for peers the maintainer doesn't track (session-only test fixtures).
+// path, pongs gone quiet, peer without heartbeat support, and peers the maintainer does NOT track) rides the
+// reliable stream, so delivery never depends on an unverified path.
 func (m *linkMaintainer) datagramsTrusted(pid peer.ID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l := m.links[pid]
 	if l == nil {
-		return true
+		// A peer the maintainer does not track gets NO trust: a friend removed mid-game leaves a stale route
+		// whose heartbeats have stopped — exactly the forever-unproven path Invariant 2 bans (adversarial M2).
+		// The stream fallback still delivers. (Overlay-only tests run with linkm==nil and never reach here.)
+		return false
 	}
 	return l.everPonged && l.missed < linkBeatMiss
 }
 
+// trustedConnFor is the single per-packet gate query (one lock take on the hot path — adversarial round-2 L9):
+// tracked reports whether the maintainer knows pid at all (false → maintainer-less legacy path, tests), and
+// connID is the ONE connection game datagrams may ride ("" = untrusted → stream). Trust binds to the specific
+// conn the last pong proved; any sibling is an untested path.
+func (m *linkMaintainer) trustedConnFor(pid peer.ID) (connID string, tracked bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l := m.links[pid]
+	if l == nil {
+		return "", false
+	}
+	if !l.everPonged || l.missed >= linkBeatMiss {
+		return "", true
+	}
+	return l.provenConnID, true
+}
+
 // handleHeartbeat processes a control datagram; sendPong ships a reply datagram on the same direct connection.
-func (m *linkMaintainer) handleHeartbeat(pid peer.ID, pkt []byte, sendPong func([]byte)) {
+func (m *linkMaintainer) handleHeartbeat(pid peer.ID, connID string, pkt []byte, sendPong func([]byte)) {
 	if !isHeartbeat(pkt) {
 		return
 	}
@@ -183,6 +206,7 @@ func (m *linkMaintainer) handleHeartbeat(pid peer.ID, pkt []byte, sendPong func(
 			l.lastPong = time.Now()
 			wasProven := l.everPonged
 			l.everPonged = true
+			l.provenConnID = connID
 			l.missed = 0
 			if !wasProven {
 				vlog("linkm", "PONG %s: datagram path PROVEN (rtt=%dms)", l.nick, l.rttMs)
@@ -248,13 +272,34 @@ func (m *linkMaintainer) tick() {
 
 func (m *linkMaintainer) evaluate(l *peerLink) {
 	connected := m.host.Network().Connectedness(l.pid) == network.Connected
-	direct := directQUICSender(m.host, l.pid)
+	conns := quicConnsTo(m.host, l.pid) // every direct QUIC conn — each gets a beat, any may prove itself
+	direct := len(conns) > 0
+	connGone := false
 	m.mu.Lock()
+	// Instant demote when the PROVEN conn is gone (closed, replaced by a re-punch): trust died with it — waiting
+	// out the miss window would ride an untested sibling conn for up to 3 beats (adversarial H2).
+	if l.everPonged && l.provenConnID != "" {
+		alive := false
+		for _, c := range conns {
+			if c.ID() == l.provenConnID {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			l.everPonged, l.provenConnID, l.missed, l.rttMs = false, "", 0, -1
+			l.demoted++
+			connGone = true // printed AFTER Unlock: this lock is on the per-packet TX path (adversarial round-3)
+		}
+	}
 	proven := l.everPonged && l.missed < linkBeatMiss
 	missed, rtt := l.missed, l.rttMs
 	m.mu.Unlock()
+	if connGone {
+		fmt.Fprintf(os.Stderr, "[lan] %s: proven conn gone — datagrams distrusted until a new pong\n", l.nick)
+	}
 	vlog("linkm", "eval %s state=%s connected=%v directQUIC=%v proven=%v missed=%d rtt=%dms",
-		l.nick, l.state, connected, direct != nil, proven, missed, rtt)
+		l.nick, l.state, connected, direct, proven, missed, rtt)
 
 	// Re-kick datagram receive loops for every existing conn — a conn that predated friendship (a bitswap dial,
 	// a presence stream) would otherwise NEVER get a loop, and a missed loop means our pings' pongs land in the
@@ -265,7 +310,7 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 
 	next := l.state
 	switch {
-	case direct != nil && proven:
+	case direct && proven:
 		next = linkDirect
 	case connected:
 		next = linkRelayed // includes an UNPROVEN direct conn: the stream carries traffic while heartbeats probe
@@ -280,12 +325,17 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		}
 	}
 
-	if direct != nil {
+	if direct {
 		// Beat — proving a fresh path or confirming a proven one. A previously-responsive peer that stops
 		// ponging has a dead datagram path (idled-out NAT mapping, path change): DEMOTE it (Invariant 2) so
 		// traffic rides the reliable stream, and nudge a fresh force-direct dial for a new datagram path.
 		// NEVER ClosePeer (Invariant 1) — bitswap and the friend protocol share this connection.
-		direct(heartbeatPacket(0, time.Now().UnixNano()))
+		for _, c := range conns { // beat EVERY direct conn: any of them may pong and become the proven path
+			var qc *quic.Conn
+			if c.As(&qc) && qc != nil {
+				_ = qc.SendDatagram(heartbeatPacket(0, time.Now().UnixNano()))
+			}
+		}
 		m.mu.Lock()
 		if l.everPonged && time.Since(l.lastPong) > linkBeatEvery {
 			l.missed++
@@ -316,7 +366,7 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		m.kickDial(l, false)
 	}
 
-	if connected || direct != nil {
+	if connected || direct {
 		m.host.ConnManager().Protect(l.pid, linkProtectTag)
 	}
 
@@ -329,7 +379,8 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		fmt.Fprintf(os.Stderr, "[lan] %s: %s → %s (rtt=%dms dgTx=%d dgRx=%d streamTx=%d demoted=%d)\n",
 			l.nick, prev, next, rtt, dgTx, dgRx, st, dm)
 	} else if overlayDebug {
-		fmt.Fprintf(os.Stderr, "[lan] %s: %s rtt=%dms\n", l.nick, l.state, l.rttMs)
+		fmt.Fprintf(os.Stderr, "[lan] %s: %s rtt=%dms\n", l.nick, next, rtt) // snapshotted values — l.rttMs is
+		// written under m.mu from recv goroutines; a bare read here was the fixed HIGH-2's surviving sibling
 	}
 }
 
@@ -357,9 +408,18 @@ func (m *linkMaintainer) kickDial(l *peerLink, direct bool) {
 		return
 	}
 	l.dialing = true
+	nick := l.nick // captured under m.mu: tick() rewrites l.nick concurrently — an unlocked read from the dial
+	// goroutine was a torn-string race (-race caught it; adversarial round-2 HIGH-2)
 	m.mu.Unlock()
 	safeGo("linkm.kickDial", func() {
-		vlog("linkm", "dial %s (forceDirect=%v)", l.nick, direct)
+		// DEFERRED, not sequential: a recovered panic in the dial would otherwise leave dialing=true forever and
+		// the link permanently stuck in "connecting" with every future kickDial short-circuiting (adversarial H1).
+		defer func() {
+			m.mu.Lock()
+			l.dialing = false
+			m.mu.Unlock()
+		}()
+		vlog("linkm", "dial %s (forceDirect=%v)", nick, direct)
 		ctx, cancel := context.WithTimeout(m.ctx, 25*time.Second)
 		var err error
 		if direct {
@@ -369,14 +429,13 @@ func (m *linkMaintainer) kickDial(l *peerLink, direct bool) {
 		}
 		cancel()
 		m.mu.Lock()
-		l.dialing = false
 		if err == nil {
-			vlog("linkm", "dial %s ok (forceDirect=%v)", l.nick, direct)
+			vlog("linkm", "dial %s ok (forceDirect=%v)", nick, direct)
 		}
 		if err != nil {
 			// Rate-limited by the backoff itself. Was once silent — a peer flapped down↔connecting for an hour
 			// and nothing anywhere said WHY the dial failed.
-			fmt.Fprintf(os.Stderr, "[lan] %s: dial failed (%v) — retrying in %s\n", l.nick, err, l.backoff)
+			fmt.Fprintf(os.Stderr, "[lan] %s: dial failed (%v) — retrying in %s\n", nick, err, l.backoff)
 			l.nextDial = time.Now().Add(l.backoff)
 			if l.backoff < linkDialMax {
 				l.backoff *= 2
@@ -389,14 +448,17 @@ func (m *linkMaintainer) kickDial(l *peerLink, direct bool) {
 	})
 }
 
-// directQUICSender returns a datagram-send closure over a direct QUIC connection to pid, or nil when the only
-// connections are relayed/TCP (heartbeats are datagram-only — their whole point is exercising the direct path).
-func directQUICSender(h host.Host, pid peer.ID) func([]byte) {
-	qc := quicConnTo(h, pid)
-	if qc == nil {
-		return nil
+// quicConnsTo returns EVERY direct QUIC connection to pid (relayed/TCP conns don't unwrap). All of them get
+// heartbeats — proving is per-conn, and after a re-punch the old and new conn briefly coexist.
+func quicConnsTo(h host.Host, pid peer.ID) []network.Conn {
+	var out []network.Conn
+	for _, c := range h.Network().ConnsToPeer(pid) {
+		var qc *quic.Conn
+		if c.As(&qc) && qc != nil {
+			out = append(out, c)
+		}
 	}
-	return func(b []byte) { _ = qc.SendDatagram(b) }
+	return out
 }
 
 // snapshot returns the UI view of every maintained link.

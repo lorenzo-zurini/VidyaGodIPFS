@@ -251,3 +251,36 @@ func TestOverlayFansOutBroadcast(t *testing.T) {
 		}
 	}
 }
+
+// TestAttachTearsDownLeftoverState pins the round-3/4 attach gate: when readLoop's exit has cleared `running`
+// but a link (or tri-plane) is still installed — the fd-handoff-vs-instant-game-death race — a new attach must
+// tear the leftovers down, not overwrite them (the overwrite leaked the old TUN fd and doubled the reflector).
+// Mutation-verified: reverting the gate to `if o.running` fails this test.
+func TestAttachTearsDownLeftoverState(t *testing.T) {
+	h := testHost(t)
+	o := newOverlayService(context.Background(), h, nil, nil)
+	o.start()
+
+	oldLink, newLink := newChanLink(), newChanLink()
+	// Model the leftover state directly: link installed, running already cleared (as readLoop's defer leaves it).
+	o.mu.Lock()
+	o.link = oldLink
+	o.running = false
+	o.mu.Unlock()
+
+	o.attach(newLink)
+	defer o.detach()
+
+	select {
+	case <-oldLink.closed:
+		// the leftover link was torn down — the gate fired
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach over leftover state did not tear down the old link (gate keyed on running only?)")
+	}
+	o.mu.Lock()
+	cur, running := o.link, o.running
+	o.mu.Unlock()
+	if cur != packetLink(newLink) || !running {
+		t.Fatalf("new link not installed cleanly (running=%v)", running)
+	}
+}

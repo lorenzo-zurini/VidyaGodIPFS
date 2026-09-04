@@ -60,15 +60,14 @@ func TestLinkMaintainerReachesDirectWithRTT(t *testing.T) {
 
 func TestUnprovenDirectConnIsNotReportedDirectAndNotTrusted(t *testing.T) {
 	_, hb, _, _, ma, _ := lanPair(t)
-	// No pong has arrived yet (no ticks beyond the membership sync): a raw direct QUIC conn exists, but the
-	// path is unproven — it must read "relayed" (usable via stream) and the TX gate must NOT trust datagrams.
+	// FORCE the unproven state (a pong may already have raced in on fast hardware — skipping here meant the
+	// test sometimes never ran its asserts; adversarial L2): distrust exactly as a fresh conn starts out.
+	time.Sleep(250 * time.Millisecond) // let ALL of lanPair's tick-pings' pongs land: no new pings are sent between
+	// this drain and the asserts below, so after it the forced state cannot be re-proven (adversarial round-2 L2)
 	ma.mu.Lock()
 	l := ma.links[hb.ID()]
-	ponged := l.everPonged
+	l.everPonged, l.provenConnID, l.missed = false, "", 0
 	ma.mu.Unlock()
-	if ponged {
-		t.Skip("pong already arrived before the assert — env too fast; covered by the demote test")
-	}
 	if ma.datagramsTrusted(hb.ID()) {
 		t.Fatal("unproven direct path must not be trusted with game traffic")
 	}

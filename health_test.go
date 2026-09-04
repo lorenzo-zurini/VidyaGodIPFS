@@ -23,8 +23,8 @@ func mustCid(t *testing.T) cid.Cid {
 func TestHealthReportNoNode(t *testing.T) {
 	closeNode() // ensure no global node
 	r := healthReport()
-	if len(r) != 1 || r[0].Name != "Node" || r[0].Status != "down" {
-		t.Fatalf("no-node report should be exactly one down Node row, got %+v", r)
+	if len(r) != 2 || r[0].Name != "Panic guard" || r[1].Name != "Node" || r[1].Status != "down" {
+		t.Fatalf("no-node report should be [panic-guard, down Node], got %+v", r)
 	}
 	var parsed []healthEntry
 	if err := json.Unmarshal([]byte(healthJSON()), &parsed); err != nil {
@@ -43,11 +43,11 @@ func TestHealthReportOfflineNode(t *testing.T) {
 	if len(r) < 2 {
 		t.Fatalf("offline report too short: %+v", r)
 	}
-	if r[0].Name != "Node" || r[0].Status != "ok" {
-		t.Fatalf("repo is open — Node must be ok, got %+v", r[0])
+	if r[1].Name != "Node" || r[1].Status != "ok" {
+		t.Fatalf("repo is open — Node must be ok, got %+v", r[1])
 	}
-	if r[1].Name != "Network" || r[1].Status != "down" {
-		t.Fatalf("offline node — Network must be down, got %+v", r[1])
+	if r[2].Name != "Network" || r[2].Status != "down" {
+		t.Fatalf("offline node — Network must be down, got %+v", r[2])
 	}
 }
 

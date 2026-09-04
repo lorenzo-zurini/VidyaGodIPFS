@@ -50,17 +50,22 @@ func kickDoHProbe() {
 	dohProbe.running = true
 	dohProbe.mu.Unlock()
 	safeGo("health.dohProbe", func() {
+		// DEFERRED flag reset: a recovered panic in the resolver would otherwise leave running=true forever and
+		// freeze the DoH health row permanently (adversarial H1).
+		v := "probe did not complete" // overwritten on any normal path; survives a recovered panic
+		defer func() {
+			dohProbe.mu.Lock()
+			dohProbe.verdict, dohProbe.last, dohProbe.running = v, time.Now(), false
+			dohProbe.mu.Unlock()
+		}()
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, err := newDoHResolver().LookupIPAddr(ctx, "cloudflare.com")
-		v := fmt.Sprintf("resolving ok (%dms)", time.Since(t0).Milliseconds())
+		v = fmt.Sprintf("resolving ok (%dms)", time.Since(t0).Milliseconds())
 		if err != nil {
 			v = "lookup failed: " + rootErr(err)
 		}
-		dohProbe.mu.Lock()
-		dohProbe.verdict, dohProbe.last, dohProbe.running = v, time.Now(), false
-		dohProbe.mu.Unlock()
 	})
 }
 
@@ -69,28 +74,43 @@ func healthReport() []healthEntry {
 	var out []healthEntry
 	add := func(name, status, detail string) { out = append(out, healthEntry{name, status, detail}) }
 
+	// Recovered panics first: they are bugs that stayed invisible before this row existed. warn (not down) —
+	// the process lives — but a non-zero count means some code path is broken and possibly a loop died with it.
+	if total, last, when := panicStats(); total > 0 {
+		add("Panic guard", "warn", fmt.Sprintf("%d panic(s) recovered — last: %s at %s (each one is a bug; check the log)",
+			total, last, when.Format("15:04:05")))
+	} else {
+		add("Panic guard", "ok", "no recovered panics")
+	}
+
 	n := get()
 	if n == nil {
 		add("Node", "down", "not started — networking is off or startup failed")
 		return out
 	}
+	// Snapshot the service fields UNDER gMu: the background goOnline retry (re)writes them under that lock, and
+	// unsynchronized reads here raced it on every cold-start laptop (adversarial M1a).
+	gMu.Lock()
+	online, host, kad, exch, prov, mdnsSvc := n.online, n.host, n.dht, n.exchange, n.provider, n.mdns
+	friendSvc, social, linkm, overlay, bwc, serveFails := n.friend, n.social, n.linkm, n.overlay, n.bwc, n.serveFails
+	gMu.Unlock()
 	add("Node", "ok", "repo open at "+n.repoPath)
 
 	// --- libp2p host / connectivity ---
-	if !n.online || n.host == nil {
+	if !online || host == nil {
 		add("Network", "down", "offline — the network stack has not come up (still retrying in the background)")
 		return out // everything below needs the host
 	}
-	peers := len(n.host.Network().Peers())
+	peers := len(host.Network().Peers())
 	st := "ok"
 	if peers == 0 {
 		st = "warn"
 	}
-	add("Network", st, fmt.Sprintf("connected to %d peer(s), %d listen addr(s)", peers, len(n.host.Addrs())))
+	add("Network", st, fmt.Sprintf("connected to %d peer(s), %d listen addr(s)", peers, len(host.Addrs())))
 
 	// --- reachability: what we advertise decides whether OTHERS can reach us ---
 	pub, relay := 0, 0
-	for _, a := range n.host.Addrs() {
+	for _, a := range host.Addrs() {
 		s := a.String()
 		if strings.Contains(s, "/p2p-circuit") {
 			relay++
@@ -108,27 +128,27 @@ func healthReport() []healthEntry {
 	}
 
 	// --- DHT (peer + content discovery) ---
-	if n.dht == nil {
+	if kad == nil {
 		add("DHT", "down", "not running — peers and content cannot be discovered")
-	} else if sz := n.dht.RoutingTable().Size(); sz == 0 {
+	} else if sz := kad.RoutingTable().Size(); sz == 0 {
 		add("DHT", "warn", "routing table empty — discovery will fail until bootstrap completes")
 	} else {
 		add("DHT", "ok", fmt.Sprintf("routing table: %d peer(s)", sz))
 	}
 
 	// --- bitswap (transfers) + deliverability ---
-	if n.exchange == nil {
+	if exch == nil {
 		add("Transfers (bitswap)", "down", "exchange not running — downloads and seeding are dead")
 	} else {
 		detail := "running"
-		if n.bwc != nil {
-			t := n.bwc.GetBandwidthTotals()
+		if bwc != nil {
+			t := bwc.GetBandwidthTotals()
 			detail = fmt.Sprintf("running — ↓%.0f KB/s ↑%.0f KB/s", t.RateIn/1024, t.RateOut/1024)
 		}
 		add("Transfers (bitswap)", "ok", detail)
 	}
-	if n.serveFails != nil {
-		if c := n.serveFails.count(); c > 0 {
+	if serveFails != nil {
+		if c := serveFails.count(); c > 0 {
 			add("Deliverability", "warn", fmt.Sprintf("%d block(s) peers asked for could NOT be served (drifted/missing content) — see the IPFS tab", c))
 		} else {
 			add("Deliverability", "ok", "no failed serves")
@@ -136,7 +156,7 @@ func healthReport() []healthEntry {
 	}
 
 	// --- content announce (how peers find what we seed) ---
-	if n.provider == nil {
+	if prov == nil {
 		add("Content announce", "down", "reprovider not running — nothing we seed is discoverable")
 	} else {
 		n.seedMu.RLock()
@@ -150,18 +170,18 @@ func healthReport() []healthEntry {
 	}
 
 	// --- same-LAN discovery ---
-	if n.mdns == nil {
+	if mdnsSvc == nil {
 		add("LAN discovery (mDNS)", "warn", "not running — same-network peers won't be found automatically")
 	} else {
 		add("LAN discovery (mDNS)", "ok", "announcing + listening on the local network")
 	}
 
 	// --- friends service ---
-	if n.friend == nil || n.social == nil {
+	if friendSvc == nil || social == nil {
 		add("Friends", "down", "friend service not running")
 	} else {
 		accepted, online := 0, 0
-		for _, c := range n.social.list() {
+		for _, c := range social.list() {
 			if c.State == stAccepted {
 				accepted++
 				if c.online {
@@ -173,11 +193,11 @@ func healthReport() []healthEntry {
 	}
 
 	// --- virtual-LAN link maintainer ---
-	if n.linkm == nil {
+	if linkm == nil {
 		add("Virtual LAN links", "down", "link maintainer not running — friend links are not being kept alive")
 	} else {
 		counts := map[string]int{}
-		for _, state := range n.linkm.snapshotStates() {
+		for _, state := range linkm.snapshotStates() {
 			counts[state]++
 		}
 		total := 0
@@ -189,10 +209,10 @@ func healthReport() []healthEntry {
 	}
 
 	// --- overlay datapath + tri-plane (game-time services) ---
-	if n.overlay == nil {
+	if overlay == nil {
 		add("Overlay datapath", "down", "overlay service not registered — the virtual LAN cannot carry traffic")
 	} else {
-		running, routes, gw, relayOn := n.overlay.healthSnapshot()
+		running, routes, gw, relayOn := overlay.healthSnapshot()
 		if running {
 			add("Overlay datapath", "ok", fmt.Sprintf("forwarding (game active) — %d route(s)", routes))
 			if gw {

@@ -146,13 +146,43 @@ func (n *node) goOnline() error {
 	if err != nil {
 		return err
 	}
+	// A panic between here and publication (n.host = h) is recovered by the caller's guardErr and RETRIED —
+	// without this, every failed attempt leaked a whole libp2p host (bound ports, goroutines) per backoff
+	// interval, forever (adversarial M3). Errors after this point must also close h before returning.
+	published := false
+	var cleanupKad *dht.IpfsDHT
+	var cleanupBswap interface{ Close() error }
+	defer func() {
+		if !published {
+			// Close EVERYTHING built so far, newest-first — the retry loop otherwise accretes a DHT (on n.ctx,
+			// which outlives the attempt) and 32 bitswap workers per failed attempt (adversarial round-2).
+			// published flips only at the very END of goOnline: a panic in the late steps (provider, mDNS,
+			// friend/overlay wiring) must ALSO tear this attempt down, or the retry builds a second host with
+			// the same identity over a live first one (adversarial round-3).
+			if n.mdns != nil {
+				_ = n.mdns.Close()
+				n.mdns = nil
+			}
+			if n.provider != nil {
+				_ = n.provider.Close()
+				n.provider = nil
+			}
+			if cleanupBswap != nil {
+				_ = cleanupBswap.Close()
+			}
+			if cleanupKad != nil {
+				_ = cleanupKad.Close()
+			}
+			_ = h.Close()
+		}
+	}()
 
 	kad, err := dht.New(n.ctx, h, dht.Mode(dht.ModeAuto),
 		dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))
 	if err != nil {
-		_ = h.Close()
-		return err
+		return err // deferred cleanup closes h
 	}
+	cleanupKad = kad
 
 	// Online bitswap. Provider discovery was the ENTIRE download bottleneck: a cold Amino-DHT walk took ~14 s to find
 	// who holds a CID, while the transfer itself runs near link speed once a provider is known. So consult a delegated
@@ -187,6 +217,7 @@ func (n *node) goOnline() error {
 		// session down and a fresh one re-asks). Cut it to 10s so a session self-heals its tail well before the
 		// watchdog fires, which also un-starves files queued behind another on a slow link (concurrent downloads).
 		bitswap.RebroadcastDelay(10*time.Second))
+	cleanupBswap = bswap
 
 	n.host = h
 	n.dht = kad
@@ -203,11 +234,17 @@ func (n *node) goOnline() error {
 	// dialed. Registered here so it covers bitswap, friend and overlay conns alike.
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
+			if !logOn() { // don't build the args (ConnsToPeer copies a slice) on every conn event when quiet
+				return
+			}
 			vlog("conn", "OPEN   %s dir=%s remote=%s (%d conns to peer)",
 				shortPeer(c.RemotePeer().String()), c.Stat().Direction, c.RemoteMultiaddr(),
 				len(h.Network().ConnsToPeer(c.RemotePeer())))
 		},
 		DisconnectedF: func(_ network.Network, c network.Conn) {
+			if !logOn() {
+				return
+			}
 			vlog("conn", "CLOSE  %s remote=%s (%d conns left)",
 				shortPeer(c.RemotePeer().String()), c.RemoteMultiaddr(),
 				len(h.Network().ConnsToPeer(c.RemotePeer())))
@@ -271,15 +308,18 @@ func (n *node) goOnline() error {
 			}
 			return out
 		})
-		safeGo("linkm.run", n.linkm.run)
 		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
 		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
+		// Created BEFORE the maintainer starts ticking: the constructor assigns lm.ensureRecvLoops, and starting
+		// run() first made that assignment race the first tick's read (adversarial M1c).
 		n.overlay = newOverlayService(n.ctx, h, kad, n.linkm)
 		n.overlay.start()
+		safeGo("linkm.run", n.linkm.run)
 	}
 
 	n.online = true
+	published = true // EVERYTHING above succeeded; from here closeNode owns the teardown
 	safeGo("node.bootstrap", n.bootstrap)
 	safeGo("node.refreshPinnedSet", func() { n.refreshPinnedSet(n.ctx) }) // keep the pinned-root set warm for the upload tracer
 	n.startBenchObserver()                                                // bench.go: periodic path/bandwidth ground-truth log when VG_BENCH_OBSERVE is set
