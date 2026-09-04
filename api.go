@@ -55,6 +55,15 @@ func VgSetLogVerbose(on C.int) {
 	vlog("log", "verbose logging %s", map[bool]string{true: "ENABLED", false: "disabled"}[on != 0])
 }
 
+// Live health of every Go service, for Settings → Network: JSON [{name,status,detail}] with status
+// ok|warn|down|off. Passive introspection — cheap enough to poll every few seconds (health.go).
+//
+//export VgHealth
+func VgHealth(outJson **C.char) C.int {
+	setStr(outJson, healthJSON())
+	return 0
+}
+
 // ---- lifecycle ----
 
 //export VgStart
