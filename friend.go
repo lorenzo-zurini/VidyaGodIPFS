@@ -103,6 +103,7 @@ func (f *friendService) handleStream(s network.Stream) {
 
 // dispatch applies one inbound message from remote to the address book + emits the UI event.
 func (f *friendService) dispatch(remote string, m friendMsg) {
+	vlog("friend", "RECV %-8s from %s (nick=%q)", m.Type, shortPeer(remote), m.Nick)
 	switch m.Type {
 	case "request":
 		// A friend request: record as incoming unless we already accepted/blocked them. Store the profile they sent so
@@ -188,6 +189,7 @@ func (f *friendService) send(pidStr string, msgs ...friendMsg) error {
 	ctx, cancel := context.WithTimeout(f.ctx, 30*time.Second)
 	defer cancel()
 	if err := f.dial(ctx, pid); err != nil {
+		vlog("friend", "SEND %-8s to %s: dial failed: %v", msgTypes(msgs), shortPeer(pidStr), err)
 		return err
 	}
 	// WithAllowLimitedConn: a friend request is a tiny JSON message that must go through even when the only path to
@@ -196,16 +198,34 @@ func (f *friendService) send(pidStr string, msgs ...friendMsg) error {
 	// stream: limited connection to peer") even though we're "connected" and bitswap (which opts in) downloads fine.
 	s, err := f.host.NewStream(network.WithAllowLimitedConn(ctx, "vidyagod-friend"), pid, friendProtoID)
 	if err != nil {
+		vlog("friend", "SEND %-8s to %s: open stream failed: %v", msgTypes(msgs), shortPeer(pidStr), err)
 		return fmt.Errorf("open stream: %w", err)
 	}
 	defer s.Close()
 	enc := json.NewEncoder(s)
 	for _, m := range msgs {
 		if err := enc.Encode(&m); err != nil {
+			vlog("friend", "SEND %-8s to %s: encode failed: %v", m.Type, shortPeer(pidStr), err)
 			return fmt.Errorf("send: %w", err)
 		}
 	}
+	vlog("friend", "SEND %-8s to %s: ok", msgTypes(msgs), shortPeer(pidStr))
 	return nil
+}
+
+// msgTypes joins the message types in a batch for a log line (usually one).
+func msgTypes(msgs []friendMsg) string {
+	if len(msgs) == 1 {
+		return msgs[0].Type
+	}
+	out := ""
+	for i, m := range msgs {
+		if i > 0 {
+			out += "+"
+		}
+		out += m.Type
+	}
+	return out
 }
 
 // helloMsg builds a message of the given type carrying our current profile.

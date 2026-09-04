@@ -151,9 +151,11 @@ func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid pee
 	ctx = network.WithForceDirectDial(ctx, "vg-lan-upgrade")
 	if router != nil {
 		if ai, err := router.FindPeer(ctx, pid); err == nil {
+			vlog("dial", "force-direct %s via FindPeer addrs=%v", shortPeer(pid.String()), ai.Addrs)
 			return h.Connect(ctx, ai)
 		}
 	}
+	vlog("dial", "force-direct %s from peerstore", shortPeer(pid.String()))
 	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
 
@@ -211,6 +213,7 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 	o.bcast = bcast
 	o.subnetNet = snet
 	o.mu.Unlock()
+	vlog("overlay", "configure selfVIP=%s subnet=%s routes=%d bcast=%s", localVIP, subnet, len(routes), bcast)
 	// Existing direct-QUIC connections to these peers (e.g. a fetch already holepunched to a friend) need a datagram
 	// receive loop too — the notifiee only catches connections that appear AFTER this point.
 	for _, pid := range routes {
@@ -270,6 +273,7 @@ func (o *overlayService) attach(link packetLink) {
 		}
 	}
 	safeGo("overlay.readLoop", func() { o.readLoop(ctx, link) })
+	vlog("overlay", "attach: TUN link up (gateway=%v reflector=%v selfVIP=%s)", gwWant, relayWant && localVIP != "", localVIP)
 }
 
 // detach stops forwarding and tears down the link + cached streams + any pending fd-handoff socket.
@@ -525,6 +529,7 @@ func (o *overlayService) maybeStartDatagramLoop(c network.Conn) {
 	}
 	o.dgRecv[c] = true
 	o.dgMu.Unlock()
+	vlog("overlay", "datagram RX loop started for %s (%s)", shortPeer(c.RemotePeer().String()), c.RemoteMultiaddr())
 	safeGo("overlay.datagramRecvLoop", func() { o.datagramRecvLoop(c, qc) })
 }
 

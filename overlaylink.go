@@ -181,8 +181,14 @@ func (m *linkMaintainer) handleHeartbeat(pid peer.ID, pkt []byte, sendPong func(
 		if l := m.links[pid]; l != nil {
 			l.rttMs = time.Since(sent).Milliseconds()
 			l.lastPong = time.Now()
+			wasProven := l.everPonged
 			l.everPonged = true
 			l.missed = 0
+			if !wasProven {
+				vlog("linkm", "PONG %s: datagram path PROVEN (rtt=%dms)", l.nick, l.rttMs)
+			} else {
+				vlog("linkm", "pong %s rtt=%dms", l.nick, l.rttMs)
+			}
 		}
 		m.mu.Unlock()
 	}
@@ -245,7 +251,10 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 	direct := directQUICSender(m.host, l.pid)
 	m.mu.Lock()
 	proven := l.everPonged && l.missed < linkBeatMiss
+	missed, rtt := l.missed, l.rttMs
 	m.mu.Unlock()
+	vlog("linkm", "eval %s state=%s connected=%v directQUIC=%v proven=%v missed=%d rtt=%dms",
+		l.nick, l.state, connected, direct != nil, proven, missed, rtt)
 
 	// Re-kick datagram receive loops for every existing conn — a conn that predated friendship (a bitswap dial,
 	// a presence stream) would otherwise NEVER get a loop, and a missed loop means our pings' pongs land in the
@@ -350,6 +359,7 @@ func (m *linkMaintainer) kickDial(l *peerLink, direct bool) {
 	l.dialing = true
 	m.mu.Unlock()
 	safeGo("linkm.kickDial", func() {
+		vlog("linkm", "dial %s (forceDirect=%v)", l.nick, direct)
 		ctx, cancel := context.WithTimeout(m.ctx, 25*time.Second)
 		var err error
 		if direct {
@@ -360,6 +370,9 @@ func (m *linkMaintainer) kickDial(l *peerLink, direct bool) {
 		cancel()
 		m.mu.Lock()
 		l.dialing = false
+		if err == nil {
+			vlog("linkm", "dial %s ok (forceDirect=%v)", l.nick, direct)
+		}
 		if err != nil {
 			// Rate-limited by the backoff itself. Was once silent — a peer flapped down↔connecting for an hour
 			// and nothing anywhere said WHY the dial failed.

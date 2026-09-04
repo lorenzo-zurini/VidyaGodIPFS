@@ -46,6 +46,15 @@ func fail(errOut **C.char, err error) C.int {
 //export VgFree
 func VgFree(p *C.char) { C.free(unsafe.Pointer(p)) }
 
+// VgSetLogVerbose flips the node's verbose diagnostic log (vglog.go) on/off at runtime. The app calls this from its
+// --log path AFTER redirecting the process stderr to the log file, so every subsequent vlog line is captured there.
+//
+//export VgSetLogVerbose
+func VgSetLogVerbose(on C.int) {
+	gLogVerbose.Store(on != 0)
+	vlog("log", "verbose logging %s", map[bool]string{true: "ENABLED", false: "disabled"}[on != 0])
+}
+
 // ---- lifecycle ----
 
 //export VgStart

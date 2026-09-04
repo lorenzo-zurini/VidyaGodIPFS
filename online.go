@@ -25,6 +25,7 @@ import (
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
 	host "github.com/libp2p/go-libp2p/core/host"
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
+	network "github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
@@ -195,6 +196,24 @@ func (n *node) goOnline() error {
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
 	}
+
+	// Connection-event trace (verbose only): the single most useful signal for diagnosing NAT traversal in the
+	// field — every conn open/close with its remote multiaddr shows relay (/p2p-circuit) vs direct, the transport
+	// (quic/tcp), and which interface/address actually carried it (LAN, WireGuard, public). Direction tells us who
+	// dialed. Registered here so it covers bitswap, friend and overlay conns alike.
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			vlog("conn", "OPEN   %s dir=%s remote=%s (%d conns to peer)",
+				shortPeer(c.RemotePeer().String()), c.Stat().Direction, c.RemoteMultiaddr(),
+				len(h.Network().ConnsToPeer(c.RemotePeer())))
+		},
+		DisconnectedF: func(_ network.Network, c network.Conn) {
+			vlog("conn", "CLOSE  %s remote=%s (%d conns left)",
+				shortPeer(c.RemotePeer().String()), c.RemoteMultiaddr(),
+				len(h.Network().ConnsToPeer(c.RemotePeer())))
+		},
+	})
+	vlog("online", "host up peerID=%s addrs=%d", h.ID(), len(h.Addrs()))
 	// Re-log addresses once AutoNAT/UPnP/relay have settled — these are what the node ACTUALLY advertises to the
 	// public network (a public ip4/ip6 = directly reachable; only /p2p-circuit = relay-only → slow downloads).
 	safeGo("node.addrLogger", func() {
@@ -356,9 +375,12 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	// nudges an upgrade — this is what turns "two PCs on the same LAN" into a direct local connection instead of
 	// a hairpin punch.
 	m.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+	vlog("mdns", "discovered %s addrs=%v", shortPeer(pi.ID.String()), pi.Addrs)
 	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	defer cancel()
-	_ = m.h.Connect(ctx, pi)
+	if err := m.h.Connect(ctx, pi); err != nil {
+		vlog("mdns", "connect %s failed: %v", shortPeer(pi.ID.String()), err)
+	}
 }
 
 // reprovideKeys streams the recursively-pinned roots for the reprovider to announce.
