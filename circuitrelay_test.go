@@ -1,5 +1,11 @@
 package main
 
+// ADVERSARY-TODO (2026-09-04): the changeset that added the conn-close assertion below + the battery
+// recovery-gate correction did NOT clear the Fable adversary gate — Fable hit its usage limit mid-review and
+// returned no verdict; it was pushed on an Opus inline self-review at the user's call. Re-run the adversary
+// (.claude/agents/adversary.md) on commit 02b42e9 / main bfe7c65 once Fable credits are back; fix any finding
+// as a follow-up. Self-review notes: maintainer down-path self-heals (kickDial backoff, no wedge), traffic-
+// resumed is the real recovery proof; judged a legitimate harness correction, not theater.
 // circuitrelay_test.go — an IN-PROCESS circuit-v2 relay fixture: a relay host R and two UNREACHABLE clients that
 // can only meet through it. This is the topology the unit suite structurally lacked (every other fixture wires
 // directly-connected hosts, so Connectedness is always Connected): libp2p reports a relayed conn as
@@ -123,4 +129,15 @@ func TestRelayOnlyConnIsLimitedAndCountsAsConnected(t *testing.T) {
 		c, ok := sB.get(a.ID().String())
 		return ok && c.State == stIncoming
 	})
+
+	// Outage detection, deterministic (no DHT): closing the only conn must move the maintainer OFF relayed —
+	// the state-machine half of "recovery" the field battery can't assert without flaky cold re-discovery. Done
+	// LAST so the assertions above still had a live relay conn.
+	_ = a.Network().ClosePeer(b.ID())
+	m.tick()
+	for _, li := range m.snapshot(func(peer.ID) string { return "" }) {
+		if li.Peer == b.ID().String() && (li.Link == linkRelayed || li.Link == linkDirect) {
+			t.Fatalf("maintainer still reports %q after the only conn closed — outage not detected", li.Link)
+		}
+	}
 }
