@@ -168,8 +168,8 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 
 // dial ensures we have a connection to pid, resolving addresses via the router (DHT) if we're not already connected.
 func (f *friendService) dial(ctx context.Context, pid peer.ID) error {
-	if f.host.Network().Connectedness(pid) == network.Connected {
-		return nil
+	if c := f.host.Network().Connectedness(pid); c == network.Connected || c == network.Limited {
+		return nil // Limited (relayed) suffices: friend streams opt into limited conns (WithAllowLimitedConn)
 	}
 	if f.router != nil {
 		ai, err := f.router.FindPeer(ctx, pid)

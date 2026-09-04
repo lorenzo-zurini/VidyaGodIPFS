@@ -161,8 +161,8 @@ func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid pee
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
 func dialPeer(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
-	if h.Network().Connectedness(pid) == network.Connected {
-		return nil
+	if c := h.Network().Connectedness(pid); c == network.Connected || c == network.Limited {
+		return nil // Limited (relayed) is a usable link — the maintainer's force-direct nudge handles upgrades
 	}
 	if router != nil {
 		ai, err := router.FindPeer(ctx, pid)

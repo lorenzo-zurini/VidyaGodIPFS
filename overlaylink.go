@@ -271,7 +271,11 @@ func (m *linkMaintainer) tick() {
 }
 
 func (m *linkMaintainer) evaluate(l *peerLink) {
-	connected := m.host.Network().Connectedness(l.pid) == network.Connected
+	// Limited (circuit-v2 relayed) COUNTS as connected: our stream fallback opts into limited conns, so a
+	// relay-only friend has a fully working link — treating Limited as "down" showed a live link as down in the
+	// panel and re-dialed it uselessly every beat (caught by the battery's post-outage state assert, 2026-09-04).
+	connState := m.host.Network().Connectedness(l.pid)
+	connected := connState == network.Connected || connState == network.Limited
 	conns := quicConnsTo(m.host, l.pid) // every direct QUIC conn — each gets a beat, any may prove itself
 	direct := len(conns) > 0
 	connGone := false

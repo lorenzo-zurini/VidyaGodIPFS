@@ -66,8 +66,10 @@ func (n *node) warmProviders(c cid.Cid) {
 // and dials it, so a subsequent bitswap block request rides a working connection. Relay-circuit addresses connect
 // first; DCUtR then upgrades to a direct hole-punched path transparently.
 func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
-	// If we already have a live connection to this provider, nothing to do — bitswap will use it.
-	if n.host.Network().Connectedness(pi.ID) == network.Connected {
+	// If we already have a live connection to this provider, nothing to do — bitswap will use it. Limited
+	// (relayed) counts: bitswap opts into limited conns and DCUtR upgrades in the background; dialing "again"
+	// through the swarm just short-circuits on the existing conn anyway, so the walk below would be pure waste.
+	if c := n.host.Network().Connectedness(pi.ID); c == network.Connected || c == network.Limited {
 		return
 	}
 	// FAST PATH: FindProvidersAsync already handed us the provider's advertised addresses (from its provider record).
@@ -85,7 +87,7 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	tf := time.Now()
 	fresh, err := n.dht.FindPeer(fctx, pi.ID)
 	fdbg("warm: FindPeer %s → %d addr in %s (err=%v)", shortPeer(pi.ID.String()), len(fresh.Addrs), time.Since(tf).Round(time.Millisecond), err)
-	if err == nil && len(fresh.Addrs) > 0 && n.host.Network().Connectedness(pi.ID) != network.Connected {
+	if c := n.host.Network().Connectedness(pi.ID); err == nil && len(fresh.Addrs) > 0 && c != network.Connected && c != network.Limited {
 		n.host.Peerstore().AddAddrs(fresh.ID, fresh.Addrs, 10*time.Minute)
 		n.dialWarm(ctx, fresh, "findpeer")
 	}
