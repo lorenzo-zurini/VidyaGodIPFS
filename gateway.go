@@ -118,7 +118,7 @@ func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw stri
 	// to the next one instead of hanging. Reset on every read.
 	var lastRead atomic.Int64
 	lastRead.Store(time.Now().UnixNano())
-	go func() {
+	safeGo("gateway.fetchWatchdog", func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
@@ -132,7 +132,7 @@ func (n *node) fetchCarFromGateway(ctx context.Context, hc *http.Client, gw stri
 				}
 			}
 		}
-	}()
+	})
 
 	// The CAR stream carries no Content-Length (chunked), so probe the file size with a HEAD for a real progress bar.
 	// The CAR is a touch larger than the file (block framing) so cap the ratio at 99; the finalize step lands it at 100.

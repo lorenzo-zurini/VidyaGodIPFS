@@ -384,7 +384,7 @@ func (f *friendService) blockFriend(pidStr string) error {
 // broadcastProfile pushes our updated profile to every accepted friend (best-effort, async).
 func (f *friendService) broadcastProfile() {
 	for _, pid := range f.social.acceptedPeers() {
-		go func(p string) { _ = f.send(p, f.helloMsg("profile")) }(pid)
+		safeGo("friend.helloProfile", func() { _ = f.send(pid, f.helloMsg("profile")) })
 	}
 }
 
@@ -392,7 +392,7 @@ func (f *friendService) broadcastProfile() {
 // of presence, modelled on broadcastProfile.
 func (f *friendService) broadcastPresence() {
 	for _, pid := range f.social.acceptedPeers() {
-		go func(p string) { _ = f.send(p, f.helloMsg("presence")) }(pid)
+		safeGo("friend.helloPresence", func() { _ = f.send(pid, f.helloMsg("presence")) })
 	}
 }
 

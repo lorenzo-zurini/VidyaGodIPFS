@@ -29,7 +29,7 @@ func (o *overlayService) serve(sockPath string) error {
 	o.sockL = l
 	o.sockPath = sockPath
 	o.mu.Unlock()
-	go func() {
+	safeGo("overlay.fdAccept", func() {
 		conn, err := l.AcceptUnix()
 		if err != nil {
 			return // listener closed (detach) before the sandbox connected
@@ -42,7 +42,7 @@ func (o *overlayService) serve(sockPath string) error {
 		}
 		o.attach(&fdLink{f: os.NewFile(uintptr(fd), "vgtun"), mtu: overlayMTU})
 		fmt.Fprintf(os.Stderr, "[overlay] received sandbox TUN fd — forwarding attached\n")
-	}()
+	})
 	return nil
 }
 

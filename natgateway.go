@@ -117,7 +117,7 @@ func newNATGateway(parent context.Context, write func([]byte) error,
 	udpFwd := udp.NewForwarder(g.st, g.handleUDP)
 	g.st.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
-	go g.egressPump()
+	safeGo("natgw.egressPump", func() { g.egressPump() })
 	return g, nil
 }
 
@@ -170,7 +170,7 @@ func (g *natGateway) handleTCP(r *tcp.ForwarderRequest) {
 	inner := gonet.NewTCPConn(&wq, ep)
 
 	g.tcpFlows.Add(1)
-	go func() {
+	safeGo("natgw.tcpFlow", func() {
 		defer g.tcpFlows.Add(-1)
 		defer inner.Close()
 		dst := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprint(id.LocalPort))
@@ -180,13 +180,14 @@ func (g *natGateway) handleTCP(r *tcp.ForwarderRequest) {
 		}
 		defer outer.Close()
 		spliceConns(inner, outer, gwTCPIdle)
-	}()
+	})
 }
 
 // spliceConns pumps both directions until either side closes or the flow idles out.
 func spliceConns(a, b net.Conn, idle time.Duration) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
+		defer func() { done <- struct{}{} }() // signal even on panic (guard recovers it) — the sibling must not hang
 		buf := make([]byte, 32<<10)
 		for {
 			_ = src.SetReadDeadline(time.Now().Add(idle))
@@ -200,10 +201,9 @@ func spliceConns(a, b net.Conn, idle time.Duration) {
 				break
 			}
 		}
-		done <- struct{}{}
 	}
-	go cp(a, b)
-	go cp(b, a)
+	safeGo("natgw.copyPump", func() { cp(a, b) })
+	safeGo("natgw.copyPump", func() { cp(b, a) })
 	<-done // either direction ending tears the flow down (closes unblock the sibling)
 	_ = a.Close()
 	_ = b.Close()
@@ -225,7 +225,7 @@ func (g *natGateway) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	inner := gonet.NewUDPConn(&wq, ep)
 
 	g.udpFlows.Add(1)
-	go func() {
+	safeGo("natgw.udpFlow", func() {
 		defer g.udpFlows.Add(-1)
 		defer inner.Close()
 		if id.LocalPort == 53 {
@@ -239,7 +239,7 @@ func (g *natGateway) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 		}
 		defer outer.Close()
 		spliceConns(inner, outer, gwUDPIdle)
-	}()
+	})
 	return true
 }
 

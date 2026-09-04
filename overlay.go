@@ -122,10 +122,39 @@ func (l *fdLink) ReadPacket() ([]byte, error) {
 func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return err }
 func (l *fdLink) Close() error               { return l.f.Close() }
 
-func newOverlayService(ctx context.Context, h host.Host, r peerRouter) *overlayService {
-	return &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
+// newOverlayService — lm is the always-on link maintainer, injected HERE because this wiring was once a field
+// assignment ("o.linkm = ...") that every TEST performed and production NEVER did: with linkm nil, no friend
+// connection ever got a datagram receive loop and inbound heartbeats were ignored, so pongs never happened in
+// the field — the LAN ran blind while the state machine guessed. Constructor injection makes the
+// forgotten-wiring class unrepresentable; nil stays legal for overlay-only tests (and disables the trust gate).
+func newOverlayService(ctx context.Context, h host.Host, r peerRouter, lm *linkMaintainer) *overlayService {
+	o := &overlayService{parent: ctx, host: h, router: r, routes: map[string]peer.ID{},
 		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{},
-		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}}
+		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}, linkm: lm}
+	if lm != nil {
+		// The maintainer re-kicks receive loops from its tick: a conn that predated friend membership (a bitswap
+		// dial, a presence stream) would otherwise NEVER get a loop — the dgRecv dedupe means a miss was permanent.
+		lm.ensureRecvLoops = func(pid peer.ID) {
+			for _, c := range h.Network().ConnsToPeer(pid) {
+				o.maybeStartDatagramLoop(c)
+			}
+		}
+	}
+	return o
+}
+
+// dialPeerDirect forces a DIRECT dial attempt even while a relayed/TCP connection exists. dialPeer's
+// Connectedness short-circuit made every "upgrade nudge" a no-op for the maintainer: as long as ANY conn was up
+// (relay, TCP over a tunnel iface), h.Connect returned early and the better path was never tried. This uses the
+// swarm's force-direct escape hatch — mDNS-learned same-LAN addrs in the peerstore finally get dialed.
+func dialPeerDirect(ctx context.Context, h host.Host, router peerRouter, pid peer.ID) error {
+	ctx = network.WithForceDirectDial(ctx, "vg-lan-upgrade")
+	if router != nil {
+		if ai, err := router.FindPeer(ctx, pid); err == nil {
+			return h.Connect(ctx, ai)
+		}
+	}
+	return h.Connect(ctx, peer.AddrInfo{ID: pid})
 }
 
 // dialPeer ensures a connection to pid (resolving via the router/DHT if not already connected).
@@ -431,6 +460,14 @@ func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
 	if forceStreamOverlay {
 		return false // A/B harness: force the old reliable-stream path to compare against datagrams
 	}
+	// TRUST GATE (Invariant 2, overlaylink.go): a direct QUIC conn is not enough — its datagram path must be
+	// PROVEN by heartbeat pongs. A half-dead/one-way path (hairpin punch, asymmetric firewall) reports
+	// send-success while eating every packet — measured live as 100% one-way loss with the link showing
+	// "direct". Until proven (and whenever pongs stop) the packet rides the reliable stream instead: delivery
+	// is never entrusted to an unverified path; the datagram win is an upgrade, not a prerequisite.
+	if o.linkm != nil && !o.linkm.datagramsTrusted(pid) {
+		return false
+	}
 	qc := quicConnTo(o.host, pid)
 	if qc == nil {
 		return false // no direct QUIC connection (relayed/TCP, or not connected yet) → stream fallback
@@ -573,7 +610,10 @@ func (o *overlayService) sendStream(ctx context.Context, pid peer.ID) (network.S
 	if err := dialPeer(ctx, o.host, o.router, pid); err != nil {
 		return nil, err
 	}
-	s, err := o.host.NewStream(ctx, pid, overlayProtoID)
+	// WithAllowLimitedConn: without it, NewStream refuses to open over a RELAYED (circuit-v2 "limited")
+	// connection — so a relay-only pair (hole-punch failed) had NO working overlay path at all: datagrams need a
+	// direct conn AND the "reliable fallback" couldn't open. The stream must work over ANY connection.
+	s, err := o.host.NewStream(network.WithAllowLimitedConn(ctx, "vidyagod-overlay"), pid, overlayProtoID)
 	if err != nil {
 		return nil, err
 	}

@@ -58,7 +58,7 @@ func (n *node) runNetworkTest() []netCheck {
 	put := func(c netCheck) { mu.Lock(); out[c.Name] = c; mu.Unlock() }
 
 	var wg sync.WaitGroup
-	run := func(f func()) { wg.Add(1); go func() { defer wg.Done(); f() }() }
+	run := func(f func()) { wg.Add(1); safeGo("nettest.check", func() { defer wg.Done(); f() }) }
 
 	run(func() { put(n.checkHTTPS(ctx)) })
 	run(func() { put(n.checkDoH(ctx)) })
@@ -214,14 +214,14 @@ func (n *node) checkMDNS(ctx context.Context) netCheck {
 	entries := make(chan *zeroconf.ServiceEntry, 16)
 	heard := map[string]bool{}
 	done := make(chan struct{})
-	go func() {
+	safeGo("nettest.mdnsListen", func() {
 		defer close(done)
 		for e := range entries {
 			if e != nil && e.Instance != "" {
 				heard[e.Instance] = true
 			}
 		}
-	}()
+	})
 	err := zeroconf.Browse(cctx, "_p2p._udp", "local.", entries)
 	<-done
 	if err != nil && len(heard) == 0 {

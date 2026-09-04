@@ -36,9 +36,9 @@ func (n *node) setSeedLevels(colls, pkgs []cid.Cid) {
 	n.seedStarted = true
 	n.seedMu.Unlock()
 	if start {
-		go n.seedAnnounceLoop()
+		safeGo("node.seedAnnounceLoop", func() { n.seedAnnounceLoop() })
 	} else {
-		go n.runSeedAnnounce()
+		safeGo("node.runSeedAnnounce", func() { n.runSeedAnnounce() })
 	}
 }
 
@@ -135,7 +135,7 @@ func (n *node) announcePass(label string, cids []cid.Cid) {
 	var wg sync.WaitGroup
 	for i := 0; i < seedProvideConcurrency; i++ {
 		wg.Add(1)
-		go func() {
+		safeGo("node.seedProvideWorker", func() {
 			defer wg.Done()
 			for c := range jobs {
 				if n.ctx.Err() != nil {
@@ -150,7 +150,7 @@ func (n *node) announcePass(label string, cids []cid.Cid) {
 					n.seedMu.Unlock()
 				}
 			}
-		}()
+		})
 	}
 	for _, c := range cids {
 		select {

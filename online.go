@@ -61,7 +61,8 @@ func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, coun
 			continue
 		}
 		wg.Add(1)
-		go func(idx int, rr routing.ContentDiscovery) {
+		safeGo("finder.fanout", func() {
+			idx, rr := i, r
 			defer wg.Done()
 			t0 := time.Now()
 			n := 0
@@ -77,9 +78,9 @@ func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, coun
 				}
 			}
 			fmt.Fprintf(os.Stderr, "[finder] router %d: %d providers total in %s\n", idx, n, time.Since(t0))
-		}(i, r)
+		})
 	}
-	go func() { wg.Wait(); close(out) }()
+	safeGo("finder.close", func() { wg.Wait(); close(out) })
 	return out
 }
 
@@ -230,7 +231,7 @@ func (n *node) goOnline() error {
 		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
 		n.friend.start()
 		n.friend.startPresence(45 * time.Second)
-		// ALWAYS-ON link maintainer (overlaylink.go): heartbeat + auto-reconnect + hole-repunch per accepted
+		// ALWAYS-ON link maintainer (overlaylink.go): heartbeat + auto-reconnect + datagram-path proving per accepted
 		// friend for the app's lifetime — the LAN's links are warm BEFORE any game launches, and the UI gets
 		// live per-friend link state. Membership is re-read from the address book every beat.
 		n.linkm = newLinkMaintainer(n.ctx, h, kad, func() map[peer.ID]string {
@@ -255,7 +256,7 @@ func (n *node) goOnline() error {
 		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
 		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
-		n.overlay = newOverlayService(n.ctx, h, kad)
+		n.overlay = newOverlayService(n.ctx, h, kad, n.linkm)
 		n.overlay.start()
 	}
 
@@ -307,18 +308,18 @@ func (n *node) announce(c cid.Cid) {
 		n.seedDone[c.String()] = struct{}{}
 	}
 	n.seedMu.Unlock()
-	go func() {
+	safeGo("node.announceProvide", func() {
 		if err := n.provider.Provide(n.ctx, c, true); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
 		}
-	}()
+	})
 }
 
 // relayPeerSource feeds AutoRelay with candidate relays from the DHT routing table — public, well-connected peers;
 // those that support circuit-relay-v2 get used. Called by AutoRelay at runtime (n.dht/n.host are set by then).
 func (n *node) relayPeerSource(ctx context.Context, num int) <-chan peer.AddrInfo {
 	out := make(chan peer.AddrInfo)
-	go func() {
+	safeGo("node.relayPeerSource", func() {
 		defer close(out)
 		if n.dht == nil || n.host == nil {
 			return
@@ -339,7 +340,7 @@ func (n *node) relayPeerSource(ctx context.Context, num int) <-chan peer.AddrInf
 				return
 			}
 		}
-	}()
+	})
 	return out
 }
 
@@ -350,6 +351,11 @@ type mdnsNotifee struct {
 }
 
 func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Keep the discovered same-LAN addrs for an hour (Connect alone records them with a temp TTL of minutes):
+	// the link maintainer's force-direct upgrade dials need them to still be there when a relayed/unproven link
+	// nudges an upgrade — this is what turns "two PCs on the same LAN" into a direct local connection instead of
+	// a hairpin punch.
+	m.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
 	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	defer cancel()
 	_ = m.h.Connect(ctx, pi)
@@ -358,7 +364,7 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 // reprovideKeys streams the recursively-pinned roots for the reprovider to announce.
 func (n *node) reprovideKeys(ctx context.Context) (<-chan cid.Cid, error) {
 	ch := make(chan cid.Cid)
-	go func() {
+	safeGo("node.reprovideKeys", func() {
 		defer close(ch)
 		for sp := range n.pinner.RecursiveKeys(ctx, false) {
 			if sp.Err != nil {
@@ -370,7 +376,7 @@ func (n *node) reprovideKeys(ctx context.Context) (<-chan cid.Cid, error) {
 				return
 			}
 		}
-	}()
+	})
 	return ch, nil
 }
 
@@ -379,12 +385,12 @@ func (n *node) bootstrap() {
 	var wg sync.WaitGroup
 	for _, pi := range dht.GetDefaultBootstrapPeerAddrInfos() {
 		wg.Add(1)
-		go func(pi peer.AddrInfo) {
+		safeGo("node.bootstrapDial", func() {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 			defer cancel()
 			_ = n.host.Connect(ctx, pi)
-		}(pi)
+		})
 	}
 	wg.Wait()
 	_ = n.dht.Bootstrap(n.ctx)

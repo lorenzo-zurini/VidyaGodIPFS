@@ -167,7 +167,7 @@ func openNode(repoPath string) error {
 		// process — convert it to an error so the existing retry path handles it, leaving a usable offline node.
 		if err := guardErr("goOnline", gNode.goOnline); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] goOnline failed: %v — retrying in background\n", err)
-			go retryOnline(gNode)
+			safeGo("node.retryOnline", func() { retryOnline(gNode) })
 		}
 	}
 	return nil
@@ -243,10 +243,10 @@ func (n *node) scheduleCompaction() {
 	if n.ldb == nil || !n.compacting.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	safeGo("node.compaction", func() {
 		defer n.compacting.Store(false)
 		_ = n.ldb.DB.CompactRange(goleveldbutil.Range{})
-	}()
+	})
 }
 
 // get returns the live node or nil.

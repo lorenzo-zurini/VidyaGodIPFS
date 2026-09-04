@@ -41,7 +41,7 @@ func (n *node) warmProviders(c cid.Cid) {
 	if _, busy := warmInflight.LoadOrStore(c.String(), struct{}{}); busy {
 		return
 	}
-	go func() {
+	safeGo("node.warmProviders", func() {
 		defer warmInflight.Delete(c.String())
 		ctx, cancel := context.WithTimeout(n.ctx, 40*time.Second)
 		defer cancel()
@@ -57,9 +57,9 @@ func (n *node) warmProviders(c cid.Cid) {
 				fdbg("warm: first provider %s after %s (walk)", shortPeer(pi.ID.String()), time.Since(t0).Round(time.Millisecond))
 				first = false
 			}
-			go n.freshenAndConnect(ctx, pi) // one goroutine per provider — never serialize behind a slow FindPeer
+			safeGo("node.freshenAndConnect", func() { n.freshenAndConnect(ctx, pi) }) // one goroutine per provider — never serialize behind a slow FindPeer
 		}
-	}()
+	})
 }
 
 // freshenAndConnect learns a peer's CURRENT addresses via a live DHT walk (bypassing possibly-stale peerstore entries)
@@ -75,7 +75,7 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	// whichever connects first wins, the other no-ops.
 	if len(pi.Addrs) > 0 {
 		n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, 10*time.Minute)
-		go n.dialWarm(ctx, peer.AddrInfo{ID: pi.ID, Addrs: pi.Addrs}, "record")
+		safeGo("node.dialWarm", func() { n.dialWarm(ctx, peer.AddrInfo{ID: pi.ID, Addrs: pi.Addrs}, "record") })
 	}
 	// REFRESH PATH (bounded): a live FindPeer walk gets CURRENT addresses when the record is stale (an old relay
 	// reservation). On a hostile DHT this walk can take tens of seconds — longer than the whole fetch — so it MUST be

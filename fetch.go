@@ -318,7 +318,7 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 	}
 	stop := make(chan struct{})
 	var stalled atomic.Bool
-	go func() {
+	safeGo("fetch.progress", func() {
 		t := time.NewTicker(250 * time.Millisecond)
 		defer t.Stop()
 		last, lastGrow := int64(-1), time.Now()
@@ -344,7 +344,7 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 				}
 			}
 		}
-	}()
+	})
 	werr := files.WriteTo(fnode, tmp)
 	close(stop)
 	if werr != nil {
@@ -642,7 +642,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		var lastBlk atomic.Int64
 		lastBlk.Store(time.Now().UnixNano())
 		var stalled atomic.Bool
-		go func() {
+		safeGo("fetch.worker", func() {
 			t := time.NewTicker(200 * time.Millisecond)
 			defer t.Stop()
 			for {
@@ -663,7 +663,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 					}
 				}
 			}
-		}()
+		})
 
 		// One long-lived bitswap SESSION with a SINGLE continuous want-list for EVERY missing leaf — the session pipelines
 		// to link speed with its own bounded in-flight window, and blocks stream in out of order. THROUGHPUT-CRITICAL: the
@@ -686,7 +686,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		var rateBytes, rateBlocks atomic.Int64
 		var rateMaxGapMs atomic.Int64
 		if os.Getenv("VG_FETCH_RATE") != "" {
-			go func() {
+			safeGo("fetch.rateLogger", func() {
 				t := time.NewTicker(1 * time.Second)
 				defer t.Stop()
 				sec := 0
@@ -703,7 +703,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 							shortCid(root), sec, float64(b)/1e6, k, g)
 					}
 				}
-			}()
+			})
 		}
 
 		const dropBatch = 256 // ~64 MiB of received blocks before the flusher reclaims them → bounded residency
@@ -736,7 +736,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		dropSig := make(chan struct{}, 1)
 		var flusher sync.WaitGroup
 		flusher.Add(1)
-		go func() {
+		safeGo("fetch.pump", func() {
 			defer flusher.Done()
 			t := time.NewTicker(2 * time.Second)
 			defer t.Stop()
@@ -751,7 +751,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 					doDrop()
 				}
 			}
-		}()
+		})
 
 		// WANT WINDOWING: bitswap SERVERS truncate each peer's queued wantlist (boxo default: 1024 entries, silently
 		// dropping the overflow), and the cap is PER PEER across ALL sessions — so one big file, or three concurrent
@@ -770,7 +770,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			wantChunks = v
 		}
 		blkCh := make(chan blocks.Block, 64)
-		go func() {
+		safeGo("fetch.pump", func() {
 			defer close(blkCh)
 			slots := make(chan struct{}, wantChunks)
 			var cwg sync.WaitGroup
@@ -787,7 +787,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 				}
 				ch := sess.GetBlocks(fctx, need[start:end])
 				cwg.Add(1)
-				go func(ch <-chan blocks.Block) {
+				safeGo("fetch.blockConsumer", func() {
 					defer cwg.Done()
 					for b := range ch {
 						select {
@@ -797,10 +797,10 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 						}
 					}
 					<-slots
-				}(ch)
+				})
 			}
 			cwg.Wait()
-		}()
+		})
 
 		for blk := range blkCh {
 			now := time.Now().UnixNano()

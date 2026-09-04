@@ -93,7 +93,7 @@ func (n *node) startBenchObserver() {
 	if !benchObserve() || n.host == nil {
 		return
 	}
-	go func() {
+	safeGo("bench.observer", func() {
 		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
 		for {
@@ -104,7 +104,7 @@ func (n *node) startBenchObserver() {
 				n.logBenchSnapshot()
 			}
 		}
-	}()
+	})
 }
 
 func (n *node) logBenchSnapshot() {

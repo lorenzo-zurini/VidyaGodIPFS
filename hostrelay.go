@@ -119,7 +119,7 @@ func (r *hostRelay) ensure(port uint16) *net.UDPConn {
 		return nil // port taken by a host service — reflection for it is simply off
 	}
 	r.socks[port] = c
-	go r.recvLoop(port, c)
+	safeGo("hostrelay.recvLoop", func() { r.recvLoop(port, c) })
 	return c
 }
 
