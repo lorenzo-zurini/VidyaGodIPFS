@@ -21,6 +21,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"time"
 	"unsafe"
 
 	cid "github.com/ipfs/go-cid"
@@ -556,6 +557,48 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 	err := n.fetchToPath(cs, d,
 		func(pct float64) { emit(kindProgress, pct, 0, nil) },
 		func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
+	if err != nil {
+		ec := C.CString(err.Error())
+		defer C.free(unsafe.Pointer(ec))
+		emit(kindFinished, -1, 0, ec)
+		setStr(errOut, err.Error())
+		return -1
+	}
+	emit(kindFinished, 100, 1, nil)
+	return 0
+}
+
+// VgFetchToPathBounded is VgFetchToPath with a WALL-CLOCK BUDGET for SYNCHRONOUS callers (launch-time layer
+// materialization, cover fetches) that must not hang a user action forever. It waits up to timeoutMs for the
+// (unbounded, retry-forever) fetch; on timeout it returns an error while the fetch CONTINUES in the background,
+// so a later launch/repaint finds it progressed or done. timeoutMs<=0 waits forever (== VgFetchToPath).
+//
+//export VgFetchToPathBounded
+func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	cs := C.GoString(cidStr)
+	d := C.GoString(dest)
+	ccid := C.CString(cs)
+	defer C.free(unsafe.Pointer(ccid))
+	emit := func(kind int, pct float64, ok int, errc *C.char) {
+		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
+	}
+	emit(kindStarted, -1, 0, nil)
+	var err error
+	if timeoutMs > 0 {
+		err = n.fetchToPathDeadline(cs, d,
+			func(pct float64) { emit(kindProgress, pct, 0, nil) },
+			func(pct float64) { emit(kindFinalizing, pct, 0, nil) },
+			time.Duration(timeoutMs)*time.Millisecond)
+	} else {
+		err = n.fetchToPath(cs, d,
+			func(pct float64) { emit(kindProgress, pct, 0, nil) },
+			func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
+	}
 	if err != nil {
 		ec := C.CString(err.Error())
 		defer C.free(unsafe.Pointer(ec))

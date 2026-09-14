@@ -191,8 +191,13 @@ func (n *node) goOnline() error {
 	bsn := bsnet.NewFromIpfsHost(h)
 	var finder routing.ContentDiscovery = kad
 	// DoH-resolving HTTP client so the indexer host (delegated-ipfs.dev) also resolves through a DNS filter.
+	// friendFinder makes our accepted friends providers for EVERY cid (friendprovider.go) — the only content router
+	// that still works when the DHT is dead and the delegated indexer knows only a throttling third party. Listed
+	// FIRST so a friend who has the content is asked immediately, before the slow/rate-limited routers answer.
 	if hc, herr := routinghttp.New("https://delegated-ipfs.dev", routinghttp.WithHTTPClient(dohHTTPClient(newDoHResolver()))); herr == nil {
-		finder = combinedFinder{routers: []routing.ContentDiscovery{kad, routinghttpcr.NewContentRoutingClient(hc)}}
+		finder = combinedFinder{routers: []routing.ContentDiscovery{friendFinder{n}, kad, routinghttpcr.NewContentRoutingClient(hc)}}
+	} else {
+		finder = combinedFinder{routers: []routing.ContentDiscovery{friendFinder{n}, kad}}
 	}
 	n.upSeen = make(map[string]int64)
 	// Concurrent-UPLOAD tuning. boxo's server defaults cap a SINGLE peer to 1 MiB of outstanding (in-flight) block

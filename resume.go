@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"path/filepath"
 )
 
 // errIncomplete: the fetch stalled or the session dropped before every leaf arrived, but the partial (dest.tmp +
@@ -41,6 +42,14 @@ func (p *partBits) allSet() bool { return p.nset == p.count }
 
 func partPath(dest string) string { return dest + ".part" }
 func tmpPath(dest string) string  { return dest + ".tmp" }
+
+// partExists reports whether a resume sidecar is present. Because finalize removes the .part only as its LAST step
+// (after reference+pin+announce all succeed), a .part sitting next to a complete dest is the unambiguous signature of
+// a fetch that crashed mid-finalize — the caller re-runs the idempotent finalize to converge it.
+func partExists(dest string) bool {
+	_, err := os.Stat(partPath(dest))
+	return err == nil
+}
 
 // removePartial discards a partial fetch (its tmp + part) — an explicit cancel or a completed finalize.
 func removePartial(dest string) {
@@ -92,8 +101,32 @@ func savePart(dest string, p *partBits) error {
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(p.count))
 	buf = append(buf, p.bits...)
 	sib := partPath(dest) + ".w"
-	if err := os.WriteFile(sib, buf, 0o644); err != nil {
+	// fsync the sidecar's bytes to disk BEFORE the rename, and fsync the parent directory AFTER, so a power loss
+	// can never leave a renamed-but-empty .part (rename metadata durable while the data blocks are not) — that would
+	// resume against a zero/garbage bitmap. On a normal crash (process killed, disk intact) the plain write+rename
+	// already suffices; this is the belt-and-braces path for power loss / kernel panic.
+	f, err := os.OpenFile(sib, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(sib, partPath(dest))
+	if _, err := f.Write(buf); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(sib, partPath(dest)); err != nil {
+		return err
+	}
+	// Best-effort parent-dir fsync so the rename itself is durable across power loss.
+	if d, derr := os.Open(filepath.Dir(dest)); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

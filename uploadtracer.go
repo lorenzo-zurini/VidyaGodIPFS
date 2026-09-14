@@ -24,7 +24,8 @@ type upTracer struct{ n *node }
 // can discover it, instead of waiting for the sweep. Cheap on the hot path: a map lookup per want; announce() (which
 // also marks it seeding) only fires for an as-yet-unannounced pinned root, and marks seedDone synchronously so a burst
 // of wants for the same CID triggers exactly one publish.
-func (t upTracer) MessageReceived(_ peer.ID, m bsmsg.BitSwapMessage) {
+func (t upTracer) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
+	wire.received(p, m) // wiretrace.go: per-peer wire accounting for the fetch tracer (no-op unless tracing)
 	wl := m.Wantlist()
 	if len(wl) == 0 {
 		return
@@ -48,7 +49,8 @@ func (t upTracer) MessageReceived(_ peer.ID, m bsmsg.BitSwapMessage) {
 	}
 }
 
-func (t upTracer) MessageSent(_ peer.ID, m bsmsg.BitSwapMessage) {
+func (t upTracer) MessageSent(p peer.ID, m bsmsg.BitSwapMessage) {
+	wire.sent(p, m) // wiretrace.go
 	blocks := m.Blocks()
 	if len(blocks) == 0 {
 		return

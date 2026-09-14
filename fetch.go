@@ -50,6 +50,65 @@ var errNotRawLeaves = errors.New("not all-raw-leaves")
 // (HH:MM:SS.mmm) so a "stuck for a minute" gap is visible directly in the log.
 var dbgFetch = os.Getenv("VG_FETCH_DEBUG") != ""
 
+// wantBudget is the TOTAL outstanding block-wants this process may have across ALL concurrent fetches. It is a
+// hard global cap enforced by a token pool (below), NOT a per-fetch number — so no matter how many downloads run
+// at once, the combined wants we send to any single peer stay under the stock-boxo 1024/peer server cap. Kept
+// under 1024 with margin. One fetch alone can hold the whole budget (fast); N fetches SHARE it fairly through the
+// pool, which is the concrete meaning of "concurrent transfers must not collectively overload one peer".
+const wantBudget = 768
+
+// maxPerFetch caps how many tokens ONE fetch may hold, so a single download — especially a trickling one whose
+// stragglers hold tokens until its stall watchdog fires — cannot starve every other fetch of the whole budget.
+// Half the budget: one fetch alone still gets a 96MiB pipeline (plenty above any BDP), and two fetches always
+// both make progress.
+var maxPerFetch = wantBudget / 2 // var (not const) so tests can shrink it to prove it binds independently of the pool
+
+// wantPool is a counting semaphore of outstanding-want tokens. A fetch's rolling window acquires a token per
+// in-flight want and releases it when the block lands (or when the fetch ends), so len(tokens-in-use) — summed
+// across every fetch — never exceeds wantBudget. This is provable by construction, unlike a per-fetch window
+// that is fixed at session start (which, with staggered starts, can transiently exceed the cap).
+type wantPool struct{ tokens chan struct{} }
+
+func newWantPool(n int) *wantPool {
+	p := &wantPool{tokens: make(chan struct{}, n)}
+	for i := 0; i < n; i++ {
+		p.tokens <- struct{}{}
+	}
+	return p
+}
+
+// acquire blocks for one token, returning false if ctx is cancelled first (teardown). tryAcquire never blocks.
+func (p *wantPool) acquire(ctx context.Context) bool {
+	select {
+	case <-p.tokens:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+func (p *wantPool) tryAcquire() bool {
+	select {
+	case <-p.tokens:
+		return true
+	default:
+		return false
+	}
+}
+func (p *wantPool) release() {
+	select {
+	case p.tokens <- struct{}{}:
+	default: // pool already full — never happens if acquire/release are balanced; guards against a double release
+	}
+}
+func (p *wantPool) available() int { return len(p.tokens) }
+
+var globalWantPool = newWantPool(wantBudget)
+
+// lastFetchLeaves records the unique-leaf count of the most recent writeThrough transfer phase. Test-only
+// observability: it lets a test assert the rolling window actually had many leaves to roll through (guarding
+// against a degenerate fixture whose chunks all dedup to one block, which would make the window a no-op).
+var lastFetchLeaves atomic.Int64
+
 func fdbg(format string, a ...interface{}) {
 	if dbgFetch {
 		fmt.Fprintf(os.Stderr, "[fetchdbg %s] "+format+"\n", append([]interface{}{time.Now().Format("15:04:05.000")}, a...)...)
@@ -62,16 +121,45 @@ func fdbg(format string, a ...interface{}) {
 // the root from the now-local blockstore. On a normal network the root arrives fast and the gateway is never touched.
 func (n *node) getRoot(c cid.Cid, cidStr string, onProgress func(pct float64)) (ipld.Node, error) {
 	getCtx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	defer cancel()
+	// Honour a user-cancel DURING the (up to 30s) root fetch AND the gateway fallback below — both run under
+	// getCtx. Without this a cancelled download blocks a waiter (and holds a download slot) for the full timeout.
+	// The poller exits when getCtx is done (the deferred cancel) or when told to stop after the fetch returns.
+	stopPoll := make(chan struct{})
+	safeGo("fetch.getRootCancel", func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-getCtx.Done():
+				return
+			case <-t.C:
+				if isCancelled(cidStr) {
+					cancel()
+					return
+				}
+			}
+		}
+	})
 	root, err := n.dserv.Get(getCtx, c)
-	cancel()
 	if err == nil {
+		close(stopPoll)
 		return root, nil
 	}
 	if isMissingFile(err) {
+		close(stopPoll)
 		return nil, errMissingFiles
 	}
+	if n.dht == nil {
+		close(stopPoll)
+		return nil, err // offline (unit tests / pre-goOnline): no DHT means no network — do not touch real gateways
+	}
 	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
-	if gerr := n.fetchViaGateway(n.ctx, c, onProgress); gerr != nil {
+	gerr := n.fetchViaGateway(getCtx, c, onProgress) // under getCtx: a cancel interrupts the gateway CAR too
+	close(stopPoll)
+	if gerr != nil {
 		fdbg("getRoot: gateway fallback failed cid=%s: %v", cidStr, gerr)
 		return nil, err // surface the original network error
 	}
@@ -129,6 +217,51 @@ func (r *refLeaf) Size() (uint64, error)                              { return u
 // the backing file was deleted. Surfaced to the UI as "Errored: missing files" rather than a cryptic open() error.
 var errMissingFiles = errors.New("missing files")
 
+// errStr is err.Error() but nil-safe, for classifying an attempt outcome without a panic on a nil error.
+func errStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// errLocalFatal marks an error that retrying can NEVER fix — a malformed CID, a disk error (ENOSPC/EROFS/EACCES),
+// a datastore/pin failure. The retry loop treats it as terminal (and logs it loudly) instead of spinning forever;
+// the network-transient errors are the only ones that retry. localFatal wraps a concrete error as this class.
+var errLocalFatal = errors.New("local fatal")
+
+func localFatal(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", errLocalFatal, err)
+}
+
+// sleepOrCancel waits d, returning true if a user-cancel arrived during the wait (polled every 250ms so a cancel
+// is honoured promptly instead of after a full 30s backoff — the slot is freed and the waiter unblocked quickly).
+// Returns false if the full delay elapsed (or the node is shutting down — the caller then checks n.ctx).
+func (n *node) sleepOrCancel(cidStr string, d time.Duration) bool {
+	const step = 250 * time.Millisecond
+	deadline := time.Now().Add(d)
+	for {
+		if isCancelled(cidStr) {
+			return true
+		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return false
+		}
+		if remain > step {
+			remain = step
+		}
+		select {
+		case <-time.After(remain):
+		case <-n.ctx.Done():
+			return false
+		}
+	}
+}
+
 // isMissingFile detects a filestore reference whose backing file is gone (deleted package content).
 func isMissingFile(err error) bool {
 	if err == nil {
@@ -162,9 +295,36 @@ func isCancelled(c string) bool {
 // fetchToPath de-duplicates by dest (see fetchGroup) then runs the resumable retry loop. Concurrent callers for the
 // same dest share ONE fetch and its result — the leader drives the transfer callbacks; joiners just wait + get the
 // same error, so they never race on the same tmp/dest files.
-func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+// maxAttempts==0 means UNBOUNDED (retry-forever) — background downloads, which must never give up on a transient
+// failure. A positive maxAttempts bounds the retries — the SYNCHRONOUS callers (launch materialization, cover
+// fetch) that must fail cleanly instead of hanging a user action forever when content is genuinely unreachable.
+// fetchToPathDeadline is fetchToPath for SYNCHRONOUS callers that must not block a user action forever (launch
+// layer materialization, cover fetches). The deadline is enforced INSIDE the retry loop and the call is fully
+// SYNCHRONOUS — there is no background goroutine to outlive the call, so the C callback string's lifetime is
+// exactly the call (no use-after-free) and nothing is left running as a "ghost" fetch. budget<=0 == fetchToPath.
+//
+// Caveat (documented, rare): fetchGroup de-dupes by dest, so if a bounded caller JOINS an already-in-flight
+// UNBOUNDED background download of the same path, it waits for that leader (its own deadline can't shorten the
+// leader). Covers never collide with downloads (distinct dests); a launch colliding with a background download of
+// the same layer waits for the content it needs anyway, and the user can cancel the download to release it.
+func (n *node) fetchToPathDeadline(cidStr, dest string, onProgress, onFinalize func(pct float64), budget time.Duration) error {
+	deadline := time.Time{}
+	if budget > 0 {
+		deadline = time.Now().Add(budget)
+	}
 	v, err, shared := fetchGroup.Do(dest, func() (interface{}, error) {
-		return nil, n.fetchToPathLoop(cidStr, dest, onProgress, onFinalize)
+		return nil, n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, deadline)
+	})
+	_ = v
+	if shared {
+		fdbg("fetchToPathDeadline JOINED an in-flight fetch (deduped) cid=%s dest=%s err=%v", cidStr, dest, err)
+	}
+	return err
+}
+
+func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64)) error {
+	v, err, shared := fetchGroup.Do(dest, func() (interface{}, error) {
+		return nil, n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, time.Time{})
 	})
 	_ = v
 	if shared {
@@ -173,7 +333,7 @@ func (n *node) fetchToPath(cidStr, dest string, onProgress func(pct float64), on
 	return err
 }
 
-func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize func(pct float64), deadline time.Time) error {
 	backoff := 2 * time.Second
 	missTries := 0
 	fdbg("fetchToPath ENTER cid=%s dest=%s", cidStr, dest)
@@ -182,6 +342,10 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 			fdbg("fetchToPath cancelled before attempt %d cid=%s", attempt, cidStr)
 			removePartial(dest)
 			return errors.New("cancelled")
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			fdbg("fetchToPath deadline exceeded before attempt %d cid=%s", attempt, cidStr)
+			return fmt.Errorf("fetch of %s did not complete before its deadline", cidStr)
 		}
 		// Proactively freshen provider addresses (warm.go) on EVERY attempt — not just the first: a live DHT walk +
 		// connect in parallel with bitswap, so a provider that restarted (new ports) or came online mid-download is
@@ -193,6 +357,7 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 			n.warmProviders(c)
 			n.warmSeedLevelProviders()
 		}
+		n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces — connect so bitswap can ask them
 		start := time.Now()
 		fdbg("fetchToPath attempt %d START cid=%s", attempt, cidStr)
 		err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
@@ -208,9 +373,11 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 				backoff *= 2
 			}
 			fdbg("fetchToPath incomplete → backoff %s then resume cid=%s", backoff, cidStr)
-			select {
-			case <-time.After(backoff):
-			case <-n.ctx.Done():
+			if n.sleepOrCancel(cidStr, backoff) {
+				removePartial(dest)
+				return errors.New("cancelled")
+			}
+			if n.ctx.Err() != nil {
 				return n.ctx.Err()
 			}
 		case err == errMissingFiles:
@@ -224,8 +391,42 @@ func (n *node) fetchToPathLoop(cidStr, dest string, onProgress func(pct float64)
 				n.dropRef(c) // clear stale refs (+ cached blocks) so the retry fetches over the network
 				fdbg("fetchToPath dropRef closure cleared in %s cid=%s", time.Since(tdr).Round(time.Millisecond), cidStr)
 			}
+		case isCancelled(cidStr) || errStr(err) == "cancelled":
+			// The USER asked to stop (or a waiter cancelled us). Terminal.
+			fdbg("fetchToPath cancelled cid=%s", cidStr)
+			removePartial(dest)
+			return errors.New("cancelled")
+		case n.ctx.Err() != nil:
+			return n.ctx.Err() // node shutting down — terminal
+		case n.dht == nil:
+			// OFFLINE (unit tests / pre-goOnline): no network to retry against — terminal.
+			return err
+		case errors.Is(err, errLocalFatal):
+			// A LOCAL, permanent failure — malformed CID, disk full/read-only, datastore or pin error. Retrying
+			// cannot fix it and an infinite silent spin is the worst kind of "stuck", so this is TERMINAL and is
+			// logged at production level (not fdbg) so the failure is visible without VG_FETCH_DEBUG. "Never give
+			// up" means never give up on a NETWORK problem — not on a broken disk or corrupt input.
+			fmt.Fprintf(os.Stderr, "[fetch] FATAL (not retryable) cid=%s: %v\n", cidStr, err)
+			return err
 		default:
-			return err // hard io/decode error, or "cancelled"
+			// TRANSIENT / NETWORK: a root-fetch timeout, all-gateways failure, a dropped connection, a DHT that
+			// found nobody this pass. None mean the content is unobtainable — only that this attempt reached no
+			// provider. Back off and retry; a provider (our seeder, a friend, Pinata after a rate-limit, a peer
+			// that comes online later) may appear at any time. Unbounded for background downloads (maxAttempts==0);
+			// bounded for synchronous callers so a launch/cover can't hang. isCancelled + n.ctx are the exits.
+			if time.Since(start) > 5*time.Second { // made progress before failing → reset backoff
+				backoff = 2 * time.Second
+			} else if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			fdbg("fetchToPath attempt %d TRANSIENT (%v) → backoff %s then retry cid=%s", attempt, err, backoff, cidStr)
+			if n.sleepOrCancel(cidStr, backoff) {
+				removePartial(dest)
+				return errors.New("cancelled")
+			}
+			if n.ctx.Err() != nil {
+				return n.ctx.Err()
+			}
 		}
 	}
 }
@@ -381,11 +582,45 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	}
 	c, err := cid.Decode(cidStr)
 	if err != nil {
-		return err
+		return localFatal(err) // malformed CID — no retry can fix it
 	}
-	if st, err := os.Stat(dest); err == nil {
-		fdbg("fetchToPathOnce: dest already present (%d bytes) → no-op cid=%s", st.Size(), cidStr)
-		return nil // already present — no-op (matches the old FetchToPath semantics)
+	if _, err := os.Stat(dest); err == nil {
+		// dest already on disk. Two cases:
+		//  * no .part sidecar → finalize completed fully (referenced + pinned + announced) → fast no-op.
+		//  * .part still present → the fetch crashed AFTER the tmp→dest rename but BEFORE finalize finished
+		//    (referencing/pinning). The bytes are correct and complete, but the content is unreferenced (can't be
+		//    served) and unpinned (GC-vulnerable). addNoCopy is the idempotent finalize: it references the leaves in
+		//    place from the existing file and (re)pins+announces, converging any crash landing to a seedable state.
+		if !partExists(dest) {
+			fdbg("fetchToPathOnce: dest present, no .part → finalized → no-op cid=%s", cidStr)
+			return nil
+		}
+		fdbg("fetchToPathOnce: dest present WITH .part → finalize was interrupted, repairing cid=%s", cidStr)
+		// VERIFY the on-disk bytes hash to the requested CID BEFORE referencing or pinning anything. computeCid has
+		// NO side effects (throwaway in-memory store); addNoCopy would pin+announce FIRST, so on a content mismatch
+		// it would leave a pinned, announced provider record for content whose only backing file we then delete —
+		// an unserveable orphan. Hash first, commit second.
+		got, cerr := computeCid(dest)
+		switch {
+		case cerr != nil:
+			// The bytes on disk are unreadable/corrupt — discard and re-fetch clean (a fresh fetch fixes it).
+			fdbg("fetchToPathOnce: dest unreadable for repair (%v) → discard + re-fetch cid=%s", cerr, cidStr)
+			_ = os.Remove(dest)
+			removePartial(dest)
+		case got == c:
+			// Content is correct and complete → finish the finalize idempotently (reference in place + pin).
+			if _, aerr := n.addNoCopy(dest); aerr != nil {
+				return localFatal(aerr) // referencing/pinning a present, correct file failed = local/datastore error
+			}
+			removePartial(dest)
+			fdbg("fetchToPathOnce: repair OK cid=%s", cidStr)
+			return nil
+		default:
+			// dest holds DIFFERENT content than requested — discard WITHOUT ever pinning it, then re-fetch.
+			fdbg("fetchToPathOnce: dest content %s != requested %s → discard (unpinned) + re-fetch", got, cidStr)
+			_ = os.Remove(dest)
+			removePartial(dest)
+		}
 	}
 	// Orphaned reference: the node "has" this CID via a filestore reference, but the backing file was deleted.
 	// Surface it cleanly as "missing files" (→ "Errored: missing files" in the UI) instead of reading the gone
@@ -395,7 +630,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 		return errMissingFiles
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
+		return localFatal(err)
 	}
 
 	fdbg("fetchToPathOnce: fetching root block cid=%s", cidStr)
@@ -440,7 +675,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	_ = os.RemoveAll(tmp)
 	out, err := os.Create(tmp)
 	if err != nil {
-		return err
+		return localFatal(err)
 	}
 
 	buf := make([]byte, 1<<20)
@@ -457,7 +692,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 			if _, werr := out.Write(buf[:nr]); werr != nil {
 				_ = out.Close()
 				_ = os.Remove(tmp)
-				return werr
+				return localFatal(werr)
 			}
 			written += int64(nr)
 			if total > 0 && onProgress != nil {
@@ -483,14 +718,14 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 		}
 	}
 	if err := out.Close(); err != nil {
-		return err
+		return localFatal(err)
 	}
 	fdbg("fallback: read complete (%d bytes) → rename + addNoCopy re-hash cid=%s", written, cidStr)
 
 	// Publish atomically, then seed from the destination by reference (filestore) so dest IS the seed source.
 	_ = os.RemoveAll(dest)
 	if err := os.Rename(tmp, dest); err != nil {
-		return err
+		return localFatal(err)
 	}
 
 	// Online bitswap cached the fetched blocks in the plain blockstore. Drop that whole closure first: Filestore.Put
@@ -507,7 +742,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	n.dropClosure(c)
 	if _, err := n.addNoCopy(dest); err != nil {
 		fdbg("fallback: addNoCopy FAILED cid=%s err=%v", cidStr, err)
-		return err
+		return localFatal(err) // referencing/pinning a present file failed — local/datastore, terminal
 	}
 	fdbg("fallback: addNoCopy DONE in %s cid=%s", time.Since(addStart).Round(time.Millisecond), cidStr)
 	n.scheduleCompaction() // reclaim tombstone disk from the dropped bitswap-cached blocks
@@ -519,6 +754,88 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 // the slow "pinning" step the old path did via addNoCopy). Only the small dag-pb root/intermediate nodes remain as
 // plain blocks. Returns errNotRawLeaves if the DAG isn't all raw leaves (filestore refs require raw leaves; the
 // caller then falls back to read + re-add).
+// rollingGetBlocks streams every cid in `need` from a bitswap session as a ROLLING, bounded want-window and
+// delivers the blocks on the returned channel (arrival order). It is the fix for the head-of-line wedge: instead
+// of chunk slots that free only when a whole chunk arrives, it keeps a bounded number of wants outstanding and
+// admits a new one for every block that lands, so one straggler never stops the rest.
+//
+// The bound is the GLOBAL want-token pool (shared across all concurrent fetches, so their combined outstanding
+// wants stay under the stock-boxo 1024/peer server cap) plus a per-fetch cap (so one download can't monopolise
+// the budget). Token lifecycle is entirely LOCAL to each batch's fan goroutine — one token per requested key,
+// released when its block arrives OR when its GetBlocks channel closes without it (a straggler / ctx-cancel).
+// So tokens are always returned exactly, with no separate exit-drain and no cross-goroutine race. The channel
+// closes when every block has been delivered or ctx is cancelled (the caller's stall watchdog / user-cancel).
+func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []cid.Cid, refillBatch int) <-chan blocks.Block {
+	out := make(chan blocks.Block, 64)
+	safeGo("fetch.producer", func() {
+		defer close(out)
+		var held atomic.Int64 // want-tokens this fetch holds right now (producer +1 on acquire, fan -1 on release)
+		var fans sync.WaitGroup
+		// fan drains ONE GetBlocks batch channel, releasing exactly `batch` tokens (one per delivered block, the
+		// rest for keys the batch never delivered) so the pool is always balanced regardless of how it ends.
+		fan := func(ch <-chan blocks.Block, batch int) {
+			defer fans.Done()
+			// Release EXACTLY `batch` tokens no matter how this fan exits (all delivered, batch channel closed
+			// early on ctx-cancel, or blocked-on-send at cancel). A single deferred accounting guarantees it, so
+			// there is no exit path that can leak or double-release a token — the property the whole global budget
+			// depends on. released counts what we've already returned; the defer returns the remainder.
+			released := 0
+			relOne := func() {
+				released++
+				held.Add(-1)
+				globalWantPool.release()
+			}
+			defer func() {
+				for released < batch {
+					relOne()
+				}
+			}()
+			for b := range ch {
+				relOne() // this block's token is done the moment it arrives
+				select {
+				case out <- b:
+				case <-ctx.Done():
+					return // the defer returns the rest of the batch's tokens
+				}
+			}
+		}
+		requested := 0
+		for requested < len(need) {
+			if ctx.Err() != nil {
+				break
+			}
+			// Per-fetch cap: if we already hold maxPerFetch, wait for our own blocks to land (fans release tokens)
+			// rather than taking more of the shared budget. Cheap poll; a fan freeing room unblocks us.
+			if held.Load() >= int64(maxPerFetch) {
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-ctx.Done():
+				}
+				continue
+			}
+			// One blocking acquire (real backpressure — wait until the global budget has room), then top up without
+			// blocking to refillBatch, the per-fetch cap, or a momentarily-empty pool.
+			if !globalWantPool.acquire(ctx) {
+				break
+			}
+			held.Add(1)
+			got := 1
+			for got < refillBatch && requested+got < len(need) && held.Load() < int64(maxPerFetch) && globalWantPool.tryAcquire() {
+				held.Add(1)
+				got++
+			}
+			end := requested + got
+			ch := sess.GetBlocks(ctx, need[requested:end])
+			batch := got
+			fans.Add(1)
+			safeGo("fetch.blockConsumer", func() { fan(ch, batch) })
+			requested = end
+		}
+		fans.Wait()
+	})
+	return out
+}
+
 func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr string,
 	onProgress func(pct float64), onFinalize func(pct float64)) error {
 	fdbg("writeThrough ENTER cid=%s dest=%s", cidStr, dest)
@@ -600,12 +917,12 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		_ = os.RemoveAll(tmp)
 		f, cerr := os.Create(tmp)
 		if cerr != nil {
-			return cerr
+			return localFatal(cerr)
 		}
 		if terr := f.Truncate(off); terr != nil { // preallocate so out-of-order WriteAt lands correctly
 			_ = f.Close()
 			_ = os.Remove(tmp)
-			return terr
+			return localFatal(terr)
 		}
 		out, bits = f, newPartBits(root.String(), total, len(leaves))
 		_ = savePart(dest, bits)
@@ -701,6 +1018,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 						g := rateMaxGapMs.Swap(0)
 						fmt.Fprintf(os.Stderr, "[rate %s] t=%03ds %8.3f MB/s blk=%3d maxgap=%4dms\n",
 							shortCid(root), sec, float64(b)/1e6, k, g)
+						wire.report("[wire " + shortCid(root) + "]") // per-peer wants/cancels/blocks/haves since last tick
 					}
 				}
 			})
@@ -736,7 +1054,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 		dropSig := make(chan struct{}, 1)
 		var flusher sync.WaitGroup
 		flusher.Add(1)
-		safeGo("fetch.pump", func() {
+		safeGo("fetch.flusher", func() {
 			defer flusher.Done()
 			t := time.NewTicker(2 * time.Second)
 			defer t.Stop()
@@ -753,56 +1071,32 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			}
 		})
 
-		// WANT WINDOWING: bitswap SERVERS truncate each peer's queued wantlist (boxo default: 1024 entries, silently
-		// dropping the overflow), and the cap is PER PEER across ALL sessions — so one big file, or three concurrent
-		// downloads, overflow it and the tail crawls in on periodic rebroadcasts (the "pulsing" download). Feed the
-		// want-list through the session in bounded chunks instead: ≤ wantChunks chunks of wantChunk leaves in flight
-		// (receipt-refilled — a chunk's channel closes when its blocks are in, admitting the next), so this fetch
-		// keeps ≤ wantChunks×wantChunk wants queued server-side and 3 concurrent fetches stay under even a
-		// DEFAULT-config seeder's cap. 256 in-flight × 256 KiB = 64 MiB of pipeline — far above any link's BDP, so
-		// throughput is unaffected. Stragglers (a lost want) delay only their own chunk's slot; the 10s rebroadcast
-		// recovers them while later chunks keep streaming through the other slot.
-		wantChunk, wantChunks := 128, 2
-		if v, _ := strconv.Atoi(os.Getenv("VG_WANT_CHUNK")); v > 0 {
-			wantChunk = v // experiment override (see the pulsing investigation)
+		// ROLLING WANT-LIST. bitswap SERVERS truncate each peer's queued wantlist (boxo default: 1024 entries,
+		// silently dropping the overflow), and the cap is PER PEER across ALL sessions — so a big file, or several
+		// concurrent downloads to one peer, overflow it and the tail crawls in on 10s rebroadcasts. The FIX is to
+		// keep only a bounded window of wants outstanding and to REFILL it by RECEIVED COUNT, not by chunk boundary.
+		//
+		// The previous design chunked the wants into `wantChunks` slots of `wantChunk` keys, freeing a slot only when
+		// a WHOLE chunk arrived. That head-of-line-blocks: one straggler (a want the peer dropped) holds its chunk's
+		// slot open forever, and once every slot is held by a straggler NO new keys are ever requested — the session
+		// only knows the ≤ window keys handed so far, of which a few never come, and keys beyond the window are never
+		// asked for at all. Against a single stock-cap peer (a friend on a dead-DHT network reaching only Pinata) the
+		// stragglers never arrive, so the fetch wedges permanently. Measured: 3015/4037 then dead; 24→56 in minutes.
+		//
+		// Rolling window: request an initial `wantWindow` keys, then admit ONE new key for every block received, so
+		// ~wantWindow wants stay outstanding continuously with no chunk boundary to wedge. A straggler delays only
+		// itself; the window keeps advancing through every other key, and the session cancels each want as its block
+		// lands (draining the peer's ledger). wantWindow×256KiB is the pipeline depth — 256 = 64MiB, far above any
+		// link's BDP, so throughput is unaffected while staying well under a stock 1024 cap even with a few concurrent
+		// fetches to the same peer. refillBatch bounds how many GetBlocks channels exist at once (fan-in goroutines).
+		refillBatch := 32
+		if v, _ := strconv.Atoi(os.Getenv("VG_WANT_REFILL")); v > 0 {
+			refillBatch = v
 		}
-		if v, _ := strconv.Atoi(os.Getenv("VG_WANT_CHUNKS")); v > 0 {
-			wantChunks = v
-		}
-		blkCh := make(chan blocks.Block, 64)
-		safeGo("fetch.pump", func() {
-			defer close(blkCh)
-			slots := make(chan struct{}, wantChunks)
-			var cwg sync.WaitGroup
-			for start := 0; start < len(need); start += wantChunk {
-				end := start + wantChunk
-				if end > len(need) {
-					end = len(need)
-				}
-				select {
-				case slots <- struct{}{}:
-				case <-fctx.Done():
-					cwg.Wait()
-					return
-				}
-				ch := sess.GetBlocks(fctx, need[start:end])
-				cwg.Add(1)
-				safeGo("fetch.blockConsumer", func() {
-					defer cwg.Done()
-					for b := range ch {
-						select {
-						case blkCh <- b:
-						case <-fctx.Done():
-							return
-						}
-					}
-					<-slots
-				})
-			}
-			cwg.Wait()
-		})
-
-		for blk := range blkCh {
+		lastFetchLeaves.Store(int64(len(need)))
+		fdbg("writeThrough: rolling window (global budget=%d, pool avail=%d) refill=%d leaves=%d cid=%s", wantBudget, globalWantPool.available(), refillBatch, len(need), cidStr)
+		var writeErr error
+		for blk := range rollingGetBlocks(fctx, sess, need, refillBatch) {
 			now := time.Now().UnixNano()
 			if gap := (now - lastBlk.Load()) / 1e6; gap > rateMaxGapMs.Load() {
 				rateMaxGapMs.Store(gap) // benign race with the reporter's Swap — diagnostic only
@@ -815,16 +1109,18 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			c := blk.Cid()
 			for _, o := range offsets[c] {
 				if _, werr := out.WriteAt(data, o); werr != nil {
-					close(flushStop)
-					flusher.Wait()
-					_ = out.Close()
 					fdbg("writeThrough: WriteAt IO error cid=%s err=%v", cidStr, werr)
-					return werr // IO error — keep the partial for a later retry
+					writeErr = localFatal(werr) // disk error (ENOSPC/EIO) — terminal
+					fcancel()                   // stop the producer + fans; we drain + clean up after the loop
+					break
 				}
 				written += int64(len(data))
 				if total > 0 && onProgress != nil {
 					onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
 				}
+			}
+			if writeErr != nil {
+				break
 			}
 			mu.Lock()
 			for _, i := range idxOf[c] {
@@ -843,13 +1139,26 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 				fdbg("writeThrough: recv %d/%d leaves, written=%d/%d (%.1f%%) cid=%s", recv, len(need), written, total, 100.0*float64(written)/float64(total), cidStr)
 			}
 		}
-		// Session ended (all received, or torn down by stall/cancel). Stop the flusher, then do a final durability +
-		// reclaim pass on the main goroutine so the returned state is fully persisted.
+		// Session ended (all received, or torn down by stall/cancel/write-error). rollingGetBlocks has drained the
+		// channel and returned every want-token by the time its channel closed, so there is nothing to join or
+		// drain here — token lifecycle is entirely inside it.
+		if writeErr != nil {
+			fcancel()
+			close(flushStop)
+			flusher.Wait()
+			_ = out.Sync()
+			_ = savePart(dest, bits) // keep the partial for a later resume
+			_ = out.Close()
+			return writeErr
+		}
+		// Stop the flusher, then do a final durability + reclaim pass on the main goroutine so the returned state
+		// is fully persisted.
 		close(flushStop)
 		flusher.Wait()
 		doSync()
 		doDrop()
 		fdbg("writeThrough: session ended cid=%s recv=%d/%d elapsed=%s stalled=%v cancelled=%v allSet=%v", cidStr, recv, len(need), time.Since(sessStart).Round(time.Millisecond), stalled.Load(), isCancelled(cidStr), bits.allSet())
+		wire.report("[wire-final " + shortCid(root) + "]")
 
 		if isCancelled(cidStr) {
 			_ = out.Close()
@@ -870,14 +1179,14 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	finStart := time.Now()
 	if err := out.Sync(); err != nil {
 		_ = out.Close()
-		return err
+		return localFatal(err)
 	}
 	if err := out.Close(); err != nil {
-		return err
+		return localFatal(err)
 	}
 	_ = os.RemoveAll(dest)
 	if err := os.Rename(tmp, dest); err != nil {
-		return err
+		return localFatal(err)
 	}
 	fdbg("finalize: fsync+rename done in %s cid=%s", time.Since(finStart).Round(time.Millisecond), cidStr)
 
@@ -888,7 +1197,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	}
 	st, err := os.Stat(dest)
 	if err != nil {
-		return err
+		return localFatal(err)
 	}
 	fm := n.fstore.FileManager()
 	fsns := make([]*posinfo.FilestoreNode, 0, len(leaves))
@@ -912,7 +1221,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 			removePartial(dest)
 			return errIncomplete
 		}
-		return err
+		return localFatal(err) // datastore write failure — terminal
 	}
 	fdbg("finalize: PutMany OK in %s cid=%s", time.Since(putStart).Round(time.Millisecond), cidStr)
 	// Drop the bitswap-cached leaf blocks from the plain blockstore in one batched commit (they're now referenced in
@@ -928,7 +1237,6 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	if onFinalize != nil {
 		onFinalize(100)
 	}
-	removePartial(dest) // tmp is now dest; clear the .part resume sidecar
 
 	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path). Walks the DAG via the OFFLINE
 	// pinner dagservice (captured pre-goOnline) so leaves resolve from the filestore/disk, never the network.
@@ -936,13 +1244,17 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	pinStart := time.Now()
 	if err := n.pinner.Pin(n.ctx, rootNode, true, dest); err != nil {
 		fdbg("finalize: PIN FAILED in %s cid=%s err=%v", time.Since(pinStart).Round(time.Millisecond), cidStr, err)
-		return err
+		return localFatal(err)
 	}
 	if err := n.pinner.Flush(n.ctx); err != nil {
 		fdbg("finalize: pin Flush FAILED cid=%s err=%v", cidStr, err)
-		return err
+		return localFatal(err)
 	}
 	n.announce(root) // re-announce now so a re-hosted CID is immediately discoverable (not after the 22h reprovide)
+	// LAST: clear the resume sidecar. The .part is the finalize COMMIT MARKER — removed only once the content is
+	// fully referenced, pinned and announced, so a crash anywhere above leaves .part+dest and the dest-exists path
+	// re-runs the idempotent repair on the next attempt. Never removed earlier.
+	removePartial(dest)
 	fdbg("finalize: PIN+flush done in %s → writeThrough SUCCESS cid=%s", time.Since(pinStart).Round(time.Millisecond), cidStr)
 	return nil
 }
