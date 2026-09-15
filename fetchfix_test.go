@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"context"
 	"crypto/rand"
 	"os"
@@ -273,7 +274,7 @@ func TestBoundedFetchStopsAtItsDeadline(t *testing.T) {
 	if err == nil {
 		t.Fatal("a past deadline must stop the fetch with an error, even for present content")
 	}
-	if !bytes.Contains([]byte(err.Error()), []byte("deadline")) {
+	if !errors.Is(err, errFetchDeadline) {
 		t.Errorf("expected a deadline error, got %v", err)
 	}
 }

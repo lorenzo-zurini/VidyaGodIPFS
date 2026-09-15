@@ -569,9 +569,11 @@ func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
 }
 
 // VgFetchToPathBounded is VgFetchToPath with a WALL-CLOCK BUDGET for SYNCHRONOUS callers (launch-time layer
-// materialization, cover fetches) that must not hang a user action forever. It waits up to timeoutMs for the
-// (unbounded, retry-forever) fetch; on timeout it returns an error while the fetch CONTINUES in the background,
-// so a later launch/repaint finds it progressed or done. timeoutMs<=0 waits forever (== VgFetchToPath).
+// materialization, cover fetches) that must not hang a user action forever. It waits up to timeoutMs, then returns
+// an error. Whether the fetch CONTINUES after that depends on who else wants it: if an unbounded background
+// download of the same dest is also waiting, leadership passes to it and the transfer continues (resuming from the
+// .part bitmap); if this bounded call is the sole caller, the fetch is torn down at the deadline (the partial file
+// + .part stay on disk, so a later attempt resumes from there). timeoutMs<=0 waits forever (== VgFetchToPath).
 //
 //export VgFetchToPathBounded
 func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut **C.char) C.int {
@@ -589,8 +591,9 @@ func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut 
 	}
 	emit(kindStarted, -1, 0, nil)
 	var err error
+	emitTerminal := true // false when this call was a pure joiner, or a leader that handed its give-up off
 	if timeoutMs > 0 {
-		err = n.fetchToPathDeadline(cs, d,
+		err, emitTerminal = n.fetchToPathDeadline(cs, d,
 			func(pct float64) { emit(kindProgress, pct, 0, nil) },
 			func(pct float64) { emit(kindFinalizing, pct, 0, nil) },
 			time.Duration(timeoutMs)*time.Millisecond)
@@ -600,13 +603,21 @@ func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut 
 			func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
 	}
 	if err != nil {
-		ec := C.CString(err.Error())
-		defer C.free(unsafe.Pointer(ec))
-		emit(kindFinished, -1, 0, ec)
 		setStr(errOut, err.Error())
+		// Emit the terminal Errored event only when this call OWNS the CID's row: it drove the transfer and did not
+		// hand its give-up off to a successor (fetchToPathDeadline computes this). A pure joiner and a handed-off
+		// leader both stay silent (the owner reports its own terminal event); a SOLE bounded give-up still emits so
+		// its row never hangs. Belt-and-braces: IpfsModel also heals Errored→Downloading on a later progress tick.
+		if emitTerminal {
+			ec := C.CString(err.Error())
+			defer C.free(unsafe.Pointer(ec))
+			emit(kindFinished, -1, 0, ec)
+		}
 		return -1
 	}
-	emit(kindFinished, 100, 1, nil)
+	if emitTerminal {
+		emit(kindFinished, 100, 1, nil)
+	}
 	return 0
 }
 

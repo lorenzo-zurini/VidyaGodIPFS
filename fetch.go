@@ -32,14 +32,143 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
-	"golang.org/x/sync/singleflight"
 )
 
-// fetchGroup de-duplicates concurrent fetches that target the SAME destination file. Two workers (e.g. a layer CID
-// referenced from two nodes, an overlapping hydrate, or a startup auto-resume racing a manual download) writing the
-// same dest.tmp/dest would stomp each other's rename/pin → spurious "no such file"/missing-files. Keyed by dest (a
-// dest maps to exactly one CID), the second caller JOINS the first and shares its result instead of racing.
-var fetchGroup singleflight.Group
+// Fetch de-duplication by destination file. Two workers (a layer CID referenced from two nodes, an overlapping
+// hydrate, or a startup auto-resume racing a manual download) writing the same dest.tmp/dest would stomp each
+// other's rename/pin → spurious "no such file"/missing-files. Keyed by dest (a dest maps to exactly one CID), the
+// FIRST caller (the leader) runs the fetch and drives ITS OWN onProgress/onFinalize callbacks; later callers
+// (joiners) block on the leader's result instead of racing.
+//
+// Why not singleflight: a bounded (deadline) joiner must be able to STOP WAITING at its deadline without waiting
+// for an UNBOUNDED leader to finish (the pass-4 hang). Abandoning the WAIT is UAF-safe precisely because a joiner's
+// own callbacks are NEVER invoked — only the leader's fn runs — so no goroutine touches the joiner's C strings
+// after it returns. The LEADER never abandons (its C wrapper owns the callback strings for the call's lifetime);
+// instead the leader's deadline is threaded INTO the attempt (see fetchToPathLoopUntil), so it returns on its own
+// at ~deadline. singleflight.DoChan can't express "leader waits, joiner may bail" because Result.Shared is known
+// only after the result arrives — too late to decide who may abandon.
+type fetchWait struct {
+	done    chan struct{}
+	err     error
+	waiters int // joiners currently blocked on this leader (guarded by inflightMu) — see the handoff-emit note
+}
+
+var (
+	inflightMu sync.Mutex
+	inflight   = map[string]*fetchWait{}
+)
+
+// errFetchDeadline marks a give-up caused by a caller's WALL-CLOCK budget running out (as opposed to a terminal
+// local error or the node shutting down). It is the signal for leadership handoff: a give-up under one caller's
+// deadline is not a verdict on the content, so a still-in-budget (or unbounded) waiter takes over instead of
+// inheriting it. errors.Is unwraps it whether it was produced here or wrapped with the CID for the message.
+var errFetchDeadline = errors.New("did not complete before its deadline")
+
+func deadlineErr(cidStr string) error { return fmt.Errorf("fetch of %s %w", cidStr, errFetchDeadline) }
+
+// dedupFetch coordinates one fetch per dest. The FIRST caller (leader) runs `run(deadline)` and drives its own
+// callbacks; later callers (joiners) wait on the leader's result. Two properties this must guarantee:
+//
+//  1. A joiner with a deadline stops WAITING at its deadline (returns a deadline error) instead of blocking on a
+//     possibly-unbounded leader. Abandoning the wait is UAF-safe: a joiner's own callbacks are never invoked (only
+//     the leader's run fn runs), so nothing touches the joiner's C strings after it returns.
+//
+//  2. LEADERSHIP HANDOFF. A give-up under the LEADER's deadline must not be inherited by a waiter that still has
+//     budget — otherwise a bounded launch (120s leader) would kill an UNBOUNDED background download of the same
+//     file the moment the transfer runs longer than 120s. When the leader finishes with errFetchDeadline and a
+//     waiter is still in-budget (or unbounded), that waiter loops back, becomes the new leader, and CONTINUES the
+//     fetch — it resumes from the .part bitmap, so nothing is refetched. Whoever has the longest budget ends up
+//     leading; a truly unbounded waiter leads until the content lands.
+// The returned `ran` is true iff THIS call executed the fetch (as the original leader, or as a joiner that took
+// over via handoff). It is false for a pure joiner that only waited (and then inherited a result or abandoned).
+// Callers that emit transfer events use it so that only the call actually driving the transfer reports its
+// terminal event — a pure joiner must not stamp Errored/Finished onto a CID whose leader still owns the row.
+func (n *node) dedupFetch(dest, cidStr string, deadline time.Time, run func(deadline time.Time) error) (err error, ran bool, handedOff bool) {
+	for {
+		inflightMu.Lock()
+		fw, joining := inflight[dest]
+		if !joining {
+			lead := &fetchWait{done: make(chan struct{})}
+			inflight[dest] = lead
+			inflightMu.Unlock()
+			err, handedOff = n.runFetchAsLeader(dest, lead, deadline, run)
+			return err, true, handedOff // this call drove the fetch
+		}
+		fw.waiters++ // counted (under inflightMu) so the leader knows a successor is queued to take over
+		inflightMu.Unlock()
+
+		var timerC <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			timerC = timer.C
+		}
+		select {
+		case <-fw.done:
+			if timer != nil {
+				timer.Stop()
+			}
+			lerr := fw.err
+			inflightMu.Lock()
+			fw.waiters--
+			inflightMu.Unlock()
+			// Handoff: the leader gave up under ITS deadline but we still have budget (or are unbounded) → take over.
+			if errors.Is(lerr, errFetchDeadline) && (deadline.IsZero() || time.Now().Before(deadline)) {
+				fdbg("dedupFetch: leader gave up on its deadline, taking over as new leader cid=%s dest=%s", cidStr, dest)
+				continue
+			}
+			return lerr, false, false // pure joiner: inherited the leader's result, did not drive
+		case <-timerC:
+			inflightMu.Lock()
+			fw.waiters--
+			inflightMu.Unlock()
+			fdbg("dedupFetch: joiner deadline exceeded, abandoning wait on leader cid=%s dest=%s", cidStr, dest)
+			return deadlineErr(cidStr), false, false // pure joiner: abandoned the wait, did not drive
+		case <-n.ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			inflightMu.Lock()
+			fw.waiters--
+			inflightMu.Unlock()
+			return n.ctx.Err(), false, false // pure joiner: node shutting down, did not drive
+		}
+	}
+}
+
+// runFetchAsLeader runs the fetch for one dest and publishes its result to waiters. Cleanup (unlock the dest + close
+// the done channel) is deferred so that even a PANIC in run releases waiters — otherwise one panic would wedge that
+// dest forever (every future fetch of it blocks on a done channel that never closes). On panic the published error
+// is a real non-nil error (never a silent nil that a joiner would read as success) and the panic is re-raised.
+func (n *node) runFetchAsLeader(dest string, lead *fetchWait, deadline time.Time, run func(deadline time.Time) error) (err error, handedOff bool) {
+	defer func() {
+		inflightMu.Lock()
+		delete(inflight, dest)
+		// A give-up on OUR deadline with a waiter queued will be TAKEN OVER by that waiter (it resumes from the .part
+		// bitmap), so this call must not emit a terminal Errored - the successor owns the row. Read under the same lock
+		// joiners bump waiters with. A sole give-up (no waiter) keeps handedOff=false, so it reports the error.
+		//
+		// Two known suppress-without-successor windows (both accepted): a counted waiter can still fail to take over
+		// if, between this read and its own wake, (a) its timer fires and the runtime picks the timerC arm, or (b) it
+		// wakes on fw.done but its deadline has since passed (the Before(deadline) check below returns instead of
+		// continuing). In either case handedOff was true but nobody takes over → the row shows a wrong "Downloading"/
+		// "Stalled" label (not a hang; the next Started heals it). Both require TWO bounded callers racing on the SAME
+		// dest within scheduling latency — a topology the app never creates (launch dests are per-layer with no double
+		// launch; covers are unique; every other caller is unbounded and never yields errFetchDeadline). Closing them
+		// needs a "designated last waiter emits" handshake; not worth the added concurrency for an unreachable case.
+		handedOff = errors.Is(err, errFetchDeadline) && lead.waiters > 0
+		inflightMu.Unlock()
+		if r := recover(); r != nil {
+			lead.err = fmt.Errorf("fetch aborted (panic): %v", r)
+			close(lead.done)
+			panic(r) // preserve the crash; waiters already have a real error, not a false success
+		}
+		lead.err = err
+		close(lead.done)
+	}()
+	err = run(deadline)
+	return
+}
 
 // errNotRawLeaves signals that a DAG isn't all-raw-leaves, so the write-through path can't reference it (filestore
 // references require raw leaves) and the caller must fall back to the read + re-add path.
@@ -119,8 +248,10 @@ func fdbg(format string, a ...interface{}) {
 // in time (a hostile/captive network where the DHT finds providers but no transport connects, e.g. Pinata's ws:3000
 // mangled by a proxy) — falls back to importing the whole DAG from an HTTPS trustless gateway (gateway.go) and reads
 // the root from the now-local blockstore. On a normal network the root arrives fast and the gateway is never touched.
-func (n *node) getRoot(c cid.Cid, cidStr string, onProgress func(pct float64)) (ipld.Node, error) {
-	getCtx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgress func(pct float64)) (ipld.Node, error) {
+	// Parent on nctx (the attempt's deadline ctx), not n.ctx: a bounded caller's deadline caps the root fetch AND
+	// the gateway fallback below at min(30s, remaining budget) instead of a fixed 30s that can blow past the deadline.
+	getCtx, cancel := context.WithTimeout(nctx, 30*time.Second)
 	defer cancel()
 	// Honour a user-cancel DURING the (up to 30s) root fetch AND the gateway fallback below — both run under
 	// getCtx. Without this a cancelled download blocks a waiter (and holds a download slot) for the full timeout.
@@ -163,7 +294,7 @@ func (n *node) getRoot(c cid.Cid, cidStr string, onProgress func(pct float64)) (
 		fdbg("getRoot: gateway fallback failed cid=%s: %v", cidStr, gerr)
 		return nil, err // surface the original network error
 	}
-	return n.dserv.Get(n.ctx, c) // DAG now in the local blockstore
+	return n.dserv.Get(nctx, c) // DAG now in the local blockstore
 }
 
 // shortCid trims a CID for readable logs (first 6 + last 4 of the base58/base32 string).
@@ -292,45 +423,76 @@ func isCancelled(c string) bool {
 // writeThrough) resumes only the missing leaves from the on-disk partial (dest.tmp + dest.part). A stall/drop returns
 // errIncomplete → back off (growing to a cap, reset once an attempt has clearly made progress) and resume. A stale
 // LOCAL reference (removed/moved content) returns errMissingFiles → clear it once and re-fetch over the network.
-// fetchToPath de-duplicates by dest (see fetchGroup) then runs the resumable retry loop. Concurrent callers for the
-// same dest share ONE fetch and its result — the leader drives the transfer callbacks; joiners just wait + get the
-// same error, so they never race on the same tmp/dest files.
-// maxAttempts==0 means UNBOUNDED (retry-forever) — background downloads, which must never give up on a transient
-// failure. A positive maxAttempts bounds the retries — the SYNCHRONOUS callers (launch materialization, cover
-// fetch) that must fail cleanly instead of hanging a user action forever when content is genuinely unreachable.
-// fetchToPathDeadline is fetchToPath for SYNCHRONOUS callers that must not block a user action forever (launch
-// layer materialization, cover fetches). The deadline is enforced INSIDE the retry loop and the call is fully
-// SYNCHRONOUS — there is no background goroutine to outlive the call, so the C callback string's lifetime is
-// exactly the call (no use-after-free) and nothing is left running as a "ghost" fetch. budget<=0 == fetchToPath.
+// fetchToPath de-duplicates by dest (see dedupFetch) then runs the resumable retry loop. Concurrent callers for the
+// same dest share ONE fetch: the leader drives the transfer callbacks; joiners wait for the result. A zero deadline
+// means UNBOUNDED (retry-forever) — background downloads, which must never give up on a transient failure.
 //
-// Caveat (documented, rare): fetchGroup de-dupes by dest, so if a bounded caller JOINS an already-in-flight
-// UNBOUNDED background download of the same path, it waits for that leader (its own deadline can't shorten the
-// leader). Covers never collide with downloads (distinct dests); a launch colliding with a background download of
-// the same layer waits for the content it needs anyway, and the user can cancel the download to release it.
-func (n *node) fetchToPathDeadline(cidStr, dest string, onProgress, onFinalize func(pct float64), budget time.Duration) error {
+// fetchToPathDeadline is fetchToPath for SYNCHRONOUS callers that must not block a user action forever (launch layer
+// materialization, cover fetches). The budget bounds this CALLER'S WAIT, not necessarily the shared fetch: the
+// deadline is threaded INTO the attempt (getRoot/session ctxs) AND caps the between-attempt backoff, and — if this
+// caller is a pure joiner — caps how long it waits on the leader. NOTE (behaviour, not a caveat): a bounded fetch
+// that is the SOLE caller is torn down at its deadline and does NOT continue in the background — the loop returns
+// and the goroutine exits, so the C callback string's lifetime is exactly the call (no use-after-free, no ghost
+// fetch). What DOES continue is a fetch that an UNBOUNDED caller is also waiting on: when a bounded leader gives up
+// on its deadline, dedupFetch hands leadership to the unbounded waiter, which continues from the .part bitmap. So a
+// launch that collides with a background download of the same layer never kills that download.
+//
+// Returns (err, emitTerminal): emitTerminal is true only when this call drove the transfer AND did not hand its
+// deadline give-up off to a waiting successor. False for a pure joiner (the leader owns the CID's row) and for a
+// leader that handed off (the successor owns it) — so no caller stamps Errored onto a live download, while a SOLE
+// bounded give-up still emits (emitTerminal true) so its row never hangs as a stuck spinner.
+func (n *node) fetchToPathDeadline(cidStr, dest string, onProgress, onFinalize func(pct float64), budget time.Duration) (error, bool) {
 	deadline := time.Time{}
 	if budget > 0 {
 		deadline = time.Now().Add(budget)
 	}
-	v, err, shared := fetchGroup.Do(dest, func() (interface{}, error) {
-		return nil, n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, deadline)
+	err, ran, handedOff := n.dedupFetch(dest, cidStr, deadline, func(dl time.Time) error {
+		return n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, dl)
 	})
-	_ = v
-	if shared {
-		fdbg("fetchToPathDeadline JOINED an in-flight fetch (deduped) cid=%s dest=%s err=%v", cidStr, dest, err)
+	if !ran {
+		fdbg("fetchToPathDeadline JOINED an in-flight fetch (deduped, did not drive) cid=%s dest=%s err=%v", cidStr, dest, err)
+	}
+	// emitTerminal: emit a terminal transfer event only if this call drove the transfer AND did not hand the
+	// give-up off to a successor (which now owns the row). A sole bounded give-up still emits so its row can't hang.
+	return err, ran && !handedOff
+}
+
+func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64)) error {
+	err, ran, _ := n.dedupFetch(dest, cidStr, time.Time{}, func(dl time.Time) error {
+		return n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, dl)
+	})
+	if !ran {
+		fdbg("fetchToPath JOINED an in-flight fetch of the same dest (deduped, did not drive) cid=%s dest=%s err=%v", cidStr, dest, err)
 	}
 	return err
 }
 
-func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64)) error {
-	v, err, shared := fetchGroup.Do(dest, func() (interface{}, error) {
-		return nil, n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, time.Time{})
-	})
-	_ = v
-	if shared {
-		fdbg("fetchToPath JOINED an in-flight fetch of the same dest (deduped) cid=%s dest=%s err=%v", cidStr, dest, err)
+// backoffWait sleeps for d between attempts, honouring both a user-cancel and the fetch deadline. It returns
+// exit=true (with the error to return) when the loop must stop: the user cancelled, the node is shutting down, or
+// the deadline is already exhausted (rem<=0). When the remaining budget is smaller than the backoff, the sleep is
+// CLAMPED to the remaining budget (not zeroed — a fast-failing online attempt would busy-spin) so the sleep never
+// runs past the deadline and the loop's top-of-iteration deadline check then ends the fetch. deadline zero =
+// unbounded (background download): sleep the full backoff.
+func (n *node) backoffWait(cidStr, dest string, d time.Duration, deadline time.Time) (bool, error) {
+	if !deadline.IsZero() {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			fdbg("fetchToPath deadline reached, no budget for another attempt cid=%s", cidStr)
+			return true, deadlineErr(cidStr)
+		}
+		if d > rem {
+			d = rem // sleep at most the remaining budget, then the loop-top deadline check returns. Never sleep past
+			// the deadline, and never drop to a zero backoff (a fast-failing online attempt would then busy-spin).
+		}
 	}
-	return err
+	if d > 0 && n.sleepOrCancel(cidStr, d) {
+		removePartial(dest)
+		return true, errors.New("cancelled")
+	}
+	if n.ctx.Err() != nil {
+		return true, n.ctx.Err()
+	}
+	return false, nil
 }
 
 func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize func(pct float64), deadline time.Time) error {
@@ -343,9 +505,9 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 			removePartial(dest)
 			return errors.New("cancelled")
 		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
+		if !deadline.IsZero() && !time.Now().Before(deadline) { // now >= deadline (>= not >, so no doomed extra attempt at equality)
 			fdbg("fetchToPath deadline exceeded before attempt %d cid=%s", attempt, cidStr)
-			return fmt.Errorf("fetch of %s did not complete before its deadline", cidStr)
+			return deadlineErr(cidStr)
 		}
 		// Proactively freshen provider addresses (warm.go) on EVERY attempt — not just the first: a live DHT walk +
 		// connect in parallel with bitswap, so a provider that restarted (new ports) or came online mid-download is
@@ -360,7 +522,20 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 		n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces — connect so bitswap can ask them
 		start := time.Now()
 		fdbg("fetchToPath attempt %d START cid=%s", attempt, cidStr)
-		err := n.fetchToPathOnce(cidStr, dest, onProgress, onFinalize)
+		// Bound the ATTEMPT ITSELF by the deadline, not just the loop top: a 30s getRoot, a gateway CAR pull, or a
+		// session that trickles one block per <stallTimeout (never triggering the stall watchdog) must all be torn
+		// down AT the deadline so a synchronous caller returns on time. attemptCtx carries the deadline into every
+		// network read (getRoot, the fallback DagReader, the writeThrough session). n.ctx (shutdown) is the parent,
+		// so a node stop still cancels. No deadline (background download) → attemptCtx == n.ctx, unbounded.
+		attemptCtx := n.ctx
+		var acancel context.CancelFunc
+		if !deadline.IsZero() {
+			attemptCtx, acancel = context.WithDeadline(n.ctx, deadline)
+		}
+		err := n.fetchToPathOnce(attemptCtx, cidStr, dest, onProgress, onFinalize)
+		if acancel != nil {
+			acancel()
+		}
 		fdbg("fetchToPath attempt %d DONE cid=%s err=%v elapsed=%s", attempt, cidStr, err, time.Since(start).Round(time.Millisecond))
 		switch {
 		case err == nil:
@@ -373,12 +548,8 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 				backoff *= 2
 			}
 			fdbg("fetchToPath incomplete → backoff %s then resume cid=%s", backoff, cidStr)
-			if n.sleepOrCancel(cidStr, backoff) {
-				removePartial(dest)
-				return errors.New("cancelled")
-			}
-			if n.ctx.Err() != nil {
-				return n.ctx.Err()
+			if exit, e := n.backoffWait(cidStr, dest, backoff, deadline); exit {
+				return e
 			}
 		case err == errMissingFiles:
 			missTries++
@@ -412,20 +583,16 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 			// TRANSIENT / NETWORK: a root-fetch timeout, all-gateways failure, a dropped connection, a DHT that
 			// found nobody this pass. None mean the content is unobtainable — only that this attempt reached no
 			// provider. Back off and retry; a provider (our seeder, a friend, Pinata after a rate-limit, a peer
-			// that comes online later) may appear at any time. Unbounded for background downloads (maxAttempts==0);
-			// bounded for synchronous callers so a launch/cover can't hang. isCancelled + n.ctx are the exits.
+			// that comes online later) may appear at any time. Unbounded for background downloads (zero deadline);
+			// bounded (deadline threaded into the attempt) for synchronous callers so a launch/cover can't hang.
 			if time.Since(start) > 5*time.Second { // made progress before failing → reset backoff
 				backoff = 2 * time.Second
 			} else if backoff < 30*time.Second {
 				backoff *= 2
 			}
 			fdbg("fetchToPath attempt %d TRANSIENT (%v) → backoff %s then retry cid=%s", attempt, err, backoff, cidStr)
-			if n.sleepOrCancel(cidStr, backoff) {
-				removePartial(dest)
-				return errors.New("cancelled")
-			}
-			if n.ctx.Err() != nil {
-				return n.ctx.Err()
+			if exit, e := n.backoffWait(cidStr, dest, backoff, deadline); exit {
+				return e
 			}
 		}
 	}
@@ -487,7 +654,9 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 	// warming that single-file fetches get (warm.go): a live DHT provider walk + connect in parallel with bitswap, so a
 	// NAT'd provider is holepunched before getRoot's deadline instead of relying on bitswap's slower passive connect.
 	n.warmProviders(c)
-	root, err := n.getRoot(c, cidStr, onProgress) // libp2p, or an HTTPS trustless-gateway CAR fallback on hostile nets
+	// Directory (meta) fetches run under the sync worker with a bounded attempt count, not a wall-clock deadline, so
+	// the attempt context is just n.ctx — getRoot still caps each root fetch at 30s.
+	root, err := n.getRoot(n.ctx, c, cidStr, onProgress) // libp2p, or an HTTPS trustless-gateway CAR fallback on hostile nets
 	if err != nil {
 		if err == errMissingFiles || isMissingFile(err) {
 			return errMissingFiles
@@ -576,7 +745,7 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 // onProgress is called with 0..100 during the transfer; onFinalize is called once the bytes are all down and the
 // (slower) re-reference/"pinning" step runs — with 0..100 progress through that step on the write-through path, or -1
 // (indeterminate) on the fallback re-add path (so the UI can show "Pinning… 42%" instead of looking stuck at 100%).
-func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
@@ -635,7 +804,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 
 	fdbg("fetchToPathOnce: fetching root block cid=%s", cidStr)
 	getStart := time.Now()
-	root, err := n.getRoot(c, cidStr, onProgress)
+	root, err := n.getRoot(nctx, c, cidStr, onProgress)
 	if err != nil {
 		fdbg("fetchToPathOnce: root Get FAILED cid=%s err=%v (isMissingFile=%v)", cidStr, err, isMissingFile(err))
 		if err == errMissingFiles || isMissingFile(err) {
@@ -648,7 +817,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
-	wtErr := n.writeThrough(c, root, dest, cidStr, onProgress, onFinalize)
+	wtErr := n.writeThrough(nctx, c, root, dest, cidStr, onProgress, onFinalize)
 	fdbg("writeThrough(%s) -> %v", cidStr, wtErr)
 	if err := wtErr; err == nil {
 		n.scheduleCompaction() // reclaim tombstone disk from the leaves we dropped from the blockstore
@@ -664,7 +833,7 @@ func (n *node) fetchToPathOnce(cidStr, dest string, onProgress func(pct float64)
 	}
 	fdbg("writeThrough(%s) fell through to SLOW read+addNoCopy fallback", cidStr)
 
-	rdr, err := ufsio.NewDagReader(n.ctx, root, n.dserv)
+	rdr, err := ufsio.NewDagReader(nctx, root, n.dserv)
 	if err != nil {
 		return err
 	}
@@ -836,11 +1005,11 @@ func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []ci
 	return out
 }
 
-func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr string,
+func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.Node, dest, cidStr string,
 	onProgress func(pct float64), onFinalize func(pct float64)) error {
 	fdbg("writeThrough ENTER cid=%s dest=%s", cidStr, dest)
 	// File size (for progress + preallocation) — cheap, reads the root's UnixFS metadata.
-	rdr, err := ufsio.NewDagReader(n.ctx, rootNode, n.dserv)
+	rdr, err := ufsio.NewDagReader(nctx, rootNode, n.dserv)
 	if err != nil {
 		return err
 	}
@@ -884,7 +1053,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 				if l.Cid.Prefix().Codec == cid.Raw {
 					addLeaf(l.Cid, int(l.Size))
 				} else if seenN.Visit(l.Cid) {
-					child, gerr := n.dserv.Get(n.ctx, l.Cid)
+					child, gerr := n.dserv.Get(nctx, l.Cid)
 					if gerr != nil {
 						return gerr
 					}
@@ -954,7 +1123,7 @@ func (n *node) writeThrough(root cid.Cid, rootNode ipld.Node, dest, cidStr strin
 	if len(need) > 0 {
 		// Cancel + STALL watcher: cancel the fetch on user-cancel, OR when no block has arrived for stallTimeout (a dead
 		// peer), so the wrapper can back off + resume from the bitmap instead of hanging.
-		fctx, fcancel := context.WithCancel(n.ctx)
+		fctx, fcancel := context.WithCancel(nctx)
 		defer fcancel()
 		var lastBlk atomic.Int64
 		lastBlk.Store(time.Now().UnixNano())
