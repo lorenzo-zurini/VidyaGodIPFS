@@ -34,142 +34,8 @@ import (
 	ipld "github.com/ipfs/go-ipld-format"
 )
 
-// Fetch de-duplication by destination file. Two workers (a layer CID referenced from two nodes, an overlapping
-// hydrate, or a startup auto-resume racing a manual download) writing the same dest.tmp/dest would stomp each
-// other's rename/pin → spurious "no such file"/missing-files. Keyed by dest (a dest maps to exactly one CID), the
-// FIRST caller (the leader) runs the fetch and drives ITS OWN onProgress/onFinalize callbacks; later callers
-// (joiners) block on the leader's result instead of racing.
-//
-// Why not singleflight: a bounded (deadline) joiner must be able to STOP WAITING at its deadline without waiting
-// for an UNBOUNDED leader to finish (the pass-4 hang). Abandoning the WAIT is UAF-safe precisely because a joiner's
-// own callbacks are NEVER invoked — only the leader's fn runs — so no goroutine touches the joiner's C strings
-// after it returns. The LEADER never abandons (its C wrapper owns the callback strings for the call's lifetime);
-// instead the leader's deadline is threaded INTO the attempt (see fetchToPathLoopUntil), so it returns on its own
-// at ~deadline. singleflight.DoChan can't express "leader waits, joiner may bail" because Result.Shared is known
-// only after the result arrives — too late to decide who may abandon.
-type fetchWait struct {
-	done    chan struct{}
-	err     error
-	waiters int // joiners currently blocked on this leader (guarded by inflightMu) — see the handoff-emit note
-}
-
-var (
-	inflightMu sync.Mutex
-	inflight   = map[string]*fetchWait{}
-)
-
-// errFetchDeadline marks a give-up caused by a caller's WALL-CLOCK budget running out (as opposed to a terminal
-// local error or the node shutting down). It is the signal for leadership handoff: a give-up under one caller's
-// deadline is not a verdict on the content, so a still-in-budget (or unbounded) waiter takes over instead of
-// inheriting it. errors.Is unwraps it whether it was produced here or wrapped with the CID for the message.
-var errFetchDeadline = errors.New("did not complete before its deadline")
-
-func deadlineErr(cidStr string) error { return fmt.Errorf("fetch of %s %w", cidStr, errFetchDeadline) }
-
-// dedupFetch coordinates one fetch per dest. The FIRST caller (leader) runs `run(deadline)` and drives its own
-// callbacks; later callers (joiners) wait on the leader's result. Two properties this must guarantee:
-//
-//  1. A joiner with a deadline stops WAITING at its deadline (returns a deadline error) instead of blocking on a
-//     possibly-unbounded leader. Abandoning the wait is UAF-safe: a joiner's own callbacks are never invoked (only
-//     the leader's run fn runs), so nothing touches the joiner's C strings after it returns.
-//
-//  2. LEADERSHIP HANDOFF. A give-up under the LEADER's deadline must not be inherited by a waiter that still has
-//     budget — otherwise a bounded launch (120s leader) would kill an UNBOUNDED background download of the same
-//     file the moment the transfer runs longer than 120s. When the leader finishes with errFetchDeadline and a
-//     waiter is still in-budget (or unbounded), that waiter loops back, becomes the new leader, and CONTINUES the
-//     fetch — it resumes from the .part bitmap, so nothing is refetched. Whoever has the longest budget ends up
-//     leading; a truly unbounded waiter leads until the content lands.
-//
-// The returned `ran` is true iff THIS call executed the fetch (as the original leader, or as a joiner that took
-// over via handoff). It is false for a pure joiner that only waited (and then inherited a result or abandoned).
-// Callers that emit transfer events use it so that only the call actually driving the transfer reports its
-// terminal event — a pure joiner must not stamp Errored/Finished onto a CID whose leader still owns the row.
-func (n *node) dedupFetch(dest, cidStr string, deadline time.Time, run func(deadline time.Time) error) (err error, ran bool, handedOff bool) {
-	for {
-		inflightMu.Lock()
-		fw, joining := inflight[dest]
-		if !joining {
-			lead := &fetchWait{done: make(chan struct{})}
-			inflight[dest] = lead
-			inflightMu.Unlock()
-			err, handedOff = n.runFetchAsLeader(dest, lead, deadline, run)
-			return err, true, handedOff // this call drove the fetch
-		}
-		fw.waiters++ // counted (under inflightMu) so the leader knows a successor is queued to take over
-		inflightMu.Unlock()
-
-		var timerC <-chan time.Time
-		var timer *time.Timer
-		if !deadline.IsZero() {
-			timer = time.NewTimer(time.Until(deadline))
-			timerC = timer.C
-		}
-		select {
-		case <-fw.done:
-			if timer != nil {
-				timer.Stop()
-			}
-			lerr := fw.err
-			inflightMu.Lock()
-			fw.waiters--
-			inflightMu.Unlock()
-			// Handoff: the leader gave up under ITS deadline but we still have budget (or are unbounded) → take over.
-			if errors.Is(lerr, errFetchDeadline) && (deadline.IsZero() || time.Now().Before(deadline)) {
-				fdbg("dedupFetch: leader gave up on its deadline, taking over as new leader cid=%s dest=%s", cidStr, dest)
-				continue
-			}
-			return lerr, false, false // pure joiner: inherited the leader's result, did not drive
-		case <-timerC:
-			inflightMu.Lock()
-			fw.waiters--
-			inflightMu.Unlock()
-			fdbg("dedupFetch: joiner deadline exceeded, abandoning wait on leader cid=%s dest=%s", cidStr, dest)
-			return deadlineErr(cidStr), false, false // pure joiner: abandoned the wait, did not drive
-		case <-n.ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			inflightMu.Lock()
-			fw.waiters--
-			inflightMu.Unlock()
-			return n.ctx.Err(), false, false // pure joiner: node shutting down, did not drive
-		}
-	}
-}
-
-// runFetchAsLeader runs the fetch for one dest and publishes its result to waiters. Cleanup (unlock the dest + close
-// the done channel) is deferred so that even a PANIC in run releases waiters — otherwise one panic would wedge that
-// dest forever (every future fetch of it blocks on a done channel that never closes). On panic the published error
-// is a real non-nil error (never a silent nil that a joiner would read as success) and the panic is re-raised.
-func (n *node) runFetchAsLeader(dest string, lead *fetchWait, deadline time.Time, run func(deadline time.Time) error) (err error, handedOff bool) {
-	defer func() {
-		inflightMu.Lock()
-		delete(inflight, dest)
-		// A give-up on OUR deadline with a waiter queued will be TAKEN OVER by that waiter (it resumes from the .part
-		// bitmap), so this call must not emit a terminal Errored - the successor owns the row. Read under the same lock
-		// joiners bump waiters with. A sole give-up (no waiter) keeps handedOff=false, so it reports the error.
-		//
-		// Two known suppress-without-successor windows (both accepted): a counted waiter can still fail to take over
-		// if, between this read and its own wake, (a) its timer fires and the runtime picks the timerC arm, or (b) it
-		// wakes on fw.done but its deadline has since passed (the Before(deadline) check below returns instead of
-		// continuing). In either case handedOff was true but nobody takes over → the row shows a wrong "Downloading"/
-		// "Stalled" label (not a hang; the next Started heals it). Both require TWO bounded callers racing on the SAME
-		// dest within scheduling latency — a topology the app never creates (launch dests are per-layer with no double
-		// launch; covers are unique; every other caller is unbounded and never yields errFetchDeadline). Closing them
-		// needs a "designated last waiter emits" handshake; not worth the added concurrency for an unreachable case.
-		handedOff = errors.Is(err, errFetchDeadline) && lead.waiters > 0
-		inflightMu.Unlock()
-		if r := recover(); r != nil {
-			lead.err = fmt.Errorf("fetch aborted (panic): %v", r)
-			close(lead.done)
-			panic(r) // preserve the crash; waiters already have a real error, not a false success
-		}
-		lead.err = err
-		close(lead.done)
-	}()
-	err = run(deadline)
-	return
-}
+// (Fetch de-duplication and leadership handoff were removed with the internal retry loop: the C++ DownloadQueue
+// now guarantees exactly one active fetch per CID, so there is no same-dest race to singleflight.)
 
 // errNotRawLeaves signals that a DAG isn't all-raw-leaves, so the write-through path can't reference it (filestore
 // references require raw leaves) and the caller must fall back to the read + re-add path.
@@ -461,32 +327,6 @@ func localFatal(err error) error {
 	return fmt.Errorf("%w: %v", errLocalFatal, err)
 }
 
-// sleepOrCancel waits d, returning true if a user-cancel arrived during the wait (polled every 250ms so a cancel
-// is honoured promptly instead of after a full 30s backoff — the slot is freed and the waiter unblocked quickly).
-// Returns false if the full delay elapsed (or the node is shutting down — the caller then checks n.ctx).
-func (n *node) sleepOrCancel(cidStr string, d time.Duration) bool {
-	const step = 250 * time.Millisecond
-	deadline := time.Now().Add(d)
-	for {
-		if isCancelled(cidStr) {
-			return true
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return false
-		}
-		if remain > step {
-			remain = step
-		}
-		select {
-		case <-time.After(remain):
-		case <-n.ctx.Done():
-			return false
-		}
-	}
-}
-
-// isMissingFile detects a filestore reference whose backing file is gone (deleted package content).
 func isMissingFile(err error) bool {
 	if err == nil {
 		return false
@@ -511,228 +351,84 @@ func isCancelled(c string) bool {
 	return cancelSet[c]
 }
 
-// fetchToPath retrieves cidStr's file content to dest and seeds it from there — TORRENT-STYLE: it resumes and retries
-// until the file is whole or the user cancels, never failing on a transient stall. Each attempt (fetchToPathOnce →
-// writeThrough) resumes only the missing leaves from the on-disk partial (dest.tmp + dest.part). A stall/drop returns
-// errIncomplete → back off (growing to a cap, reset once an attempt has clearly made progress) and resume. A stale
-// LOCAL reference (removed/moved content) returns errMissingFiles → clear it once and re-fetch over the network.
-// fetchToPath de-duplicates by dest (see dedupFetch) then runs the resumable retry loop. Concurrent callers for the
-// same dest share ONE fetch: the leader drives the transfer callbacks; joiners wait for the result. A zero deadline
-// means UNBOUNDED (retry-forever) — background downloads, which must never give up on a transient failure.
-//
-// fetchToPathDeadline is fetchToPath for SYNCHRONOUS callers that must not block a user action forever (launch layer
-// materialization, cover fetches). The budget bounds this CALLER'S WAIT, not necessarily the shared fetch: the
-// deadline is threaded INTO the attempt (getRoot/session ctxs) AND caps the between-attempt backoff, and — if this
-// caller is a pure joiner — caps how long it waits on the leader. NOTE (behaviour, not a caveat): a bounded fetch
-// that is the SOLE caller is torn down at its deadline and does NOT continue in the background — the loop returns
-// and the goroutine exits, so the C callback string's lifetime is exactly the call (no use-after-free, no ghost
-// fetch). What DOES continue is a fetch that an UNBOUNDED caller is also waiting on: when a bounded leader gives up
-// on its deadline, dedupFetch hands leadership to the unbounded waiter, which continues from the .part bitmap. So a
-// launch that collides with a background download of the same layer never kills that download.
-//
-// Returns (err, emitTerminal): emitTerminal is true only when this call drove the transfer AND did not hand its
-// deadline give-up off to a waiting successor. False for a pure joiner (the leader owns the CID's row) and for a
-// leader that handed off (the successor owns it) — so no caller stamps Errored onto a live download, while a SOLE
-// bounded give-up still emits (emitTerminal true) so its row never hangs as a stuck spinner.
-func (n *node) fetchToPathDeadline(cidStr, dest string, onProgress, onFinalize func(pct float64), budget time.Duration) (error, bool) {
-	deadline := time.Time{}
-	if budget > 0 {
-		deadline = time.Now().Add(budget)
+// fetchToPath retrieves cidStr's file content to dest in ONE attempt (getRoot → writeThrough, with the 20 s stall
+// watchdog and the HTTPS gateway leaf-resume inside). It does NOT loop: retry/backoff and stall-demotion now live in
+// the C++ DownloadQueue's rolling dispatcher, which re-dispatches a Retryable outcome. Kept as a thin convenience for
+// the node's own tests; VgFetchOnce is the production entry point. A stale LOCAL reference (errMissingFiles) is
+// cleared here so the re-dispatch re-fetches over the network.
+// destGuard serializes concurrent fetches to the SAME dest. The C++ DownloadQueue already guarantees one active
+// fetch per CID (dest ↔ CID is 1:1), so this is a cheap primitive-level backstop — not the old leadership-handoff —
+// against a silent dest.tmp/rename race if two callers ever collide. Refcounted so the map is bounded by live dests.
+type destGuard struct {
+	mu   sync.Mutex
+	refs int
+}
+
+var (
+	destGuardsMu sync.Mutex
+	destGuards   = map[string]*destGuard{}
+)
+
+func lockDest(dest string) func() {
+	destGuardsMu.Lock()
+	g := destGuards[dest]
+	if g == nil {
+		g = &destGuard{}
+		destGuards[dest] = g
 	}
-	err, ran, handedOff := n.dedupFetch(dest, cidStr, deadline, func(dl time.Time) error {
-		return n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, dl)
-	})
-	if !ran {
-		fdbg("fetchToPathDeadline JOINED an in-flight fetch (deduped, did not drive) cid=%s dest=%s err=%v", cidStr, dest, err)
+	g.refs++
+	destGuardsMu.Unlock()
+	g.mu.Lock()
+	return func() {
+		g.mu.Unlock()
+		destGuardsMu.Lock()
+		if g.refs--; g.refs == 0 {
+			delete(destGuards, dest)
+		}
+		destGuardsMu.Unlock()
 	}
-	// emitTerminal: emit a terminal transfer event only if this call drove the transfer AND did not hand the
-	// give-up off to a successor (which now owns the row). A sole bounded give-up still emits so its row can't hang.
-	return err, ran && !handedOff
 }
 
 func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64)) error {
-	err, ran, _ := n.dedupFetch(dest, cidStr, time.Time{}, func(dl time.Time) error {
-		return n.fetchToPathLoopUntil(cidStr, dest, onProgress, onFinalize, dl)
-	})
-	if !ran {
-		fdbg("fetchToPath JOINED an in-flight fetch of the same dest (deduped, did not drive) cid=%s dest=%s err=%v", cidStr, dest, err)
+	unlock := lockDest(dest)
+	defer unlock()
+	err := n.fetchToPathOnce(n.ctx, cidStr, dest, onProgress, onFinalize)
+	if err == errMissingFiles {
+		if c, derr := cid.Decode(cidStr); derr == nil {
+			n.dropRef(c) // clear the stale ref (+ cached blocks) so the next dispatch fetches over the network
+		}
 	}
 	return err
 }
 
-// backoffWait sleeps for d between attempts, honouring both a user-cancel and the fetch deadline. It returns
-// exit=true (with the error to return) when the loop must stop: the user cancelled, the node is shutting down, or
-// the deadline is already exhausted (rem<=0). When the remaining budget is smaller than the backoff, the sleep is
-// CLAMPED to the remaining budget (not zeroed — a fast-failing online attempt would busy-spin) so the sleep never
-// runs past the deadline and the loop's top-of-iteration deadline check then ends the fetch. deadline zero =
-// unbounded (background download): sleep the full backoff.
-func (n *node) backoffWait(cidStr, dest string, d time.Duration, deadline time.Time) (bool, error) {
-	if !deadline.IsZero() {
-		rem := time.Until(deadline)
-		if rem <= 0 {
-			fdbg("fetchToPath deadline reached, no budget for another attempt cid=%s", cidStr)
-			return true, deadlineErr(cidStr)
-		}
-		if d > rem {
-			d = rem // sleep at most the remaining budget, then the loop-top deadline check returns. Never sleep past
-			// the deadline, and never drop to a zero backoff (a fast-failing online attempt would then busy-spin).
-		}
-	}
-	if d > 0 && n.sleepOrCancel(cidStr, d) {
-		removePartial(dest)
-		return true, errors.New("cancelled")
-	}
-	if n.ctx.Err() != nil {
-		return true, n.ctx.Err()
-	}
-	return false, nil
-}
+// fetchOutcome classes, mirrored on the C++ side (downloadqueue.cpp RunJob): the rolling dispatcher reads these to
+// decide Done / rotate-and-retry / fail.
+const (
+	fetchDone      = 0 // complete + seeded
+	fetchRetryable = 1 // stalled, provider-exhausted, offline, or a cleared stale ref — re-dispatch later
+	fetchTerminal  = 2 // cancelled, malformed CID, or a local/disk error retrying can never fix
+)
 
-func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize func(pct float64), deadline time.Time) error {
-	backoff := 2 * time.Second
-	missTries := 0
-	fdbg("fetchToPath ENTER cid=%s dest=%s", cidStr, dest)
-	for attempt := 1; ; attempt++ {
-		if isCancelled(cidStr) {
-			fdbg("fetchToPath cancelled before attempt %d cid=%s", attempt, cidStr)
-			removePartial(dest)
-			return errors.New("cancelled")
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) { // now >= deadline (>= not >, so no doomed extra attempt at equality)
-			fdbg("fetchToPath deadline exceeded before attempt %d cid=%s", attempt, cidStr)
-			return deadlineErr(cidStr)
-		}
-		// Proactively freshen provider addresses (warm.go) on EVERY attempt — not just the first: a live DHT walk +
-		// connect in parallel with bitswap, so a provider that restarted (new ports) or came online mid-download is
-		// re-discovered instead of the retry loop spinning forever on a dead peer set. No-op when already connected.
-		// A fresh CONTENT CID may have no DHT record yet (bulk content announces drain through a slow batched queue),
-		// but the 3-level schema blocking-announces the COLLECTION metas first — so also warm the collection providers:
-		// whoever seeds our sources has this file, and bitswap's want-broadcast reaches it once we're connected.
-		if c, derr := cid.Decode(cidStr); derr == nil {
-			n.warmProviders(c)
-			n.warmSeedLevelProviders()
-		}
-		n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces — connect so bitswap can ask them
-		start := time.Now()
-		fdbg("fetchToPath attempt %d START cid=%s", attempt, cidStr)
-		phase(cidStr, fmt.Sprintf("attempt %d — connecting to providers", attempt))
-		// Bound the ATTEMPT ITSELF by the deadline, not just the loop top: a 30s getRoot, a gateway CAR pull, or a
-		// session that trickles one block per <stallTimeout (never triggering the stall watchdog) must all be torn
-		// down AT the deadline so a synchronous caller returns on time. attemptCtx carries the deadline into every
-		// network read (getRoot, the fallback DagReader, the writeThrough session). n.ctx (shutdown) is the parent,
-		// so a node stop still cancels. No deadline (background download) → attemptCtx == n.ctx, unbounded.
-		attemptCtx := n.ctx
-		var acancel context.CancelFunc
-		if !deadline.IsZero() {
-			attemptCtx, acancel = context.WithDeadline(n.ctx, deadline)
-		}
-		err := n.fetchToPathOnce(attemptCtx, cidStr, dest, onProgress, onFinalize)
-		if acancel != nil {
-			acancel()
-		}
-		fdbg("fetchToPath attempt %d DONE cid=%s err=%v elapsed=%s", attempt, cidStr, err, time.Since(start).Round(time.Millisecond))
-		switch {
-		case err == nil:
-			fdbg("fetchToPath SUCCESS cid=%s after %d attempt(s)", cidStr, attempt)
-			return nil
-		case err == errIncomplete:
-			if time.Since(start) > 5*time.Second { // the attempt fetched for a while before stalling → reset backoff
-				backoff = 2 * time.Second
-			} else if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			fdbg("fetchToPath incomplete → backoff %s then resume cid=%s", backoff, cidStr)
-			phase(cidStr, fmt.Sprintf("transfer interrupted — resuming in %s", backoff.Round(time.Second)))
-			if exit, e := n.backoffWait(cidStr, dest, backoff, deadline); exit {
-				return e
-			}
-		case err == errMissingFiles:
-			missTries++
-			fdbg("fetchToPath missingFiles (try %d) → dropRef + refetch cid=%s", missTries, cidStr)
-			if missTries > 2 { // shouldn't recur after dropRef; guard against a spin
-				return err
-			}
-			if c, derr := cid.Decode(cidStr); derr == nil {
-				tdr := time.Now()
-				n.dropRef(c) // clear stale refs (+ cached blocks) so the retry fetches over the network
-				fdbg("fetchToPath dropRef closure cleared in %s cid=%s", time.Since(tdr).Round(time.Millisecond), cidStr)
-			}
-		case isCancelled(cidStr) || errStr(err) == "cancelled":
-			// The USER asked to stop (or a waiter cancelled us). Terminal.
-			fdbg("fetchToPath cancelled cid=%s", cidStr)
-			removePartial(dest)
-			return errors.New("cancelled")
-		case n.ctx.Err() != nil:
-			return n.ctx.Err() // node shutting down — terminal
-		case n.dht == nil:
-			// OFFLINE (unit tests / pre-goOnline): no network to retry against — terminal.
-			return err
-		case errors.Is(err, errLocalFatal):
-			// A LOCAL, permanent failure — malformed CID, disk full/read-only, datastore or pin error. Retrying
-			// cannot fix it and an infinite silent spin is the worst kind of "stuck", so this is TERMINAL and is
-			// logged at production level (not fdbg) so the failure is visible without VG_FETCH_DEBUG. "Never give
-			// up" means never give up on a NETWORK problem — not on a broken disk or corrupt input.
-			fmt.Fprintf(os.Stderr, "[fetch] FATAL (not retryable) cid=%s: %v\n", cidStr, err)
-			return err
-		default:
-			// TRANSIENT / NETWORK: a root-fetch timeout, all-gateways failure, a dropped connection, a DHT that
-			// found nobody this pass. None mean the content is unobtainable — only that this attempt reached no
-			// provider. Back off and retry; a provider (our seeder, a friend, Pinata after a rate-limit, a peer
-			// that comes online later) may appear at any time. Unbounded for background downloads (zero deadline);
-			// bounded (deadline threaded into the attempt) for synchronous callers (a launch) and for a cover's
-			// one-attempt-per-sweep queue job, so neither can hang — or hold a DownloadSlot — forever.
-			if time.Since(start) > 5*time.Second { // made progress before failing → reset backoff
-				backoff = 2 * time.Second
-			} else if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			fdbg("fetchToPath attempt %d TRANSIENT (%v) → backoff %s then retry cid=%s", attempt, err, backoff, cidStr)
-			if exit, e := n.backoffWait(cidStr, dest, backoff, deadline); exit {
-				return e
-			}
-		}
+// classifyFetchErr maps one attempt's error to a fetchOutcome. hard-stall / network / offline are Retryable (the
+// queue backs off and rotates — retry-forever without a held slot). Only two things are TERMINAL: a USER cancel
+// (isCancelled — the request surfaces as "cancelled", or as context.Canceled when it lands inside getRoot) and an
+// errLocalFatal (bad CID, ENOSPC, datastore). getRoot's OWN internal libCtx timeout ALSO surfaces as context.Canceled
+// but is a transient give-up → Retryable; classifying it terminal made every gated fetch die after one attempt.
+func classifyFetchErr(cidStr string, err error) int {
+	switch {
+	case err == nil:
+		return fetchDone
+	case errors.Is(err, errLocalFatal):
+		return fetchTerminal
+	case isCancelled(cidStr):
+		return fetchTerminal
+	default:
+		return fetchRetryable
 	}
 }
 
-// dirFetchAttempts bounds the retry loop of one fetchDirToPath call. Unlike file fetches (torrent-like, retry forever
-// in a background worker), a source sync runs INSIDE the app's sequential sync worker — an unbounded loop there would
-// wedge every source behind one dead CID. The C++ side re-runs syncSources periodically while a source is missing, so
-// bounded-here + periodic-there = indefinite retry overall with bounded workers.
-const dirFetchAttempts = 4
-
-// fetchDirToPath materializes a UnixFS DIRECTORY CID with the same resilience as file fetches: each attempt is
-// stall-guarded (no byte written for stallTimeout tears the attempt down instead of hanging forever), failures back
-// off and retry, and every fetched block persists in the blockstore between attempts — so a retry refills instantly
-// to where the last attempt died and continues from there (natural resume, no sidecar needed for a small meta tree).
 func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
-	clearCancel(cidStr)
-	backoff := 2 * time.Second
-	var err error
-	for attempt := 1; ; attempt++ {
-		if isCancelled(cidStr) {
-			return errors.New("cancelled")
-		}
-		err = n.fetchDirOnce(cidStr, dest, onProgress, onFinalize)
-		if err == nil || err == errMissingFiles || n.ctx.Err() != nil {
-			return err
-		}
-		// Offline (tests / local-only materialize): the error is not transient, retrying is pure delay.
-		if n.dht == nil {
-			return err
-		}
-		if attempt >= dirFetchAttempts {
-			return err
-		}
-		fdbg("fetchDirToPath attempt %d failed (%v) → backoff %s then retry cid=%s", attempt, err, backoff, cidStr)
-		select {
-		case <-time.After(backoff):
-		case <-n.ctx.Done():
-			return n.ctx.Err()
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
+	return n.fetchDirOnce(cidStr, dest, onProgress, onFinalize) // ONE attempt; the C++ rolling queue re-dispatches
 }
 
 // fetchDirOnce is one attempt: root fetch (bounded, with gateway fallback), then a stall-guarded tree materialize.
@@ -857,6 +553,12 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 	if err != nil {
 		return localFatal(err) // malformed CID — no retry can fix it
 	}
+	// Proactively freshen provider addresses on EVERY attempt (moved here from the deleted retry loop): a live DHT
+	// walk + connect in parallel with bitswap, so a provider that restarted (new ports) or a NAT'd seeder is
+	// re-discovered/holepunched instead of the C++ rotation re-dialing a stale peerstore forever. All no-op offline.
+	n.warmProviders(c)
+	n.warmSeedLevelProviders() // fresh content may have no DHT record yet — whoever seeds our sources has it
+	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
 	if _, err := os.Stat(dest); err == nil {
 		// dest already on disk. Two cases:
 		//  * no .part sidecar → finalize completed fully (referenced + pinned + announced) → fast no-op.

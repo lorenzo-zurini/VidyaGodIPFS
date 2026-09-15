@@ -587,31 +587,3 @@ func TestAFetchNarratesItsPhases(t *testing.T) {
 		}
 	}
 }
-
-// The retry loop's narration: with nothing to fetch from, each attempt announces itself.
-func TestTheRetryLoopNarratesItsAttempts(t *testing.T) {
-	n := offlineNode(t) // fully wired (fstore/pinner), dht nil → getRoot never touches gateways, terminal fast
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	bs, stop := peerlessBitswapOver(t, ctx, n.bstore)
-	origDserv, origBserv := n.dserv, n.bserv
-	n.dserv, n.bserv = merkledag.NewDAGService(bs), bs
-	t.Cleanup(func() { n.dserv, n.bserv = origDserv, origBserv; stop() })
-	pn := merkledag.NodeWithData([]byte("nobody has this"))
-
-	var pmu sync.Mutex
-	var lines []string
-	phaseHook = func(cid, text string) { pmu.Lock(); lines = append(lines, text); pmu.Unlock() }
-	defer func() { phaseHook = nil }()
-	origT := rootLibp2pTimeout
-	rootLibp2pTimeout = 200 * time.Millisecond
-	defer func() { rootLibp2pTimeout = origT }()
-
-	_ = n.fetchToPathLoopUntil(pn.Cid().String(), t.TempDir()+"/out.bin", nil, nil, time.Now().Add(1*time.Second))
-	pmu.Lock()
-	defer pmu.Unlock()
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "attempt 1 — connecting to providers") {
-		t.Fatalf("attempt narration missing; got:\n%s", joined)
-	}
-}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -253,28 +252,5 @@ func TestRollingWindowRollsUnderATightBudget(t *testing.T) {
 	}
 	if globalWantPool.available() != 8 {
 		t.Errorf("budget not restored after fetch: available=%d want 8", globalWantPool.available())
-	}
-}
-
-// A bounded (deadline'd) fetch must STOP at its deadline even for content it could otherwise get — the in-loop
-// deadline is what keeps a synchronous launch/cover from blocking a user action forever. Using a deadline in the
-// past makes it deterministic: the loop must return a deadline error before it even attempts (so no dependence on
-// network timing). Teeth: delete the deadline check in fetchToPathLoopUntil and this present-content fetch
-// succeeds (returns nil) instead of erroring.
-func TestBoundedFetchStopsAtItsDeadline(t *testing.T) {
-	n := offlineNode(t)
-	dir := t.TempDir()
-	src := filepath.Join(dir, "x.bin")
-	writeFile(t, src, sampleBytes())
-	c, err := n.addNoCopy(src) // content IS present — only the deadline should stop the fetch
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = n.fetchToPathLoopUntil(c.String(), filepath.Join(dir, "out.bin"), nil, nil, time.Now().Add(-time.Hour))
-	if err == nil {
-		t.Fatal("a past deadline must stop the fetch with an error, even for present content")
-	}
-	if !errors.Is(err, errFetchDeadline) {
-		t.Errorf("expected a deadline error, got %v", err)
 	}
 }

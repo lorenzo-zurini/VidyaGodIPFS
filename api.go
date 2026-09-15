@@ -22,7 +22,6 @@ import "C"
 
 import (
 	"encoding/json"
-	"time"
 	"unsafe"
 
 	cid "github.com/ipfs/go-cid"
@@ -565,51 +564,18 @@ func shortCid2(s string) string {
 	return s[:6] + ".." + s[len(s)-4:]
 }
 
-//export VgFetchToPath
-func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
-	n := get()
-	if n == nil {
-		setStr(errOut, "node not started")
-		return -1
-	}
-	cs := C.GoString(cidStr)
-	d := C.GoString(dest)
-
-	// One C string for the CID, reused across every event for this transfer.
-	ccid := C.CString(cs)
-	defer C.free(unsafe.Pointer(ccid))
-	emit := func(kind int, pct float64, ok int, errc *C.char) {
-		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
-	}
-
-	emit(kindStarted, -1, 0, nil)
-	err := n.fetchToPath(cs, d,
-		func(pct float64) { emit(kindProgress, pct, 0, nil) },
-		func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
-	if err != nil {
-		ec := C.CString(err.Error())
-		defer C.free(unsafe.Pointer(ec))
-		emit(kindFinished, -1, 0, ec)
-		setStr(errOut, err.Error())
-		return -1
-	}
-	emit(kindFinished, 100, 1, nil)
-	return 0
-}
-
-// VgFetchToPathBounded is VgFetchToPath with a WALL-CLOCK BUDGET for SYNCHRONOUS callers (launch-time layer
-// materialization, cover fetches) that must not hang a user action forever. It waits up to timeoutMs, then returns
-// an error. Whether the fetch CONTINUES after that depends on who else wants it: if an unbounded background
-// download of the same dest is also waiting, leadership passes to it and the transfer continues (resuming from the
-// .part bitmap); if this bounded call is the sole caller, the fetch is torn down at the deadline (the partial file
-// + .part stay on disk, so a later attempt resumes from there). timeoutMs<=0 waits forever (== VgFetchToPath).
+// VgFetchOnce runs ONE fetch attempt for a CID to dest and returns a CLASSIFIED outcome for the C++ rolling queue:
+// 0 = Done (complete + seeded), 1 = Retryable (stalled / no providers / offline / a cleared stale ref — the queue
+// backs off and re-dispatches), 2 = Terminal (cancelled, malformed CID, or a local/disk error). isDir != 0 fetches a
+// directory (meta) CID. There is NO internal retry loop and NO wall-clock budget: retry/backoff/stall-demotion live
+// in the dispatcher; a bounded CALLER instead bounds its WAIT (WaitBatch) while the item keeps rolling in the queue.
 //
-//export VgFetchToPathBounded
-func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut **C.char) C.int {
+//export VgFetchOnce
+func VgFetchOnce(cidStr *C.char, dest *C.char, isDir C.int, errOut **C.char) C.int {
 	n := get()
 	if n == nil {
 		setStr(errOut, "node not started")
-		return -1
+		return fetchRetryable // not fatal: the node may come up; the queue will re-dispatch
 	}
 	cs := C.GoString(cidStr)
 	d := C.GoString(dest)
@@ -618,76 +584,31 @@ func VgFetchToPathBounded(cidStr *C.char, dest *C.char, timeoutMs C.int, errOut 
 	emit := func(kind int, pct float64, ok int, errc *C.char) {
 		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
 	}
+	onP := func(pct float64) { emit(kindProgress, pct, 0, nil) }
+	onF := func(pct float64) { emit(kindFinalizing, pct, 0, nil) }
+
 	emit(kindStarted, -1, 0, nil)
 	var err error
-	emitTerminal := true // false when this call was a pure joiner, or a leader that handed its give-up off
-	if timeoutMs > 0 {
-		err, emitTerminal = n.fetchToPathDeadline(cs, d,
-			func(pct float64) { emit(kindProgress, pct, 0, nil) },
-			func(pct float64) { emit(kindFinalizing, pct, 0, nil) },
-			time.Duration(timeoutMs)*time.Millisecond)
+	if isDir != 0 {
+		err = n.fetchDirToPath(cs, d, onP, onF)
 	} else {
-		err = n.fetchToPath(cs, d,
-			func(pct float64) { emit(kindProgress, pct, 0, nil) },
-			func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
+		err = n.fetchToPath(cs, d, onP, onF) // single attempt; clears a stale ref on errMissingFiles
 	}
+	rc := classifyFetchErr(cs, err)
 	if err != nil {
 		setStr(errOut, err.Error())
-		// Emit the terminal Errored event only when this call OWNS the CID's row: it drove the transfer and did not
-		// hand its give-up off to a successor (fetchToPathDeadline computes this). A pure joiner and a handed-off
-		// leader both stay silent (the owner reports its own terminal event); a SOLE bounded give-up still emits so
-		// its row never hangs. Belt-and-braces: IpfsModel also heals Errored→Downloading on a later progress tick.
-		if emitTerminal {
+		// A TERMINAL failure stamps the row Errored. A RETRYABLE one does NOT emit a terminal event — the row keeps
+		// its last phase ("stalled …") and the dispatcher re-dispatches; flapping it to Errored on every rotation
+		// would be a lie. (IpfsModel also heals a stray Errored→Downloading on the next Started/progress.)
+		if rc == fetchTerminal {
 			ec := C.CString(err.Error())
 			defer C.free(unsafe.Pointer(ec))
 			emit(kindFinished, -1, 0, ec)
 		}
-		return -1
-	}
-	if emitTerminal {
-		emit(kindFinished, 100, 1, nil)
-	}
-	return 0
-}
-
-// Recursively materialize a UnixFS DIRECTORY CID (a folder of dehydrated packages) to dest. Fetches the small manifest
-// tree only — no per-layer content hydration. Requires the node's network stack to be up (blocks arrive via bitswap).
-//
-//export VgFetchDirToPath
-func VgFetchDirToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {
-	n := get()
-	if n == nil {
-		setStr(errOut, "node not started")
-		return -1
-	}
-	if VgOnline() == 0 {
-		setStr(errOut, "IPFS networking is offline — enable it to fetch a package CID")
-		return -1
-	}
-	cs := C.GoString(cidStr)
-	d := C.GoString(dest)
-
-	// Report the source fetch through the same transfer callback as file fetches, so a pending/stuck/slow source shows
-	// a live row (Fetching… → Stalled → Pinning… → seeded) in the IPFS tab instead of being silently invisible.
-	ccid := C.CString(cs)
-	defer C.free(unsafe.Pointer(ccid))
-	emit := func(kind int, pct float64, ok int, errc *C.char) {
-		C.vg_invoke_transfer(transferCb, ccid, C.int(kind), C.double(pct), C.int(ok), errc)
-	}
-
-	emit(kindStarted, -1, 0, nil)
-	err := n.fetchDirToPath(cs, d,
-		func(pct float64) { emit(kindProgress, pct, 0, nil) },
-		func(pct float64) { emit(kindFinalizing, pct, 0, nil) })
-	if err != nil {
-		ec := C.CString(err.Error())
-		defer C.free(unsafe.Pointer(ec))
-		emit(kindFinished, -1, 0, ec)
-		setStr(errOut, err.Error())
-		return -1
+		return C.int(rc)
 	}
 	emit(kindFinished, 100, 1, nil)
-	return 0
+	return fetchDone
 }
 
 //export VgRequestCancel

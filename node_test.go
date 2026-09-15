@@ -448,14 +448,16 @@ func TestOrphanedRefDetectedAndFetchErrors(t *testing.T) {
 	if !n.cidMissing(c) {
 		t.Error("orphaned CID (backing file deleted) not detected as missing")
 	}
-	// A download must NOT be blocked by a stale local reference: fetchToPath drops the orphaned reference and
-	// retries over the network. This node is offline, so the retry can't succeed — but the point is it does NOT
-	// return errMissingFiles (it re-fetches instead), and the stale reference is cleared afterwards.
-	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil); err == errMissingFiles {
-		t.Error("fetchToPath returned errMissingFiles instead of dropping the orphaned ref + retrying")
+	// A download must NOT be permanently blocked by a stale local reference. fetchToPath now does ONE attempt:
+	// it CLEARS the orphaned reference (so a re-dispatch fetches over the network) and returns a RETRYABLE outcome —
+	// never a TERMINAL one — which the C++ rolling queue re-dispatches. This node is offline, so the attempt can't
+	// complete; the point is the classification and that the stale ref is gone afterwards.
+	err = n.fetchToPath(c.String(), filepath.Join(dir, "out.bin"), nil, nil)
+	if classifyFetchErr(c.String(), err) == fetchTerminal {
+		t.Errorf("a stale ref must be retryable (drop + re-fetch), got a terminal outcome: %v", err)
 	}
 	if n.hasLocal(c) {
-		t.Error("orphaned reference was not cleared by fetchToPath's drop-and-retry")
+		t.Error("orphaned reference was not cleared by fetchToPath")
 	}
 }
 
