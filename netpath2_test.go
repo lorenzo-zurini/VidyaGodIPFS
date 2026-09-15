@@ -536,3 +536,82 @@ func TestARedirectChainCannotMultiplyTheHeaderTimeout(t *testing.T) {
 		t.Fatalf("the give-up must name the aggregate bound, got: %v", err)
 	}
 }
+
+// The fetch NARRATES itself: every state change emits a phase line the UI shows verbatim — hunting, falling back,
+// stalling and backing off must never look like a stuck "Downloading". Teeth (each caught): drop the attempt line
+// in fetchToPathLoopUntil, the gateway-fallback line in getRoot, or the commit line in fetchViaGateway → the
+// matching assertion fails.
+func TestAFetchNarratesItsPhases(t *testing.T) {
+	n := offlineNode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	payload, root, _, carBytes := scratchLeafDAG(t, ctx, 600_000)
+	var q string
+	var mu sync.Mutex
+	gw := carServer(carBytes, &q, &mu)
+	defer gw.Close()
+
+	bs, stop := peerlessBitswapOver(t, ctx, n.bstore) // nothing local, no peers: p2p must fail → gateway
+	defer stop()
+	origDserv, origBserv, origDht := n.dserv, n.bserv, n.dht
+	n.dserv, n.bserv, n.dht = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}
+	t.Cleanup(func() { n.dserv, n.bserv, n.dht = origDserv, origBserv, origDht })
+	origGWs, origT := trustlessGateways, rootLibp2pTimeout
+	trustlessGateways, rootLibp2pTimeout = []string{gw.URL}, 300*time.Millisecond
+	defer func() { trustlessGateways, rootLibp2pTimeout = origGWs, origT }()
+
+	var pmu sync.Mutex
+	var lines []string
+	phaseHook = func(cid, text string) {
+		if cid == root.String() {
+			pmu.Lock()
+			lines = append(lines, text)
+			pmu.Unlock()
+		}
+	}
+	defer func() { phaseHook = nil }()
+
+	dest := t.TempDir() + "/out.bin"
+	if err := n.fetchToPathOnce(ctx, root.String(), dest, nil, nil); err != nil {
+		t.Fatalf("fetch must complete via the gateway: %v", err)
+	}
+	if got, rerr := os.ReadFile(dest); rerr != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("materialized bytes differ (err=%v)", rerr)
+	}
+	pmu.Lock()
+	defer pmu.Unlock()
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"locating providers", "trying HTTPS gateways", "downloading from 127.0.0.1"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("the narration must contain %q; got:\n%s", want, joined)
+		}
+	}
+}
+
+// The retry loop's narration: with nothing to fetch from, each attempt announces itself.
+func TestTheRetryLoopNarratesItsAttempts(t *testing.T) {
+	n := offlineNode(t) // fully wired (fstore/pinner), dht nil → getRoot never touches gateways, terminal fast
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bs, stop := peerlessBitswapOver(t, ctx, n.bstore)
+	origDserv, origBserv := n.dserv, n.bserv
+	n.dserv, n.bserv = merkledag.NewDAGService(bs), bs
+	t.Cleanup(func() { n.dserv, n.bserv = origDserv, origBserv; stop() })
+	pn := merkledag.NodeWithData([]byte("nobody has this"))
+
+	var pmu sync.Mutex
+	var lines []string
+	phaseHook = func(cid, text string) { pmu.Lock(); lines = append(lines, text); pmu.Unlock() }
+	defer func() { phaseHook = nil }()
+	origT := rootLibp2pTimeout
+	rootLibp2pTimeout = 200 * time.Millisecond
+	defer func() { rootLibp2pTimeout = origT }()
+
+	_ = n.fetchToPathLoopUntil(pn.Cid().String(), t.TempDir()+"/out.bin", nil, nil, time.Now().Add(1*time.Second))
+	pmu.Lock()
+	defer pmu.Unlock()
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "attempt 1 — connecting to providers") {
+		t.Fatalf("attempt narration missing; got:\n%s", joined)
+	}
+}

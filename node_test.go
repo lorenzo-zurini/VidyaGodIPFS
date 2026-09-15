@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -639,6 +640,9 @@ func TestFetchDirSurfacesAnUnreplaceableDest(t *testing.T) {
 	}
 	if err := os.WriteFile(dest+"/old.json", []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not bind root / Windows — the fixture's premise does not hold")
 	}
 	if err := os.Chmod(dest, 0o555); err != nil { // a child + no write bit: RemoveAll(dest) cannot unlink it
 		t.Fatal(err)

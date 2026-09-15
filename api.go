@@ -9,7 +9,8 @@ package main
 /*
 #include <stdlib.h>
 
-// Transfer lifecycle callback (M2+): kind 0=Started 1=Progress 2=Finished. err is non-NULL only on a failed Finished.
+// Transfer lifecycle callback (M2+): kind 0=Started 1=Progress 2=Finished 3=Finalizing 4=Phase. err carries the
+// failure reason on a failed Finished — and, for kind 4, the PHASE TEXT (what the transfer is doing right now).
 typedef void (*vg_transfer_cb)(const char* cid, int kind, double percent, int ok, const char* err);
 
 static inline void vg_invoke_transfer(vg_transfer_cb cb,
@@ -534,7 +535,35 @@ const (
 	kindProgress   = 1
 	kindFinished   = 2
 	kindFinalizing = 3 // all bytes down; the re-reference/"pinning" step is running
+	kindPhase      = 4 // a human-readable line saying what the transfer is DOING right now (text rides the err param)
 )
+
+// phaseHook lets tests observe phase lines without a C callback installed.
+var phaseHook func(cid, text string)
+
+// phase narrates a transfer: one line per state change ("attempt 3 — connecting to providers", "downloading from
+// gateway.pinata.cloud", "stalled — no data for 20s"), shown verbatim on the transfer's UI row. THE FAILURE MODE IS
+// SILENCE doctrine applied to the UI: a fetch that is hunting, backing off or falling back must never just sit on a
+// generic "Downloading" label looking stuck. Also fdbg'd, so the netpaths matrix oracle sees the same narration.
+func phase(cidStr, text string) {
+	fdbg("phase %s: %s", shortCid2(cidStr), text)
+	if phaseHook != nil {
+		phaseHook(cidStr, text)
+	}
+	ccid := C.CString(cidStr)
+	ct := C.CString(text)
+	C.vg_invoke_transfer(transferCb, ccid, C.int(kindPhase), C.double(-1), C.int(0), ct)
+	C.free(unsafe.Pointer(ccid))
+	C.free(unsafe.Pointer(ct))
+}
+
+// shortCid2 trims a CID string for the debug trace (the UI gets the full CID through the callback).
+func shortCid2(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + ".." + s[len(s)-4:]
+}
 
 //export VgFetchToPath
 func VgFetchToPath(cidStr *C.char, dest *C.char, errOut **C.char) C.int {

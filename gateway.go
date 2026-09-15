@@ -12,6 +12,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -181,6 +182,7 @@ func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte int64
 		// COMMIT: this route proved itself. Every other candidate is cancelled NOW (its own context — one still
 		// waiting on headers dies here, not when the winner's stream ends minutes later) and drained as it reports.
 		fdbg("gateway %s won the race for %s — streaming", r.gw, shortCid(root))
+		phase(root.String(), "downloading from "+strings.TrimPrefix(strings.TrimPrefix(r.gw, "https://"), "http://"))
 		for i, cf := range cancels {
 			if cf != nil && trustlessGateways[i] != r.gw {
 				cf()

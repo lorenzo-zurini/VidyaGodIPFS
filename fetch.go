@@ -309,6 +309,7 @@ func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgres
 	defer close(stopPoll)
 
 	// Phase 1 — libp2p/bitswap, bounded by ITS OWN timeout (a fair chance, NOT the whole budget).
+	phase(cidStr, "locating providers (DHT + indexers)")
 	root, err := n.dserv.Get(libCtx, c)
 	if err == nil {
 		return root, nil
@@ -327,6 +328,7 @@ func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgres
 	// the field "will sync when online while the node is up" bug. The gateway has no fixed cap of its own (a big CAR
 	// streams for minutes); its stall watchdog + nctx bound it.
 	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
+	phase(cidStr, "no p2p source answered — trying HTTPS gateways")
 	gerr := n.fetchViaGateway(gwCtx, c, -1, func(read, total int64) {
 		if onProgress != nil && total > 0 {
 			onProgress(math.Min(99, 100.0*float64(read)/float64(total)))
@@ -613,6 +615,7 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 		n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces — connect so bitswap can ask them
 		start := time.Now()
 		fdbg("fetchToPath attempt %d START cid=%s", attempt, cidStr)
+		phase(cidStr, fmt.Sprintf("attempt %d — connecting to providers", attempt))
 		// Bound the ATTEMPT ITSELF by the deadline, not just the loop top: a 30s getRoot, a gateway CAR pull, or a
 		// session that trickles one block per <stallTimeout (never triggering the stall watchdog) must all be torn
 		// down AT the deadline so a synchronous caller returns on time. attemptCtx carries the deadline into every
@@ -639,6 +642,7 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 				backoff *= 2
 			}
 			fdbg("fetchToPath incomplete → backoff %s then resume cid=%s", backoff, cidStr)
+			phase(cidStr, fmt.Sprintf("transfer interrupted — resuming in %s", backoff.Round(time.Second)))
 			if exit, e := n.backoffWait(cidStr, dest, backoff, deadline); exit {
 				return e
 			}
@@ -675,7 +679,8 @@ func (n *node) fetchToPathLoopUntil(cidStr, dest string, onProgress, onFinalize 
 			// found nobody this pass. None mean the content is unobtainable — only that this attempt reached no
 			// provider. Back off and retry; a provider (our seeder, a friend, Pinata after a rate-limit, a peer
 			// that comes online later) may appear at any time. Unbounded for background downloads (zero deadline);
-			// bounded (deadline threaded into the attempt) for synchronous callers so a launch/cover can't hang.
+			// bounded (deadline threaded into the attempt) for synchronous callers (a launch) and for a cover's
+			// one-attempt-per-sweep queue job, so neither can hang — or hold a DownloadSlot — forever.
 			if time.Since(start) > 5*time.Second { // made progress before failing → reset backoff
 				backoff = 2 * time.Second
 			} else if backoff < 30*time.Second {
@@ -1243,6 +1248,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 					if time.Since(time.Unix(0, lastBlk.Load())) > stallTimeout {
 						stalled.Store(true)
 						fdbg("writeThrough: STALL — no block for >%s → tearing down session cid=%s", stallTimeout, cidStr)
+						phase(cidStr, fmt.Sprintf("stalled — no data for %s", stallTimeout))
 						fcancel()
 						return
 					}
@@ -1262,6 +1268,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		// via the .part bitmap). Dropping a block without an fsync is safe — it's redundant with the file bytes, and an
 		// un-synced leaf isn't in the saved bitmap, so resume re-fetches it.
 		fdbg("writeThrough: opening bitswap session, %d leaves, ONE continuous want-list cid=%s", len(need), cidStr)
+		phase(cidStr, fmt.Sprintf("downloading %d block(s) over p2p", len(need)))
 		sess := blockservice.NewSession(fctx, n.bserv)
 		recv := 0
 		sessStart := time.Now()
@@ -1454,6 +1461,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			}
 			base := written
 			fdbg("writeThrough: bitswap stalled with %d/%d leaves missing → HTTPS gateway resume from byte %d cid=%s", bits.count-bits.nset, bits.count, from, cidStr)
+			phase(cidStr, fmt.Sprintf("resuming the missing %d block(s) over HTTPS gateway", bits.count-bits.nset))
 			rctx, rstop := userCancelCtx(nctx, cidStr)
 			gerr := n.fetchViaGateway(rctx, root, from, func(read, _ int64) {
 				if total > 0 && onProgress != nil {
