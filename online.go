@@ -54,6 +54,9 @@ func loadOrCreateIdentity(repoPath string) (crypto.PrivKey, error) {
 // consults the fast delegated HTTP indexer alongside the (slow, cold) Amino DHT and uses whichever answers first.
 type combinedFinder struct{ routers []routing.ContentDiscovery }
 
+// delegatedIndexers: every delegated-routing (IPNI) endpoint the finder races. Overridable in tests / the matrix.
+var delegatedIndexers = []string{"https://delegated-ipfs.dev", "https://cid.contact"}
+
 func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, count int) <-chan peer.AddrInfo {
 	out := make(chan peer.AddrInfo)
 	var wg sync.WaitGroup
@@ -194,11 +197,19 @@ func (n *node) goOnline() error {
 	// friendFinder makes our accepted friends providers for EVERY cid (friendprovider.go) — the only content router
 	// that still works when the DHT is dead and the delegated indexer knows only a throttling third party. Listed
 	// FIRST so a friend who has the content is asked immediately, before the slow/rate-limited routers answer.
-	if hc, herr := routinghttp.New("https://delegated-ipfs.dev", routinghttp.WithHTTPClient(dohHTTPClient(newDoHResolver()))); herr == nil {
-		finder = combinedFinder{routers: []routing.ContentDiscovery{friendFinder{n}, kad, routinghttpcr.NewContentRoutingClient(hc)}}
-	} else {
-		finder = combinedFinder{routers: []routing.ContentDiscovery{friendFinder{n}, kad}}
+	// Delegated HTTP indexers, RACED: combinedFinder fans out to every router, so a second indexer costs nothing and
+	// removes the single point of failure the path matrix exposed. Pinata does NOT announce to the Amino DHT (the
+	// DHT returned only our own dead seeder's stale record), so for Pinata-pinned content the indexer IS the libp2p
+	// path — and on the laptop-at-work run delegated-ipfs.dev answered 0, leaving nothing but the gateway. cid.contact
+	// is the canonical IPNI instance (same /routing/v1 API). Each gets a DoH-resolving client so it works through a
+	// DNS filter too. [finder] router indices: 0 friends, 1 DHT, then the indexers in delegatedIndexers order.
+	routers := []routing.ContentDiscovery{friendFinder{n}, kad}
+	for _, u := range delegatedIndexers {
+		if hc, herr := routinghttp.New(u, routinghttp.WithHTTPClient(dohHTTPClient(newDoHResolver()))); herr == nil {
+			routers = append(routers, routinghttpcr.NewContentRoutingClient(hc))
+		}
 	}
+	finder = combinedFinder{routers: routers}
 	n.upSeen = make(map[string]int64)
 	// Concurrent-UPLOAD tuning. boxo's server defaults cap a SINGLE peer to 1 MiB of outstanding (in-flight) block
 	// bytes (~4× 256 KiB) and 8 send workers. When one downloader fetches several files at once (e.g. our 3-way

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -609,5 +610,49 @@ func TestFetchDirToPath(t *testing.T) {
 	}
 	if !pinned {
 		t.Errorf("fetched dir root %s is not recursively pinned", dirNode.Cid())
+	}
+}
+
+// fetchDirOnce must SURFACE a dest that cannot be replaced (EACCES and kin) instead of failing the rename with
+// "file exists" forever while the real cause is discarded — and must not leave the materialized tmp tree behind.
+// Teeth: restore `_ = os.RemoveAll(dest)` → the error text is the rename's "file exists", not "permission denied".
+func TestFetchDirSurfacesAnUnreplaceableDest(t *testing.T) {
+	n := offlineNode(t)
+	dir, err := ufsio.NewDirectory(n.dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.AddChild(n.ctx, "pkg.json", fileNodeFromBytes(t, n, []byte(`{"NODE_ID":"pkg"}`))); err != nil {
+		t.Fatal(err)
+	}
+	dnode, err := dir.GetNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.dserv.Add(n.ctx, dnode); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir() + "/src"
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest+"/old.json", []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dest, 0o555); err != nil { // a child + no write bit: RemoveAll(dest) cannot unlink it
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dest, 0o755) })
+
+	err = n.fetchDirOnce(dnode.Cid().String(), dest, nil, nil)
+	if err == nil {
+		t.Fatal("an unreplaceable dest must fail the fetch")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("the error must carry the REAL cause (permission denied), got: %v", err)
+	}
+	if _, serr := os.Stat(dest + ".tmp"); serr == nil {
+		t.Fatal("the materialized tmp tree must not be left behind")
 	}
 }

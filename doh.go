@@ -25,14 +25,24 @@ import (
 // by querying Cloudflare's DoH JSON API. Falls back to the OS resolver if DoH is unreachable, so it's a safe no-op on
 // normal networks.
 type dohResolver struct {
-	hc       *http.Client
-	endpoint string // https://1.1.1.1/dns-query — IP literal, needs no DNS to reach
+	hc        *http.Client
+	endpoints []string // IP-literal DoH JSON endpoints, RACED (see query) — none needs DNS to reach
+}
+
+// dohEndpoints: every entry is an IP literal (no bootstrap paradox) whose TLS cert carries the IP SAN, and every one
+// speaks the same JSON shape (Answer[].type/data). Cloudflare + Google, so a network that filters one provider still
+// resolves through the other. Overridable in tests.
+var dohEndpoints = []string{
+	"https://1.1.1.1/dns-query",
+	"https://1.0.0.1/dns-query",
+	"https://8.8.8.8/resolve",
+	"https://8.8.4.4/resolve",
 }
 
 func newDoHResolver() *dohResolver {
 	return &dohResolver{
-		endpoint: "https://1.1.1.1/dns-query",
-		hc:       &http.Client{Timeout: 10 * time.Second}, // dials the IP literal directly; TLS SNI covers 1.1.1.1
+		endpoints: dohEndpoints,
+		hc:        &http.Client{Timeout: 6 * time.Second}, // per-endpoint cap; the race makes it the WORST case, not the sum
 	}
 }
 
@@ -41,8 +51,41 @@ type dohAnswer struct {
 	Data string `json:"data"`
 }
 
+// query HEDGES the lookup across every endpoint at once: the first good answer wins and the rest are cancelled. A
+// single blocked or dead resolver (a filtered 1.1.1.1 at work) then costs nothing instead of everything, and the
+// worst case is ONE endpoint timeout, not their sum — the sequential form would have made a DNS-dead network take
+// 4x longer to reach the OS fallback. Every DNS-named path (bootstrap, indexer, gateways) sits on this.
 func (d *dohResolver) query(ctx context.Context, name, qtype string) ([]dohAnswer, error) {
-	u := d.endpoint + "?name=" + url.QueryEscape(name) + "&type=" + qtype
+	qctx, cancel := context.WithCancel(ctx)
+	defer cancel() // first success cancels the losers
+	type res struct {
+		ans []dohAnswer
+		err error
+	}
+	ch := make(chan res, len(d.endpoints)) // buffered: a late loser never blocks after we return
+	for _, ep := range d.endpoints {
+		ep := ep
+		safeGo("doh.hedge", func() {
+			a, e := d.queryOne(qctx, ep, name, qtype)
+			ch <- res{a, e}
+		})
+	}
+	var lastErr error
+	for range d.endpoints {
+		r := <-ch
+		if r.err == nil {
+			return r.ans, nil
+		}
+		lastErr = r.err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("doh %s/%s: no endpoints configured", name, qtype)
+	}
+	return nil, lastErr
+}
+
+func (d *dohResolver) queryOne(ctx context.Context, endpoint, name, qtype string) ([]dohAnswer, error) {
+	u := endpoint + "?name=" + url.QueryEscape(name) + "&type=" + qtype
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -67,6 +110,9 @@ func (d *dohResolver) query(ctx context.Context, name, qtype string) ([]dohAnswe
 }
 
 func (d *dohResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if benchHostBlocked(host) { // external DNS-layer block (bench.go) - refused outright, no OS fallback
+		return nil, fmt.Errorf("bench: host %q blocked (VG_BENCH_BLOCK_HOSTS)", host)
+	}
 	var out []net.IPAddr
 	for _, qt := range []string{"A", "AAAA"} {
 		ans, err := d.query(ctx, host, qt)
@@ -86,6 +132,9 @@ func (d *dohResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 }
 
 func (d *dohResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
+	if benchHostBlocked(name) { // covers _dnsaddr.<bootstrap host> TXT lookups too
+		return nil, fmt.Errorf("bench: host %q blocked (VG_BENCH_BLOCK_HOSTS)", name)
+	}
 	ans, err := d.query(ctx, name, "TXT")
 	if err != nil {
 		return net.DefaultResolver.LookupTXT(ctx, name)
@@ -117,9 +166,21 @@ func dohHTTPClient(d *dohResolver) *http.Client {
 // gateway CAR of a big file takes minutes). A whole-request Timeout would abort mid-download ("context deadline
 // exceeded"). Instead the caller bounds it with the request context + a stall watchdog on the body; the transport's
 // ResponseHeaderTimeout still catches a gateway that never starts responding.
+//
+// gatewayHeaderTimeout bounds how long a route gets to produce response headers — per hop in the transport, and in
+// aggregate per candidate (fetchViaGateway arms a timer over the whole open, because the public routes are redirect
+// chains). It is also the whole cost of probing a gateway for content it does not have: no cheap definitive negative
+// exists (tools/gwprobe.sh + dated output: Pinata 404s an absent CID only at ~62 s; only-if-cached answered 412 for
+// present content in one manual probe and 200 in the committed one — inconsistent, so not usable). 45 s = ~2× margin
+// over the worst observed public-backend success (a 20.3 s first block, run-6; that run's log was overwritten —
+// results now survive one generation as .prev). Cost where NO gateway has the content (a friend's own package):
+// each stalled attempt pays hedge delay + this in the resume, so the offline-friend cycle is stall 20 s + ~55 s +
+// backoff ≈ 80 s per lap, for as long as the friend stays offline. (var: tests shrink it)
+var gatewayHeaderTimeout = 45 * time.Second
+
 func dohStreamingClient(d *dohResolver) *http.Client {
 	t := dohTransport(d)
-	t.ResponseHeaderTimeout = 45 * time.Second
+	t.ResponseHeaderTimeout = gatewayHeaderTimeout
 	t.IdleConnTimeout = 90 * time.Second
 	return &http.Client{Transport: t} // Timeout: 0 — no whole-request cap; the context + stall watchdog bound it
 }
@@ -134,6 +195,12 @@ func dohTransport(d *dohResolver) *http.Transport {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil || net.ParseIP(host) != nil {
 				return dialer.DialContext(ctx, network, addr) // already an IP (or unparseable) → dial as-is
+			}
+			// A DELIBERATE block (VG_BENCH_BLOCK_HOSTS) is refused HERE, before the lookup: the fallback below
+			// re-dials the bare hostname through the OS resolver when DoH fails — right for an unreachable DoH,
+			// but it silently punched through the block (the path matrix saw the "blocked" indexer answering).
+			if benchHostBlocked(host) {
+				return nil, fmt.Errorf("bench: host %q blocked (VG_BENCH_BLOCK_HOSTS)", host)
 			}
 			ips, err := d.LookupIPAddr(ctx, host)
 			if err != nil || len(ips) == 0 {

@@ -21,7 +21,7 @@ func TestGatewayFetchImports(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	if err := n.fetchViaGateway(ctx, c, nil); err != nil {
+	if err := n.fetchViaGateway(ctx, c, -1, nil); err != nil {
 		t.Skipf("no trustless gateway reachable (offline?): %v", err)
 	}
 	has, err := n.bstore.Has(ctx, c)

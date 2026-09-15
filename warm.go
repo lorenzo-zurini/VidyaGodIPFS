@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"fmt"
+	swarm "github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"os"
 	"sync"
 	"time"
@@ -93,10 +94,26 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	}
 }
 
+// clearDialBackoff lifts libp2p's per-peer dial backoff. The swarm backs a peer off after a failed dial (seconds,
+// growing per failure), so a provider that refused ONE transient dial is silently not re-dialed by bitswap or by us
+// for the next attempt(s): the connect-probe against Pinata's wss peer measured two dead 30 s attempts after a single
+// failed dial, then success once the backoff lapsed. Every fetch attempt is a deliberate retry — give the provider a
+// fresh dial. Scoped to the peers we are about to warm; no other dial policy changes. No-op on non-swarm networks
+// (mocknet in tests).
+func (n *node) clearDialBackoff(pid peer.ID) {
+	if n.host == nil {
+		return
+	}
+	if sw, ok := n.host.Network().(*swarm.Swarm); ok {
+		sw.Backoff().Clear(pid)
+	}
+}
+
 // dialWarm connects to pi with a bounded timeout, logging the outcome (VG_FETCH_DEBUG) + a bench line (VG_BENCH_OBSERVE).
 func (n *node) dialWarm(ctx context.Context, pi peer.AddrInfo, via string) {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	n.clearDialBackoff(pi.ID) // a retry must actually re-dial (see clearDialBackoff)
 	td := time.Now()
 	if err := n.host.Connect(cctx, pi); err != nil {
 		fdbg("warm: connect(%s) to %s failed after %s: %v", via, shortPeer(pi.ID.String()), time.Since(td).Round(time.Millisecond), err)

@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
@@ -49,6 +50,46 @@ func benchBlockedCIDRs() []*net.IPNet {
 		}
 	}
 	return out
+}
+
+// VG_BENCH_BLOCK_HOSTS=host1,host2 - an EXTERNAL, DNS-layer block: the DoH resolver REFUSES these names (suffix
+// match, so "bootstrap.libp2p.io" also covers "_dnsaddr.bootstrap.libp2p.io") with NO OS-resolver fallback. Every
+// DNS-named path funnels through that resolver - libp2p /dns + /dnsaddr dials (the bootstrap peers, DNS-addressed
+// providers), the delegated indexer, the HTTPS gateways - so this switches any of them off from OUTSIDE the fetch
+// logic. Paired with VG_BENCH_BLOCK_CIDRS (libp2p-only, IP-level) it isolates each network path for the path
+// matrix (tools/netpaths.sh): e.g. a dead DHT = block bootstrap.libp2p.io + CIDR 104.131.131.82/32.
+// benchBlockedHosts parses VG_BENCH_BLOCK_HOSTS once per distinct value (it is consulted on every lookup and every
+// transport dial; tests change it between cases, so the cache is keyed on the raw value, not parsed once for good).
+var benchHostsMu sync.Mutex
+var benchHostsRaw string
+var benchHostsList []string
+
+func benchBlockedHosts() []string {
+	raw := os.Getenv("VG_BENCH_BLOCK_HOSTS")
+	benchHostsMu.Lock()
+	defer benchHostsMu.Unlock()
+	if benchHostsList != nil && raw == benchHostsRaw {
+		return benchHostsList
+	}
+	out := []string{}
+	for _, h := range strings.Split(raw, ",") {
+		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
+			out = append(out, h)
+		}
+	}
+	benchHostsRaw, benchHostsList = raw, out
+	return out
+}
+
+// benchHostBlocked reports whether a hostname (or any of its subdomains) is on the VG_BENCH_BLOCK_HOSTS list.
+func benchHostBlocked(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(host), ".")
+	for _, b := range benchBlockedHosts() {
+		if h == b || strings.HasSuffix(h, "."+b) {
+			return true
+		}
+	}
+	return false
 }
 
 // newBenchGater returns a connection gater blocking the tunnel subnets, or nil if the facility is off / build fails.

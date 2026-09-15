@@ -79,6 +79,7 @@ func deadlineErr(cidStr string) error { return fmt.Errorf("fetch of %s %w", cidS
 //     waiter is still in-budget (or unbounded), that waiter loops back, becomes the new leader, and CONTINUES the
 //     fetch — it resumes from the .part bitmap, so nothing is refetched. Whoever has the longest budget ends up
 //     leading; a truly unbounded waiter leads until the content lands.
+//
 // The returned `ran` is true iff THIS call executed the fetch (as the original leader, or as a joiner that took
 // over via handoff). It is false for a pure joiner that only waited (and then inherited a result or abandoned).
 // Callers that emit transfer events use it so that only the call actually driving the transfer reports its
@@ -248,23 +249,109 @@ func fdbg(format string, a ...interface{}) {
 // in time (a hostile/captive network where the DHT finds providers but no transport connects, e.g. Pinata's ws:3000
 // mangled by a proxy) — falls back to importing the whole DAG from an HTTPS trustless gateway (gateway.go) and reads
 // the root from the now-local blockstore. On a normal network the root arrives fast and the gateway is never touched.
+var rootLibp2pTimeout = 30 * time.Second // how long the libp2p/bitswap root fetch gets BEFORE the gateway fallback (var: tests shrink it)
+
+// rootNoPeersGrace: how long phase 1 tolerates the node having NO connected peers at all before handing off to the
+// gateway. Zero peers means no bitswap fetch can ever complete, so waiting the full rootLibp2pTimeout there is pure
+// waste (the isolation matrix measured 30 of a 72 s gateway-only fetch spent exactly so). The grace covers the
+// first seconds after startup while bootstrap connects; a bootstrapped node always has peers. (var: tests shrink it)
+var rootNoPeersGrace = 5 * time.Second
+
 func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgress func(pct float64)) (ipld.Node, error) {
-	// Parent on nctx (the attempt's deadline ctx), not n.ctx: a bounded caller's deadline caps the root fetch AND
-	// the gateway fallback below at min(30s, remaining budget) instead of a fixed 30s that can blow past the deadline.
-	getCtx, cancel := context.WithTimeout(nctx, 30*time.Second)
-	defer cancel()
-	// Honour a user-cancel DURING the (up to 30s) root fetch AND the gateway fallback below — both run under
-	// getCtx. Without this a cancelled download blocks a waiter (and holds a download slot) for the full timeout.
-	// The poller exits when getCtx is done (the deferred cancel) or when told to stop after the fetch returns.
+	// A single user-cancel poller for the whole call: it cancels whichever phase is running. Both phase contexts are
+	// children of nctx, so a bounded caller's deadline (or node shutdown) still bounds the total.
+	// A BOUNDED caller (a cover's 30 s, a launch's per-layer budget) splits its budget between the two phases: libp2p
+	// gets at most half of what is left, so the gateway always gets a real share. Otherwise the libp2p phase alone
+	// ate the whole budget on any network where the DHT/indexers turn up nothing (Pinata-only content), the deadline
+	// fired the instant the gateway would have started, and covers "did not complete before its deadline" while the
+	// unbounded game download beside them succeeded through that very gateway.
+	libTimeout := rootLibp2pTimeout
+	if dl, ok := nctx.Deadline(); ok {
+		if half := time.Until(dl) / 2; half < libTimeout {
+			libTimeout = half
+		}
+	}
+	libCtx, libCancel := context.WithTimeout(nctx, libTimeout)
+	defer libCancel()
+	gwCtx, gwCancel := context.WithCancel(nctx)
+	defer gwCancel()
 	stopPoll := make(chan struct{})
 	safeGo("fetch.getRootCancel", func() {
 		t := time.NewTicker(250 * time.Millisecond)
 		defer t.Stop()
+		var zeroPeersSince time.Time
 		for {
 			select {
 			case <-stopPoll:
 				return
-			case <-getCtx.Done():
+			case <-nctx.Done():
+				return
+			case <-t.C:
+				if isCancelled(cidStr) {
+					libCancel()
+					gwCancel()
+					return
+				}
+				// Phase-1 short-circuit (see rootNoPeersGrace): no connected peers for the grace period → end the
+				// libp2p attempt now so the gateway runs; libCancel is idempotent and never touches phase 2.
+				if n.host != nil && len(n.host.Network().Peers()) == 0 {
+					if zeroPeersSince.IsZero() {
+						zeroPeersSince = time.Now()
+					} else if time.Since(zeroPeersSince) >= rootNoPeersGrace {
+						libCancel()
+					}
+				} else {
+					zeroPeersSince = time.Time{}
+				}
+			}
+		}
+	})
+	defer close(stopPoll)
+
+	// Phase 1 — libp2p/bitswap, bounded by ITS OWN timeout (a fair chance, NOT the whole budget).
+	root, err := n.dserv.Get(libCtx, c)
+	if err == nil {
+		return root, nil
+	}
+	if isMissingFile(err) {
+		return nil, errMissingFiles
+	}
+	if n.dht == nil {
+		return nil, err // offline (unit tests / pre-goOnline): no DHT means no network — do not touch real gateways
+	}
+
+	// Phase 2 — HTTPS trustless-gateway fallback for hostile/captive networks (DHT finds junk/loopback provider
+	// addrs, no transport connects). CRITICAL: it runs under gwCtx, a FRESH context derived from nctx — NOT libCtx,
+	// which phase 1 just exhausted. Sharing the spent libp2p deadline made every gateway request fail "context
+	// deadline exceeded" the instant it started, so on exactly the networks the fallback exists for it never ran —
+	// the field "will sync when online while the node is up" bug. The gateway has no fixed cap of its own (a big CAR
+	// streams for minutes); its stall watchdog + nctx bound it.
+	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
+	gerr := n.fetchViaGateway(gwCtx, c, -1, func(read, total int64) {
+		if onProgress != nil && total > 0 {
+			onProgress(math.Min(99, 100.0*float64(read)/float64(total)))
+		}
+	})
+	if gerr != nil {
+		fdbg("getRoot: gateway fallback failed cid=%s: %v", cidStr, gerr)
+		return nil, err // surface the original network error
+	}
+	return n.dserv.Get(nctx, c) // DAG now in the local blockstore
+}
+
+// userCancelCtx derives a context cancelled when the user cancels cidStr (250 ms poll), for a phase that has no
+// session poller of its own. Call the returned stop when the phase ends.
+func userCancelCtx(parent context.Context, cidStr string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := make(chan struct{})
+	safeGo("fetch.userCancel", func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
 				return
 			case <-t.C:
 				if isCancelled(cidStr) {
@@ -274,27 +361,31 @@ func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgres
 			}
 		}
 	})
-	root, err := n.dserv.Get(getCtx, c)
-	if err == nil {
-		close(stopPoll)
-		return root, nil
+	return ctx, func() { close(stop); cancel() }
+}
+
+// monotoneProgress wraps a progress callback so ONE attempt's bar never runs backwards. An attempt is one piece of
+// work measured by two rulers in turn: the gateway phase reports CAR bytes over the wire, then the materialize phase
+// reports file bytes on disk starting from what the .part bitmap says (nothing, right after a CAR import — every leaf
+// is local and is written through in a blink). Unwrapped, the user saw the bar hit 100%, then a second, quick bar
+// from 0 before "pinning". Held at its high-water mark, it is one bar. A RETRY gets a fresh wrapper: a resume really
+// does start where the bitmap says.
+func monotoneProgress(f func(pct float64)) func(pct float64) {
+	if f == nil {
+		return nil
 	}
-	if isMissingFile(err) {
-		close(stopPoll)
-		return nil, errMissingFiles
+	var mu sync.Mutex
+	hi := -1.0
+	return func(pct float64) {
+		mu.Lock()
+		if pct < hi {
+			pct = hi
+		} else {
+			hi = pct
+		}
+		mu.Unlock()
+		f(pct)
 	}
-	if n.dht == nil {
-		close(stopPoll)
-		return nil, err // offline (unit tests / pre-goOnline): no DHT means no network — do not touch real gateways
-	}
-	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
-	gerr := n.fetchViaGateway(getCtx, c, onProgress) // under getCtx: a cancel interrupts the gateway CAR too
-	close(stopPoll)
-	if gerr != nil {
-		fdbg("getRoot: gateway fallback failed cid=%s: %v", cidStr, gerr)
-		return nil, err // surface the original network error
-	}
-	return n.dserv.Get(nctx, c) // DAG now in the local blockstore
 }
 
 // shortCid trims a CID for readable logs (first 6 + last 4 of the base58/base32 string).
@@ -308,7 +399,7 @@ func shortCid(c cid.Cid) string {
 
 // stallTimeout: if no block arrives for this long the fetch session is torn down so the wrapper can back off and RESUME
 // from the on-disk bitmap (a dead peer shouldn't hang the download). Longer than the UI's 6s "Stalled" hint.
-const stallTimeout = 20 * time.Second
+var stallTimeout = 20 * time.Second // (var: tests shrink it)
 
 // fetchWindow bounds how many leaves are requested from bitswap at once — and thus how many received blocks are buffered
 // (in the channel + the plain blockstore) before they're written to disk and dropped. It caps a fetch's resident memory
@@ -650,6 +741,7 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 	if err != nil {
 		return err
 	}
+	onProgress = monotoneProgress(onProgress)
 	// A meta/collection CID is a DIRECTORY, and fetching one on a hostile network needs the same proactive provider
 	// warming that single-file fetches get (warm.go): a live DHT provider walk + connect in parallel with bitswap, so a
 	// NAT'd provider is holepunched before getRoot's deadline instead of relying on bitswap's slower passive connect.
@@ -724,9 +816,15 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 		}
 		return werr
 	}
-	_ = os.RemoveAll(dest)
+	if err := os.RemoveAll(dest); err != nil {
+		// dest cannot be replaced (EACCES and kin). Swallowing this made the NEXT line fail "file exists" forever —
+		// the real cause was the one value discarded. Terminal: re-fetching cannot fix a permission problem.
+		_ = os.RemoveAll(tmp)
+		return localFatal(err)
+	}
 	if err := os.Rename(tmp, dest); err != nil {
-		return err
+		_ = os.RemoveAll(tmp) // don't leave the materialized tree behind on the failure path
+		return localFatal(err)
 	}
 	// Pin the folder root recursively so the fetched source tree is SEEDED (reprovided to the DHT) and shows in VgPinLs
 	// — mirrors addDirNoCopy. Best-effort: the files are already on disk, so a pin hiccup must not fail the fetch.
@@ -749,6 +847,7 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
+	onProgress = monotoneProgress(onProgress)
 	c, err := cid.Decode(cidStr)
 	if err != nil {
 		return localFatal(err) // malformed CID — no retry can fix it
@@ -1333,6 +1432,67 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			_ = out.Close()
 			removePartial(dest) // explicit cancel discards the partial
 			return errors.New("cancelled")
+		}
+		// The session STALLED with leaves missing while the node is online: before giving the attempt up, ask the HTTPS
+		// gateways for exactly what is missing — an entity-bytes CAR from the first missing leaf's offset on. This is
+		// the second transport for LEAVES, the same way getRoot has it for the root. Without it a DAG whose root had
+		// landed (a hedge winner that died mid-stream; a CAR cut by the stall watchdog) was stuck for good on a
+		// gateway-only network: every later attempt found the root locally, never re-entered the gateway, and looped
+		// on a bitswap session with nobody to ask (isolation matrix run-4: seven identical "incomplete" attempts).
+		// The resume is USER-CANCELLABLE on its own: fetch.worker (the session's cancel poller) has already exited
+		// on the stall, and nctx is n.ctx for a background download, so without userCancelCtx a Cancel pressed
+		// during a multi-GB CAR would stream on for minutes and then finalize + pin the file. COST where no gateway
+		// has the content (a friend's own package): gatewayHedgeDelay + gatewayHeaderTimeout (~55 s) per attempt
+		// whose session stalled — and while that friend stays offline the loop cycles stall → probe → backoff,
+		// ~80 s per lap, on every lap. No cheaper definitive negative exists: see gatewayHeaderTimeout.
+		if !bits.allSet() && stalled.Load() && n.dht != nil && nctx.Err() == nil {
+			from := int64(-1)
+			for i, lf := range leaves {
+				if !bits.get(i) && (from < 0 || int64(lf.off) < from) {
+					from = int64(lf.off)
+				}
+			}
+			base := written
+			fdbg("writeThrough: bitswap stalled with %d/%d leaves missing → HTTPS gateway resume from byte %d cid=%s", bits.count-bits.nset, bits.count, from, cidStr)
+			rctx, rstop := userCancelCtx(nctx, cidStr)
+			gerr := n.fetchViaGateway(rctx, root, from, func(read, _ int64) {
+				if total > 0 && onProgress != nil {
+					onProgress(math.Min(99, 100.0*float64(base+read)/float64(total)))
+				}
+			})
+			rstop()
+			if gerr != nil {
+				fdbg("writeThrough: gateway resume failed cid=%s: %v", cidStr, gerr)
+			} else {
+				// The CAR landed in the blockstore; write every still-missing leaf through from there.
+				for i, lf := range leaves {
+					if bits.get(i) {
+						continue
+					}
+					blk, berr := n.bstore.Get(nctx, lf.c)
+					if berr != nil {
+						fdbg("writeThrough: leaf %d (%s) still missing after the gateway resume cid=%s", i, lf.c, cidStr)
+						continue
+					}
+					if _, werr := out.WriteAt(blk.RawData(), int64(lf.off)); werr != nil {
+						_ = out.Sync()
+						_ = savePart(dest, bits)
+						_ = out.Close()
+						return localFatal(werr)
+					}
+					written += int64(len(blk.RawData()))
+					bits.set(i)
+					if total > 0 && onProgress != nil {
+						onProgress(math.Min(99, 100.0*float64(written)/float64(total)))
+					}
+				}
+				fdbg("writeThrough: gateway resume done, %d/%d leaves on disk cid=%s", bits.nset, bits.count, cidStr)
+			}
+			if isCancelled(cidStr) { // a cancel during the resume must never reach finalize
+				_ = out.Close()
+				removePartial(dest)
+				return errors.New("cancelled")
+			}
 		}
 		if !bits.allSet() { // stalled / session dropped incomplete → persist progress, keep the partial, resume later
 			_ = out.Sync()

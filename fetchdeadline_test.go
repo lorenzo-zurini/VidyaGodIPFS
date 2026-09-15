@@ -351,3 +351,34 @@ func TestAbandonedJoinerDecrementsWaiters(t *testing.T) {
 		t.Error("an abandoned joiner must decrement waiters; a leaked count makes a later sole give-up wrongly suppress its terminal event")
 	}
 }
+
+// H-B: a node with ZERO connected peers must not burn rootLibp2pTimeout before the gateway fallback — the isolation
+// matrix measured 30 s of a 72 s gateway-only fetch spent exactly so. Teeth: delete the zero-peers arm in getRoot's
+// poller and phase 1 runs the full (shrunk) 3 s timeout here instead of ending at the 300 ms grace.
+func TestGetRootHandsOffEarlyWhenTheNodeHasNoPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mn := mocknet.New()
+	h, err := mn.GenPeer() // a real libp2p host with NO connections at all
+	if err != nil {
+		t.Fatal(err)
+	}
+	bstore := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	bswap := bitswap.New(ctx, bsnet.NewFromIpfsHost(h), nilFinder{}, bstore)
+	defer bswap.Close()
+	// dht nil → after phase 1 getRoot returns immediately (no gateway phase), so elapsed IS phase 1's duration.
+	n := &node{ctx: ctx, host: h, dserv: merkledag.NewDAGService(blockservice.New(bstore, bswap)), dht: nil}
+
+	origT, origG := rootLibp2pTimeout, rootNoPeersGrace
+	rootLibp2pTimeout, rootNoPeersGrace = 3*time.Second, 300*time.Millisecond
+	defer func() { rootLibp2pTimeout, rootNoPeersGrace = origT, origG }()
+
+	absent := blocks.NewBlock([]byte("nobody is connected to serve this")).Cid()
+	start := time.Now()
+	if _, err := n.getRoot(ctx, absent, absent.String(), nil); err == nil {
+		t.Fatal("getRoot must fail: the node has no peers")
+	}
+	if el := time.Since(start); el >= 2*time.Second {
+		t.Fatalf("phase 1 ran %s with zero peers — the no-peers short-circuit did not fire (grace 300ms, timeout 3s)", el)
+	}
+}
