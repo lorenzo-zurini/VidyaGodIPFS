@@ -196,6 +196,12 @@ func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgres
 	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
 	phase(cidStr, "no p2p source answered — trying HTTPS gateways")
 	gerr := n.fetchViaGateway(gwCtx, c, -1, func(read, total int64) {
+		// A streaming CAR usually carries no Content-Length, so total is -1 here. Fall back to the manifest's
+		// stamped SOURCE.SIZE (pushed down via setExpectedSize) so the % moves instead of staying blank. read is
+		// CAR bytes (slightly > the payload total by the dag-pb spine), so cap at 99 and let finalize reach 100.
+		if total <= 0 {
+			total = expectedSize(cidStr)
+		}
 		if onProgress != nil && total > 0 {
 			onProgress(math.Min(99, 100.0*float64(read)/float64(total)))
 		}
@@ -349,6 +355,30 @@ func isCancelled(c string) bool {
 	cancelMu.Lock()
 	defer cancelMu.Unlock()
 	return cancelSet[c]
+}
+
+// Expected payload sizes, keyed by CID (the stamped SOURCE.SIZE from the manifest, pushed down by the C++ side).
+// A per-CID side channel exactly like the cancel set: it lets getRoot's HTTPS-gateway fallback report a real
+// progress % on a CAR stream that carries no Content-Length (the "silent black box" gateway download), without
+// walking the DAG to discover the total. Absent/0 → unknown, and the % is simply suppressed as before.
+var (
+	expectMu    sync.Mutex
+	expectSizes = map[string]int64{}
+)
+
+func setExpectedSize(c string, size int64) {
+	expectMu.Lock()
+	if size > 0 {
+		expectSizes[c] = size
+	} else {
+		delete(expectSizes, c)
+	}
+	expectMu.Unlock()
+}
+func expectedSize(c string) int64 {
+	expectMu.Lock()
+	defer expectMu.Unlock()
+	return expectSizes[c]
 }
 
 // fetchToPath retrieves cidStr's file content to dest in ONE attempt (getRoot → writeThrough, with the 20 s stall

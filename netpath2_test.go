@@ -138,6 +138,78 @@ func carServer(carBytes []byte, lastQuery *string, mu *sync.Mutex) *httptest.Ser
 	}))
 }
 
+// carServerNoLen serves the CAR with NO Content-Length (flush → chunked) — the real-world case (a streaming CAR from
+// Pinata) where the client's total is -1. It also DENIES the HEAD size-probe (404) so the ONLY possible total is the
+// caller's expectedSize hint — isolating exactly the getRoot fallback under test.
+func carServerNoLen(carBytes []byte) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead { // deny the size probe → total stays unknown
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.ipld.car")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok { // flush headers before the body → chunked → no Content-Length
+			f.Flush()
+		}
+		_, _ = w.Write(carBytes)
+	}))
+}
+
+// A streaming gateway CAR carries no Content-Length, so getRoot's fallback callback saw total=-1 and never called
+// onProgress — the "silent black box" gateway download the field test hit. With the manifest's stamped SOURCE.SIZE
+// pushed down via setExpectedSize, getRoot uses it as the total so the % moves. Teeth: drop the
+// `if total <= 0 { total = expectedSize(cidStr) }` line in getRoot → maxPct stays 0 and this fails.
+func TestGatewayProgressUsesExpectedSizeWhenNoContentLength(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bstore, bs, stop := peerlessBitswapDserv(t, ctx)
+	defer stop()
+	n := &node{ctx: ctx, bstore: bstore, dserv: merkledag.NewDAGService(bs), dht: &dht.IpfsDHT{}}
+
+	pn := merkledag.NodeWithData([]byte("gateway payload that arrives with no Content-Length header at all"))
+	scratch := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	if err := scratch.Put(ctx, pn); err != nil {
+		t.Fatal(err)
+	}
+	carBytes := carOfStore(t, ctx, scratch, pn.Cid())
+	gw := carServerNoLen(carBytes)
+	defer gw.Close()
+	origGWs, origT := trustlessGateways, rootLibp2pTimeout
+	trustlessGateways, rootLibp2pTimeout = []string{gw.URL}, 200*time.Millisecond
+	defer func() { trustlessGateways, rootLibp2pTimeout = origGWs, origT }()
+
+	cidStr := pn.Cid().String()
+	// The stamped SOURCE.SIZE is the PAYLOAD size, ~the block's bytes here (the CAR the client reads is slightly
+	// larger — the dag-pb spine — so read/total edges just past 1.0, which is why getRoot caps at 99).
+	payload := int64(len(pn.RawData()))
+	setExpectedSize(cidStr, payload)
+	defer setExpectedSize(cidStr, 0)
+
+	var maxPct float64
+	var pmu sync.Mutex
+	onP := func(pct float64) { pmu.Lock(); if pct > maxPct { maxPct = pct }; pmu.Unlock() }
+
+	nctx, ncancel := context.WithTimeout(ctx, 3*time.Second)
+	defer ncancel()
+	root, err := n.getRoot(nctx, pn.Cid(), cidStr, onP)
+	if err != nil {
+		t.Fatalf("gateway getRoot must succeed; got %v", err)
+	}
+	if !root.Cid().Equals(pn.Cid()) {
+		t.Fatalf("wrong root %s", root.Cid())
+	}
+	pmu.Lock()
+	got := maxPct
+	pmu.Unlock()
+	if got <= 0 {
+		t.Fatalf("with SOURCE.SIZE known, a no-Content-Length gateway CAR must report progress; maxPct=%v", got)
+	}
+	if got > 99 {
+		t.Fatalf("gateway progress must be capped at 99 until finalize (read exceeds the payload total); maxPct=%v", got)
+	}
+}
+
 // A cover fetch has a 30 s budget; the libp2p root phase had a 30 s timeout of its own — so on a network where the
 // DHT and indexers turn up nothing the deadline fired exactly when the gateway would have started, and the cover
 // "did not complete before its deadline" while the unbounded download beside it succeeded through the gateway.

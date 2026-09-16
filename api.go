@@ -617,5 +617,10 @@ func VgRequestCancel(cidStr *C.char) { requestCancel(C.GoString(cidStr)) }
 //export VgClearCancel
 func VgClearCancel(cidStr *C.char) { clearCancel(C.GoString(cidStr)) }
 
+// VgSetExpectedSize records a CID's known payload byte size (the manifest's stamped SOURCE.SIZE) so a gateway
+// fallback can show a real progress %. size <= 0 clears it. Idempotent; safe to call repeatedly.
+//export VgSetExpectedSize
+func VgSetExpectedSize(cidStr *C.char, size C.longlong) { setExpectedSize(C.GoString(cidStr), int64(size)) }
+
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
