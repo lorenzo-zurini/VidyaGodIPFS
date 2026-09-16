@@ -16,6 +16,7 @@ import (
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	blockservice "github.com/ipfs/boxo/blockservice"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	namesys "github.com/ipfs/boxo/namesys"
 	provider "github.com/ipfs/boxo/provider"
 	routinghttp "github.com/ipfs/boxo/routing/http/client"
 	routinghttpcr "github.com/ipfs/boxo/routing/http/contentrouter"
@@ -96,6 +97,7 @@ func (n *node) goOnline() error {
 	if err != nil {
 		return err
 	}
+	n.priv = priv // kept for IPNS record signing (ipns.go) — same key as the peer ID / friend code
 
 	// Maximum connectivity: hold a large peer set (default trims at ~192 — too low to fan out to many providers) and
 	// remove resource-manager caps (the default limits per-peer streams, which throttles parallel multi-provider
@@ -239,6 +241,13 @@ func (n *node) goOnline() error {
 	n.dht = kad
 	n.exchange = bswap
 	n.bwc = bwc
+	// IPNS name system over the DHT (routing.ValueStore); the datastore carries the record sequence number across
+	// restarts so a republish always supersedes. Resolve adds an HTTPS-gateway fallback on top (ipns.go).
+	if ns, nsErr := namesys.NewNameSystem(kad, namesys.WithDatastore(n.ds)); nsErr == nil {
+		n.ns = ns
+	} else {
+		fmt.Fprintf(os.Stderr, "[node] IPNS namesys init failed: %v\n", nsErr)
+	}
 	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
@@ -338,6 +347,7 @@ func (n *node) goOnline() error {
 	published = true // EVERYTHING above succeeded; from here closeNode owns the teardown
 	safeGo("node.bootstrap", n.bootstrap)
 	safeGo("node.refreshPinnedSet", func() { n.refreshPinnedSet(n.ctx) }) // keep the pinned-root set warm for the upload tracer
+	safeGo("node.ipnsRepublish", n.ipnsRepublishLoop)                     // refresh our own IPNS record before its EOL (ipns.go)
 	n.startBenchObserver()                                                // bench.go: periodic path/bandwidth ground-truth log when VG_BENCH_OBSERVE is set
 
 	// Announce EVERYTHING we seed to the DHT shortly after startup (once the routing table is warm), instead of waiting

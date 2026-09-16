@@ -21,7 +21,9 @@ static inline void vg_invoke_transfer(vg_transfer_cb cb,
 import "C"
 
 import (
+	"context"
 	"encoding/json"
+	"time"
 	"unsafe"
 
 	cid "github.com/ipfs/go-cid"
@@ -624,3 +626,74 @@ func VgSetExpectedSize(cidStr *C.char, size C.longlong) { setExpectedSize(C.GoSt
 
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
+
+// VgIpnsPublish signs + publishes an IPNS record for OUR name (the identity key = friend code) pointing at cidStr,
+// with a long EOL; ttlSeconds is the resolver-cache hint (<=0 → default). The record is re-published before EOL by
+// the node's republish loop for as long as it stays online. Blocks on the DHT put; call off the UI thread.
+//
+//export VgIpnsPublish
+func VgIpnsPublish(cidStr *C.char, ttlSeconds C.int, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, 90*time.Second)
+	defer cancel()
+	if err := n.ipnsPublish(ctx, C.GoString(cidStr), time.Duration(ttlSeconds)*time.Second); err != nil {
+		return fail(errOut, err)
+	}
+	return 0
+}
+
+// VgIpnsResolve resolves /ipns/<name> (a peer ID / friend code, with or without the /ipns/ prefix) to its current
+// /ipfs/<cid> path string. DHT first, then the HTTPS-gateway fallback; the signature is verified against the name, so
+// a forged record is rejected. Returns the resolved path (e.g. "/ipfs/Qm…") via out.
+//
+//export VgIpnsResolve
+func VgIpnsResolve(name *C.char, out **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, 60*time.Second)
+	defer cancel()
+	p, err := n.ipnsResolve(ctx, C.GoString(name))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(out, p)
+	return 0
+}
+
+// VgExportIdentity backs up the Ed25519 identity key (== friend code + library address) to destPath. Loss is permanent.
+//
+//export VgExportIdentity
+func VgExportIdentity(destPath *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	if err := n.exportIdentity(C.GoString(destPath)); err != nil {
+		return fail(errOut, err)
+	}
+	return 0
+}
+
+// VgImportIdentity installs a backed-up identity key. The running node keeps the old key until RESTARTED — the caller
+// must warn + restart for the new peer ID / friend code / library address to take effect.
+//
+//export VgImportIdentity
+func VgImportIdentity(srcPath *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	if err := n.importIdentity(C.GoString(srcPath)); err != nil {
+		return fail(errOut, err)
+	}
+	return 0
+}

@@ -22,6 +22,7 @@ import (
 	offline "github.com/ipfs/boxo/exchange/offline"
 	filestore "github.com/ipfs/boxo/filestore"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	namesys "github.com/ipfs/boxo/namesys"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	provider "github.com/ipfs/boxo/provider"
@@ -31,6 +32,7 @@ import (
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	ipld "github.com/ipfs/go-ipld-format"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	ci "github.com/libp2p/go-libp2p/core/crypto"
 	host "github.com/libp2p/go-libp2p/core/host"
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	goleveldbutil "github.com/syndtr/goleveldb/leveldb/util"
@@ -66,6 +68,15 @@ type node struct {
 	dht      *dht.IpfsDHT
 	exchange exchange.Interface
 	provider provider.System
+
+	// IPNS (ipns.go): the peer's Ed25519 identity key (also the friend code) signs a tiny mutable record pointing
+	// the peer's name at the current library-index CID; namesys publishes/resolves via the DHT, with the datastore
+	// carrying the sequence number across restarts. ipnsCurrent is the value we last published under our own name,
+	// re-published by a background loop before its EOL. nil/empty until goOnline.
+	priv        ci.PrivKey
+	ns          namesys.NameSystem
+	ipnsMu      sync.Mutex
+	ipnsCurrent string
 	mdns     interface{ Close() error } // local-network discovery service (mDNS)
 	bwc      *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
 
