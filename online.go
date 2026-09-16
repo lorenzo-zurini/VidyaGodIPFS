@@ -99,14 +99,18 @@ func (n *node) goOnline() error {
 	}
 	n.priv = priv // kept for IPNS record signing (ipns.go) — same key as the peer ID / friend code
 
-	// Maximum connectivity: hold a large peer set (default trims at ~192 — too low to fan out to many providers) and
-	// remove resource-manager caps (the default limits per-peer streams, which throttles parallel multi-provider
-	// fetch). connmgr bounds total connections (so FDs stay sane) while rcmgr stays unbounded underneath.
-	cm, cmErr := connmgr.NewConnManager(400, 900, connmgr.WithGracePeriod(20*time.Second))
+	// Connectivity vs RAM (project_idle_ram_1gb): a 900 high-water held ~900 conns at ~1.4MB each ≈ 1.3 GB, which
+	// OOM-killed the node during a library publish on a swap-pressured box. High-water 384 (still 2× the libp2p
+	// default of ~192, so multi-provider fan-out stays wide) caps that near ~540 MB; low-water 192 keeps a healthy
+	// resident peer set. rcmgr stays a fixed limiter but bounded (not InfiniteLimits) so a single peer can't balloon
+	// memory underneath the connmgr cap — the scaling defaults grow with the connection count and system RAM.
+	cm, cmErr := connmgr.NewConnManager(192, 384, connmgr.WithGracePeriod(20*time.Second))
 	if cmErr != nil {
 		return cmErr
 	}
-	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	rmLimits := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&rmLimits)
+	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rmLimits.AutoScale()))
 	if rmErr != nil {
 		return rmErr
 	}
