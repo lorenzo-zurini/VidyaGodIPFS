@@ -227,6 +227,79 @@ func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// ---- dag-json node graph (the gigagraph: one node = one dag-json block, identity = CID) ----
+
+// VgDagPut canonicalizes a node's JSON, stores it as one dag-json block (direct-pinned + announced), and returns the
+// block CID — the node's identity. Deterministic: any key order in the input yields the same CID (dag.go).
+//
+//export VgDagPut
+func VgDagPut(jsonStr *C.char, outCid **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := n.dagPut([]byte(C.GoString(jsonStr)))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(outCid, c.String())
+	return 0
+}
+
+// VgDagGet returns a node block's raw dag-json bytes (valid JSON; links as {"/":"<cid>"}). Fetches over bitswap when
+// the block is not local. Errors if the CID is not a dag-json node.
+//
+//export VgDagGet
+func VgDagGet(cidStr *C.char, outJson **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	b, err := n.dagGet(c)
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(outJson, string(b))
+	return 0
+}
+
+// VgDagHas: 1 if the node block is present locally, 0 if not, -1 if the node is not started or the CID is invalid.
+//
+//export VgDagHas
+func VgDagHas(cidStr *C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	if n.dagHas(c) {
+		return 1
+	}
+	return 0
+}
+
+// VgDagCid: the CID a node's JSON WOULD have, with NO side effects (nothing stored/pinned). Same canonicalization as
+// VgDagPut, so it matches what freezing would produce. Needs no started node.
+//
+//export VgDagCid
+func VgDagCid(jsonStr *C.char, outCid **C.char, errOut **C.char) C.int {
+	c, err := computeDagJSONCid([]byte(C.GoString(jsonStr)))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(outCid, c.String())
+	return 0
+}
+
 // VgComputeCid: what a file's CID WOULD be, with NO side effects (nothing enters the blockstore, filestore or
 // pinset). Same importer settings as VgAddNoCopy, so it answers "do these bytes still match the published CID?".
 // Needs no started node. Returns "" on failure with the reason in errOut.
