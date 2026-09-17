@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +93,132 @@ func TestFriendHandshakeAndProfileExchange(t *testing.T) {
 		c, _ := sB.get(hA.ID().String())
 		return c.Nick == "alice2" && c.PicCID == "QmAlicePic2"
 	})
+}
+
+// TestFriendLibraryExchange: once two peers are friends, a seeder's shared library (launchable CIDs) reaches the
+// leecher — pushed on setShareLib, cleared on removeShareLib, and served on an explicit request. The bilateral
+// consumer/UI gates live in C++; this proves the wire exchange itself.
+func TestFriendLibraryExchange(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	sA := newSocialState(t.TempDir())
+	sB := newSocialState(t.TempDir())
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	cur := map[string][]string(nil) // Bob's CURRENT received snapshot (replaced wholesale on each event)
+	var curSeq uint64               // highest stamp applied — models C++'s last-writer-wins (the seq authority lives there)
+	events := 0
+	emitB := func(kind int, payload string) {
+		if kind != evFriendLibrary {
+			return
+		}
+		var m struct {
+			Peer string
+			Libs map[string][]string
+			Seq  uint64
+		}
+		_ = json.Unmarshal([]byte(payload), &m)
+		mu.Lock()
+		// Snapshots ride independent, concurrently-handled streams, so a stale one can arrive after a fresher one. The
+		// receiver (C++ in production) keeps only the highest stamp; a Go-side receive gate can't (the emit is off-lock).
+		if m.Seq == 0 || m.Seq > curSeq {
+			cur = m.Libs
+			curSeq = m.Seq
+			events++
+		}
+		mu.Unlock()
+	}
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, emitB)
+	fA.start()
+	fB.start()
+
+	// BILATERAL GATE: before acceptance, a request must yield NOTHING (fA won't serve a non-accepted peer).
+	fB.requestLibraries(hA.ID().String())
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	if events != 0 {
+		mu.Unlock()
+		t.Fatalf("received a library before friendship was accepted — bilateral gate breached")
+	}
+	mu.Unlock()
+
+	if err := fA.addFriend(hB.ID().String(), ""); err != nil {
+		t.Fatalf("addFriend: %v", err)
+	}
+	waitFor(t, "bob sees incoming", func() bool { c, ok := sB.get(hA.ID().String()); return ok && c.State == stIncoming })
+	if err := fB.acceptFriend(hA.ID().String()); err != nil {
+		t.Fatalf("acceptFriend: %v", err)
+	}
+	waitFor(t, "alice accepted", func() bool { c, ok := sA.get(hB.ID().String()); return ok && c.State == stAccepted })
+
+	// Share → full snapshot pushed to Bob.
+	fA.setShareLib(hB.ID().String(), "Games", []string{"cidX", "cidY"})
+	waitFor(t, "bob receives shared snapshot", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(cur["Games"]) == 2 && cur["Games"][0] == "cidX"
+	})
+
+	// Add a second library, then WITHDRAW the first → snapshot replaces wholesale, "Games" is gone (no lost withdraw).
+	fA.setShareLib(hB.ID().String(), "Retro", []string{"cidZ"})
+	fA.removeShareLib(hB.ID().String(), "Games")
+	waitFor(t, "snapshot reflects Retro-only after withdraw", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		_, hasGames := cur["Games"]
+		return !hasGames && len(cur["Retro"]) == 1 && cur["Retro"][0] == "cidZ"
+	})
+
+	// Request path returns the authoritative snapshot on demand.
+	fB.requestLibraries(hA.ID().String())
+	waitFor(t, "request yields the current snapshot", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(cur) == 1 && len(cur["Retro"]) == 1
+	})
+
+	// WITHDRAW THE LAST LIBRARY → an EMPTY snapshot must reach the wire as an explicit {} (not a dropped/omitted map),
+	// so the receiver drops the peer entirely. The flagship path: "share nothing" has to be transmissible.
+	fA.removeShareLib(hB.ID().String(), "Retro")
+	waitFor(t, "empty snapshot clears everything", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return cur != nil && len(cur) == 0
+	})
+}
+
+// TestFriendPushSeederGate proves the seeder half of the bilateral gate at the SEND side (not just the receiver's
+// inbound check): pushSnapshot serves an ACCEPTED friend only. A pending/blocked peer is never pushed to, and marking a
+// share for a non-accepted peer schedules nothing — so blockFriend's purge can't be undone by a stray outbound push.
+func TestFriendPushSeederGate(t *testing.T) {
+	s := newSocialState(t.TempDir())
+	f := newFriendService(context.Background(), nil, nil, s, nil)
+	const peer = "12D3KooWGate"
+
+	// Pending peer: pushSnapshot must schedule no work (pushPending stays clear — nothing to send).
+	s.upsert(peer, func(c *contact) { c.State = stPending })
+	f.pushSnapshot(peer)
+	f.setShareLib(peer, "Games", []string{"cidX"}) // records intent, but must not push to a non-accepted peer
+	time.Sleep(50 * time.Millisecond)
+	f.shareMu.Lock()
+	pendingPending := f.pushPending[peer]
+	f.shareMu.Unlock()
+	if pendingPending {
+		t.Fatal("a non-accepted peer must never have a push scheduled")
+	}
+
+	// Blocked peer: same — no push scheduled.
+	s.upsert(peer, func(c *contact) { c.State = stBlocked })
+	f.pushSnapshot(peer)
+	time.Sleep(50 * time.Millisecond)
+	f.shareMu.Lock()
+	blockedPending := f.pushPending[peer]
+	f.shareMu.Unlock()
+	if blockedPending {
+		t.Fatal("a blocked peer must never have a push scheduled")
+	}
 }
 
 // TestFriendMutualCrossingConverges models the field case where BOTH peers add each other but one side's initial

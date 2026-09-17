@@ -13,6 +13,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"sync"
 	"time"
 
 	host "github.com/libp2p/go-libp2p/core/host"
@@ -32,6 +34,7 @@ const (
 	evFriendPresence = 3 // a friend's online state changed
 	evFriendProfile  = 4 // a friend updated their nickname / picture
 	evFriendRemoved  = 5 // local removal (echoed for UI symmetry)
+	evFriendLibrary  = 6 // a friend sent their COMPLETE shared set (snapshot): payload {peer, libs:{name:[…launchable CIDs]}}
 )
 
 // friendMsg is the framed wire message. One JSON value per message; a stream may carry several (a decoder loop reads
@@ -41,10 +44,47 @@ const (
 // an old message gets zero values. In particular a peer on an OLDER build still sends a "play" block — we simply
 // ignore those keys now (no lobby/join/what-are-you-playing model anymore; see social.go).
 type friendMsg struct {
-	Type   string `json:"t"`              // request | accept | decline | profile | presence | ping
+	Type   string `json:"t"`              // request | accept | decline | profile | presence | ping | library_req | library
 	Nick   string `json:"nick,omitempty"` // sender's nickname (on request/accept/profile)
 	PicCID string `json:"pic,omitempty"`  // sender's profile-picture content CID
 	Note   string `json:"note,omitempty"` // optional greeting on a request
+	// AllLibs (on a "library" message) is the sender's COMPLETE set of libraries shared with the recipient, as
+	// {libName: [launchable CIDs]}. It is a full SNAPSHOT, replaced wholesale by the receiver — so a withdrawn library
+	// (absent from the map) is unambiguous and a dropped push self-heals on the next one. Empty map = nothing shared.
+	AllLibs map[string][]string `json:"libs,omitempty"`
+	// LibSeq (on a "library" message) is a monotonic per-sender stamp. Each snapshot rides its own libp2p stream and the
+	// receiver handles streams concurrently, so two rapid share changes can arrive/process out of order — the receiver
+	// keeps only the HIGHEST seq it has seen from a peer and drops any older one, so a stale snapshot can never win.
+	// Seeded from the sender's wall clock at service start, so it also stays monotonic across a sender restart.
+	LibSeq uint64 `json:"libseq,omitempty"`
+}
+
+// Wire-decode caps for the library snapshot (defence against a hostile/broken peer). A snapshot exceeding any of these
+// is rejected before it touches memory-resident state or config.
+const (
+	maxFriendMsgBytes = 8 << 20 // 8 MiB per inbound message — bounds the pre-auth decode buffer
+	maxSharedLibs     = 4096    // libraries per snapshot
+	maxLibCids        = 100000  // launchable CIDs per library
+	maxLibNameLen     = 256     // library-name length
+	maxCidLen         = 128     // launchable-CID length
+)
+
+// libSnapshotOK bounds a decoded snapshot; false ⇒ reject (drop, do not store/serve).
+func libSnapshotOK(m map[string][]string) bool {
+	if len(m) > maxSharedLibs {
+		return false
+	}
+	for name, cids := range m {
+		if len(name) == 0 || len(name) > maxLibNameLen || len(cids) > maxLibCids {
+			return false
+		}
+		for _, c := range cids {
+			if len(c) == 0 || len(c) > maxCidLen {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // peerRouter is the subset of the DHT the friend service needs: resolve a peer ID to its current addresses. Optional
@@ -60,10 +100,27 @@ type friendService struct {
 	router peerRouter
 	social *socialState
 	emit   func(kind int, jsonPayload string) // may be nil
+
+	// What library lists we serve each friend (peerID → libName → launchable CIDs). Set from C++ per the seeder's
+	// per-(friend,library) "share" toggles; consulted when a friend requests our libraries. The BILATERAL gate's
+	// seeder half — we only ever hand a friend a library we deliberately put here.
+	//
+	// sendSeq stamps each outbound snapshot (monotonic, clock-seeded) so the RECEIVER can order concurrently-delivered
+	// snapshots (last-writer-wins by stamp lives in C++, where the persisted record is — a Go-side receive gate can't
+	// work: the emit happens off-lock, so a big stale snapshot can still emit after a small newer one). pushPending
+	// coalesces per peer: at most one in-flight push each, which reads the LATEST snapshot at send time — this both
+	// keeps the newest state winning and bounds goroutines against a flood of library_req messages.
+	shareMu     sync.Mutex
+	shareLibs   map[string]map[string][]string
+	sendSeq     uint64
+	pushPending map[string]bool
 }
 
 func newFriendService(ctx context.Context, h host.Host, r peerRouter, s *socialState, emit func(int, string)) *friendService {
-	return &friendService{ctx: ctx, host: h, router: r, social: s, emit: emit}
+	// Seed the outbound snapshot counter from the wall clock so stamps keep rising across a restart (an in-memory
+	// counter would reset to 0 and a fresh snapshot could then lose to one the receiver saw before we restarted).
+	return &friendService{ctx: ctx, host: h, router: r, social: s, emit: emit,
+		sendSeq: uint64(time.Now().UnixNano()), pushPending: map[string]bool{}}
 }
 
 // start registers the inbound stream handler. Call once the host exists.
@@ -91,11 +148,14 @@ func (f *friendService) handleStream(s network.Stream) {
 	if f.social.isBlocked(remote) {
 		return // silently drop everything from a blocked peer
 	}
-	dec := json.NewDecoder(s)
+	// Bound the whole stream so a hostile/broken peer can't stream gigabytes (a library snapshot with a giant Libs)
+	// before the stAccepted/size gates in dispatch ever run. send() opens a one-shot stream per burst, so this cap
+	// comfortably covers a real message set while killing the pre-auth memory-DoS.
+	dec := json.NewDecoder(io.LimitReader(s, maxFriendMsgBytes))
 	for {
 		var m friendMsg
 		if err := dec.Decode(&m); err != nil {
-			return // EOF or malformed → done with this stream
+			return // EOF, over-cap, or malformed → done with this stream
 		}
 		f.dispatch(remote, m)
 	}
@@ -163,7 +223,107 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 		if changed, c := f.social.setPresence(remote, true); changed {
 			f.emitContact(evFriendPresence, c)
 		}
+	case "library_req":
+		// A friend asks for what we share with them. Reply with the FULL snapshot (the seeder half of the bilateral
+		// gate — only what C++ deliberately put in shareLibs[remote]). Accepted friends only.
+		if c, ok := f.social.get(remote); !ok || c.State != stAccepted {
+			return
+		}
+		f.pushSnapshot(remote)
+	case "library":
+		// A friend sent us their COMPLETE shared set (a snapshot to replace wholesale; empty = nothing). Accepted
+		// friends only, and bounded — a hostile snapshot is dropped, never stored. C++ replaces its record + applies
+		// the leecher's receive gate.
+		if c, ok := f.social.get(remote); !ok || c.State != stAccepted {
+			return
+		}
+		if !libSnapshotOK(m.AllLibs) {
+			vlog("friend", "rejecting oversized/invalid library snapshot from %s", shortPeer(remote))
+			return
+		}
+		if f.emit != nil {
+			// Carry the stamp through so C++ (which holds the persisted record) can do last-writer-wins across
+			// concurrently-delivered snapshots. Send an explicit empty object for "share nothing" (a nil map would
+			// marshal as null and read as malformed downstream).
+			libs := m.AllLibs
+			if libs == nil {
+				libs = map[string][]string{}
+			}
+			b, _ := json.Marshal(map[string]any{"peer": remote, "libs": libs, "seq": m.LibSeq})
+			f.emit(evFriendLibrary, string(b))
+		}
 	}
+}
+
+// pushSnapshot sends a friend our COMPLETE current shared set — the one message type, so a change (add/withdraw) or a
+// request all converge to "replace wholesale", immune to lost/out-of-order deltas. Only ACCEPTED friends are served
+// (the seeder half of the bilateral gate — a blocked/pending/removed peer is never pushed to). Pushes COALESCE per
+// peer: if one is already in flight we don't spawn another — the in-flight goroutine reads the latest snapshot at send
+// time, so the newest state still wins and a flood of requests can't spawn unbounded goroutines/streams.
+func (f *friendService) pushSnapshot(pidStr string) {
+	if c, ok := f.social.get(pidStr); !ok || c.State != stAccepted {
+		return
+	}
+	f.shareMu.Lock()
+	if f.pushPending[pidStr] { // a push is already scheduled; it will pick up whatever the map holds when it runs
+		f.shareMu.Unlock()
+		return
+	}
+	f.pushPending[pidStr] = true
+	f.shareMu.Unlock()
+	safeGo("friend.libSnap", func() {
+		// Clear the pending flag and read the snapshot under one lock: a mutation AFTER this read sees pending=false
+		// and correctly schedules a fresh push, so no update is ever coalesced away.
+		f.shareMu.Lock()
+		f.pushPending[pidStr] = false
+		out := map[string][]string{}
+		for k, v := range f.shareLibs[pidStr] {
+			out[k] = append([]string(nil), v...)
+		}
+		f.sendSeq++
+		seq := f.sendSeq
+		f.shareMu.Unlock()
+		_ = f.send(pidStr, friendMsg{Type: "library", AllLibs: out, LibSeq: seq})
+	})
+}
+
+// setShareLib / removeShareLib are the seeder's per-(friend,library) toggles; each re-pushes the full snapshot.
+func (f *friendService) setShareLib(pidStr, lib string, cids []string) {
+	f.shareMu.Lock()
+	if f.shareLibs == nil {
+		f.shareLibs = map[string]map[string][]string{}
+	}
+	if f.shareLibs[pidStr] == nil {
+		f.shareLibs[pidStr] = map[string][]string{}
+	}
+	f.shareLibs[pidStr][lib] = cids
+	f.shareMu.Unlock()
+	f.pushSnapshot(pidStr)
+}
+
+func (f *friendService) removeShareLib(pidStr, lib string) {
+	f.shareMu.Lock()
+	if m := f.shareLibs[pidStr]; m != nil {
+		delete(m, lib)
+		if len(m) == 0 {
+			delete(f.shareLibs, pidStr)
+		}
+	}
+	f.shareMu.Unlock()
+	f.pushSnapshot(pidStr) // full snapshot now WITHOUT lib → receiver drops it (no lost-withdraw)
+}
+
+func (f *friendService) requestLibraries(pidStr string) {
+	safeGo("friend.libReq", func() { _ = f.send(pidStr, friendMsg{Type: "library_req"}) })
+}
+
+// purgeShares forgets everything we shared with a peer — called when the friendship ends (remove/decline/block) so a
+// later re-add cannot silently resume serving without fresh consent.
+func (f *friendService) purgeShares(pidStr string) {
+	f.shareMu.Lock()
+	delete(f.shareLibs, pidStr)
+	delete(f.pushPending, pidStr)
+	f.shareMu.Unlock()
 }
 
 // dial ensures we have a connection to pid, resolving addresses via the router (DHT) if we're not already connected.
@@ -269,6 +429,7 @@ func (f *friendService) acceptFriend(pidStr string) error {
 func (f *friendService) declineFriend(pidStr string) error {
 	_ = f.send(pidStr, friendMsg{Type: "decline"}) // best-effort; peer may be offline
 	f.social.remove(pidStr)
+	f.purgeShares(pidStr) // consent ends → stop serving them, so a re-add can't silently resume
 	f.emit(evFriendRemoved, fmt.Sprintf(`{"peer":%q}`, pidStr))
 	return nil
 }
@@ -276,6 +437,7 @@ func (f *friendService) declineFriend(pidStr string) error {
 // blockFriend marks a peer blocked (drops all their traffic) without notifying them.
 func (f *friendService) blockFriend(pidStr string) error {
 	c := f.social.upsert(pidStr, func(c *contact) { c.State = stBlocked; c.online = false })
+	f.purgeShares(pidStr)
 	f.emitContact(evFriendDecline, c)
 	return nil
 }

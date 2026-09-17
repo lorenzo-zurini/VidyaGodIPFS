@@ -8,7 +8,8 @@ package main
 #include <stdlib.h>
 
 // Inbound friend event: kind mirrors friend.go's evFriend* (0=request 1=accept 2=decline 3=presence 4=profile
-// 5=removed); json is the affected contact as a JSON object (peer/nick/pic/state/online), owned by the callee.
+// 5=removed 6=library); json is the affected contact as a JSON object (peer/nick/pic/state/online) for 0..5, or the
+// snapshot {peer, libs:{name:[cids]}} for 6; owned by the callee.
 typedef void (*vg_friend_cb)(int kind, const char* json);
 
 static inline void vg_invoke_friend(vg_friend_cb cb, int kind, const char* json) {
@@ -167,6 +168,9 @@ func VgFriendRemove(peerID *C.char) C.int {
 	if n == nil || n.social == nil {
 		return -1
 	}
+	if n.friend != nil {
+		n.friend.purgeShares(C.GoString(peerID)) // consent ends → stop serving them
+	}
 	if n.social.remove(C.GoString(peerID)) {
 		return 0
 	}
@@ -184,5 +188,52 @@ func VgFriendPing(peerID *C.char) C.int {
 	if f.pingPresence(C.GoString(peerID)) {
 		return 1
 	}
+	return 0
+}
+
+// ---- friend library sharing (bilateral, per-(friend,library)) ----
+
+// VgShareLibrary: share library `lib` (launchable CIDs in cidsJson, a JSON string array) with one friend — the
+// seeder's "share" toggle. Recorded + pushed to the friend if online. Re-call to update the CID list.
+//
+//export VgShareLibrary
+func VgShareLibrary(peerID *C.char, lib *C.char, cidsJson *C.char, errOut **C.char) C.int {
+	f := friendSvc()
+	if f == nil {
+		setStr(errOut, "networking is offline")
+		return -1
+	}
+	var cids []string
+	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &cids); err != nil {
+		return fail(errOut, err)
+	}
+	f.setShareLib(C.GoString(peerID), C.GoString(lib), cids)
+	return 0
+}
+
+// VgUnshareLibrary: stop sharing library `lib` with a friend (and tell them it's withdrawn).
+//
+//export VgUnshareLibrary
+func VgUnshareLibrary(peerID *C.char, lib *C.char, errOut **C.char) C.int {
+	f := friendSvc()
+	if f == nil {
+		setStr(errOut, "networking is offline")
+		return -1
+	}
+	f.removeShareLib(C.GoString(peerID), C.GoString(lib))
+	return 0
+}
+
+// VgRequestFriendLibraries: ask a friend to send everything they currently share with us (leecher initial sync /
+// refresh). Their replies arrive as evFriendLibrary events on the friend callback.
+//
+//export VgRequestFriendLibraries
+func VgRequestFriendLibraries(peerID *C.char, errOut **C.char) C.int {
+	f := friendSvc()
+	if f == nil {
+		setStr(errOut, "networking is offline")
+		return -1
+	}
+	f.requestLibraries(C.GoString(peerID))
 	return 0
 }
