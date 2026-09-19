@@ -770,6 +770,28 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 // released when its block arrives OR when its GetBlocks channel closes without it (a straggler / ctx-cancel).
 // So tokens are always returned exactly, with no separate exit-drain and no cross-goroutine race. The channel
 // closes when every block has been delivered or ctx is cancelled (the caller's stall watchdog / user-cancel).
+// dagGetManyTimeout bounds a whole browse batch (windowed). Generous when reachable; caps the hang when not.
+const dagGetManyTimeout = 120 * time.Second
+const dagGetManyRefill = 32
+
+// dagGetMany fetches many node blocks CONCURRENTLY via a windowed bitswap session — the SAME rolling want-window
+// content uses (rollingGetBlocks), with the same friend-as-provider routing — not serial single-block gets. 900+ tiny
+// browse blocks must not be 900 round-trips. Returns cid.String() -> raw dag-json bytes for blocks that arrive within
+// the deadline; missing ones are simply absent. Used by the browse path (BuildFrozenIndex Shallow).
+func (n *node) dagGetMany(cids []cid.Cid) map[string][]byte {
+	out := map[string][]byte{}
+	if len(cids) == 0 {
+		return out
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, dagGetManyTimeout)
+	defer cancel()
+	sess := blockservice.NewSession(ctx, n.bserv)
+	for blk := range rollingGetBlocks(ctx, sess, cids, dagGetManyRefill) {
+		out[blk.Cid().String()] = blk.RawData()
+	}
+	return out
+}
+
 func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []cid.Cid, refillBatch int) <-chan blocks.Block {
 	out := make(chan blocks.Block, 64)
 	safeGo("fetch.producer", func() {
