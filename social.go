@@ -71,6 +71,17 @@ func newSocialState(repoPath string) *socialState {
 	return s
 }
 
+// defaultNick is a non-empty default nickname: the machine hostname, or "VidyaGod" if it is unavailable. The stored
+// nick stays EMPTY until the user explicitly chooses one (so the LAN self-name keeps its per-peer fallback); this is
+// the DISPLAY/WIRE default, applied at the presentation boundary (VgGetProfile), on the wire (helloMsg), and by
+// setProfile's never-empty guard.
+func defaultNick() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "VidyaGod"
+}
+
 func (s *socialState) load() {
 	b, err := os.ReadFile(s.path)
 	if err != nil {
@@ -108,6 +119,9 @@ func (s *socialState) saveLocked() {
 func (s *socialState) setProfile(nick, picCID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if nick == "" { // never allow an empty nickname — fall back to the hostname
+		nick = defaultNick()
+	}
 	s.self = profile{Nick: nick, PicCID: picCID}
 	s.saveLocked()
 }

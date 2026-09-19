@@ -256,6 +256,105 @@ func TestFriendMutualCrossingConverges(t *testing.T) {
 	})
 }
 
+// The nickname is never empty where it is USED: defaultNick is always non-empty, setProfile refuses an empty nick
+// (falls back to the hostname), and an explicit nick is kept verbatim and persists. The STORED nick stays empty until
+// the user chooses one (so the LAN self-name keeps its per-peer fallback — see TestLanLaunchVarsSelfName).
+func TestNicknameDefaultsToHostnameAndNeverEmpty(t *testing.T) {
+	if defaultNick() == "" {
+		t.Fatal("defaultNick must never be empty")
+	}
+	dir := t.TempDir()
+	if newSocialState(dir).getProfile().Nick != "" {
+		t.Fatal("a fresh stored nick must stay empty until the user chooses one (display default lives in VgGetProfile)")
+	}
+	s := newSocialState(dir)
+	s.setProfile("", "pic") // explicit empty → refused, falls back to a non-empty default (the hostname)
+	if s.getProfile().Nick == "" {
+		t.Fatal("setProfile must never store an empty nickname")
+	}
+	s.setProfile("alice", "") // a real nick is kept verbatim
+	if s.getProfile().Nick != "alice" {
+		t.Fatal("a non-empty nickname must be kept as-is")
+	}
+	if newSocialState(dir).getProfile().Nick != "alice" {
+		t.Fatal("nickname must persist across reload")
+	}
+}
+
+// The presence-deny set is per-peer and replaced wholesale.
+func TestPresenceDenyGate(t *testing.T) {
+	f := newFriendService(context.Background(), nil, nil, nil, nil)
+	f.setPresenceDeny([]string{"peerA", "peerB"})
+	if !f.presenceDenied("peerA") || !f.presenceDenied("peerB") {
+		t.Fatal("denied peers must report denied")
+	}
+	if f.presenceDenied("peerC") {
+		t.Fatal("a non-denied peer must not be denied")
+	}
+	f.setPresenceDeny([]string{"peerC"}) // replace-wholesale clears the old set
+	if f.presenceDenied("peerA") || !f.presenceDenied("peerC") {
+		t.Fatal("setPresenceDeny must replace the whole set, not merge")
+	}
+}
+
+// End-to-end teeth for the OUTBOUND gate: a presence-denied friend must NOT receive our profile broadcast.
+func TestPresenceDenySuppressesBroadcast(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
+	sA.setProfile("alice", "pic1")
+	ctx := context.Background()
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA.start()
+	fB.start()
+	if err := fA.addFriend(hB.ID().String(), ""); err != nil {
+		t.Fatalf("addFriend: %v", err)
+	}
+	waitFor(t, "bob incoming", func() bool { c, ok := sB.get(hA.ID().String()); return ok && c.State == stIncoming })
+	if err := fB.acceptFriend(hA.ID().String()); err != nil {
+		t.Fatalf("acceptFriend: %v", err)
+	}
+	waitFor(t, "alice accepted", func() bool { c, ok := sA.get(hB.ID().String()); return ok && c.State == stAccepted })
+	// Alice DENIES presence to Bob, renames, and broadcasts → Bob must not see the new nickname.
+	fA.setPresenceDeny([]string{hB.ID().String()})
+	sA.setProfile("alice2", "pic2")
+	fA.broadcastProfile()
+	time.Sleep(300 * time.Millisecond)
+	if c, _ := sB.get(hA.ID().String()); c.Nick == "alice2" {
+		t.Fatal("a presence-denied peer must not receive our profile broadcast")
+	}
+}
+
+// The presence-deny gate is symmetric on the friend protocol: if we hide our presence from a peer, we also do not
+// record THEIR inbound liveness probe (at minimum we never answer/track a denied peer's ping).
+func TestPresenceDenyIgnoresInboundPing(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
+	ctx := context.Background()
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA.start()
+	fB.start()
+	// Make them friends.
+	if err := fA.addFriend(hB.ID().String(), ""); err != nil {
+		t.Fatalf("addFriend: %v", err)
+	}
+	waitFor(t, "bob incoming", func() bool { c, ok := sB.get(hA.ID().String()); return ok && c.State == stIncoming })
+	if err := fB.acceptFriend(hA.ID().String()); err != nil {
+		t.Fatalf("acceptFriend: %v", err)
+	}
+	waitFor(t, "alice accepted", func() bool { c, ok := sA.get(hB.ID().String()); return ok && c.State == stAccepted })
+	// Bob hides presence from Alice, then Alice pings Bob → Bob must NOT mark Alice online.
+	fB.setPresenceDeny([]string{hA.ID().String()})
+	fA.pingPresence(hB.ID().String())
+	time.Sleep(250 * time.Millisecond)
+	if c, _ := sB.get(hA.ID().String()); c.online {
+		t.Fatal("a presence-denied peer's inbound ping must not mark them online on our side")
+	}
+}
+
 func TestFriendBlockedPeerIgnored(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)

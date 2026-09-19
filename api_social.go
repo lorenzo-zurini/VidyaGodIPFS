@@ -82,7 +82,11 @@ func VgGetProfile(outJson **C.char) C.int {
 		return -1
 	}
 	p := n.social.getProfile()
-	b, _ := json.Marshal(map[string]string{"nick": p.Nick, "pic": p.PicCID})
+	nick := p.Nick
+	if nick == "" { // display default only: the stored value stays empty until the user explicitly sets a nick
+		nick = defaultNick()
+	}
+	b, _ := json.Marshal(map[string]string{"nick": nick, "pic": p.PicCID})
 	setStr(outJson, string(b))
 	return 0
 }
@@ -235,5 +239,22 @@ func VgRequestFriendLibraries(peerID *C.char, errOut **C.char) C.int {
 		return -1
 	}
 	f.requestLibraries(C.GoString(peerID))
+	return 0
+}
+
+// VgSetPresenceDeny replaces the set of peers we hide our online presence from (JSON string array of peer IDs). The
+// Network tab's per-peer "Presence" toggle (off = denied); pushed at node-ready like the vLAN roster.
+//
+//export VgSetPresenceDeny
+func VgSetPresenceDeny(jsonArr *C.char) C.int {
+	f := friendSvc()
+	if f == nil {
+		return -1
+	}
+	var peers []string
+	if err := json.Unmarshal([]byte(C.GoString(jsonArr)), &peers); err != nil {
+		return -1
+	}
+	f.setPresenceDeny(peers)
 	return 0
 }

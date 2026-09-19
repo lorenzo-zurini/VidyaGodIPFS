@@ -114,13 +114,19 @@ type friendService struct {
 	shareLibs   map[string]map[string][]string
 	sendSeq     uint64
 	pushPending map[string]bool
+
+	// presenceDeny gates OUTBOUND liveness per peer: a peer in this set is never sent our profile broadcast and is
+	// never auto-pinged, so we don't advertise that we're online to them (the Network tab's per-peer "Presence" toggle,
+	// off). Replaced wholesale from config at node-ready. Guarded by denyMu.
+	denyMu       sync.Mutex
+	presenceDeny map[string]bool
 }
 
 func newFriendService(ctx context.Context, h host.Host, r peerRouter, s *socialState, emit func(int, string)) *friendService {
 	// Seed the outbound snapshot counter from the wall clock so stamps keep rising across a restart (an in-memory
 	// counter would reset to 0 and a fresh snapshot could then lose to one the receiver saw before we restarted).
 	return &friendService{ctx: ctx, host: h, router: r, social: s, emit: emit,
-		sendSeq: uint64(time.Now().UnixNano()), pushPending: map[string]bool{}}
+		sendSeq: uint64(time.Now().UnixNano()), pushPending: map[string]bool{}, presenceDeny: map[string]bool{}}
 }
 
 // start registers the inbound stream handler. Call once the host exists.
@@ -220,8 +226,12 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 		}
 	case "ping", "presence":
 		// Liveness only: a successful inbound ping/presence marks the friend online. No play payload anymore.
-		if changed, c := f.social.setPresence(remote, true); changed {
-			f.emitContact(evFriendPresence, c)
+		// If we hide our presence from this peer, don't record or reflect their liveness probe either (the Network
+		// tab's per-peer "Presence" toggle, off) — at minimum we never answer/track a denied peer's ping.
+		if !f.presenceDenied(remote) {
+			if changed, c := f.social.setPresence(remote, true); changed {
+				f.emitContact(evFriendPresence, c)
+			}
 		}
 	case "library_req":
 		// A friend asks for what we share with them. Reply with the FULL snapshot (the seeder half of the bilateral
@@ -399,7 +409,11 @@ func msgTypes(msgs []friendMsg) string {
 // helloMsg builds a message of the given type carrying our current profile.
 func (f *friendService) helloMsg(t string) friendMsg {
 	p := f.social.getProfile()
-	return friendMsg{Type: t, Nick: p.Nick, PicCID: p.PicCID}
+	nick := p.Nick
+	if nick == "" { // friends must see a real name, not "" — default to the hostname (the stored nick stays empty)
+		nick = defaultNick()
+	}
+	return friendMsg{Type: t, Nick: nick, PicCID: p.PicCID}
 }
 
 // addFriend records an outgoing request and sends it (with our profile) to the peer.
@@ -443,8 +457,29 @@ func (f *friendService) blockFriend(pidStr string) error {
 }
 
 // broadcastProfile pushes our updated profile to every accepted friend (best-effort, async).
+// presenceDenied reports whether we suppress OUTBOUND liveness to a peer (see presenceDeny).
+func (f *friendService) presenceDenied(pidStr string) bool {
+	f.denyMu.Lock()
+	defer f.denyMu.Unlock()
+	return f.presenceDeny[pidStr]
+}
+
+// setPresenceDeny replaces the whole presence-deny set (pushed from config at node-ready).
+func (f *friendService) setPresenceDeny(peers []string) {
+	m := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		m[p] = true
+	}
+	f.denyMu.Lock()
+	f.presenceDeny = m
+	f.denyMu.Unlock()
+}
+
 func (f *friendService) broadcastProfile() {
 	for _, pid := range f.social.acceptedPeers() {
+		if f.presenceDenied(pid) { // presence hidden from this peer → don't push our profile
+			continue
+		}
 		safeGo("friend.helloProfile", func() { _ = f.send(pid, f.helloMsg("profile")) })
 	}
 }
@@ -473,6 +508,9 @@ func (f *friendService) startPresence(interval time.Duration) {
 				// friend drifts to "offline" forever with nothing reporting it (adversarial H5/C1 class).
 				guard("friend.presenceTick", func() {
 					for _, pid := range f.social.acceptedPeers() {
+						if f.presenceDenied(pid) { // don't reveal we're online to a presence-denied peer
+							continue
+						}
 						safeGo("friend.pingPresence", func() { f.pingPresence(pid) })
 					}
 				})
