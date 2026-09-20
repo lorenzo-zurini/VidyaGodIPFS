@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -27,7 +29,36 @@ import (
 type dohResolver struct {
 	hc        *http.Client
 	endpoints []string // IP-literal DoH JSON endpoints, RACED (see query) — none needs DNS to reach
+
+	// Result cache + OS-fallback bound. The router-conntrack incident (see libp2pDirectIP) proved the resolver layer
+	// must never become a FLOW GENERATOR: with the forge names decoded locally the remaining lookups are few
+	// (bootstrap /dnsaddr hosts, gateways), but a DoH outage — the very filtered-net case this resolver exists for —
+	// used to dump EVERY lookup on the OS resolver, unbounded and uncached, per call. Successes cache for 5 min,
+	// failures for 30 s (so a dead network can't stampede), and at most 4 OS fallbacks run at once.
+	mu       sync.Mutex
+	ipCache  map[string]dohIPEntry
+	txtCache map[string]dohTXTEntry
+	fbSem    chan struct{}
+	fbCalls  atomic.Int64 // test observability: how many lookups actually reached the OS resolver
 }
+
+type dohIPEntry struct {
+	ips []net.IPAddr
+	err error
+	exp time.Time
+}
+
+type dohTXTEntry struct {
+	txt []string
+	err error
+	exp time.Time
+}
+
+const (
+	dohCacheOK   = 5 * time.Minute  // positive TTL — bootstrap/gateway addresses are stable
+	dohCacheFail = 30 * time.Second // negative TTL — a dead resolver must not be re-asked per call
+	dohCacheMax  = 4096             // entries per cache; wholesale reset beyond (hostile name floods)
+)
 
 // dohEndpoints: every entry is an IP literal (no bootstrap paradox) whose TLS cert carries the IP SAN, and every one
 // speaks the same JSON shape (Answer[].type/data). Cloudflare + Google, so a network that filters one provider still
@@ -43,7 +74,56 @@ func newDoHResolver() *dohResolver {
 	return &dohResolver{
 		endpoints: dohEndpoints,
 		hc:        &http.Client{Timeout: 6 * time.Second}, // per-endpoint cap; the race makes it the WORST case, not the sum
+		ipCache:   map[string]dohIPEntry{},
+		txtCache:  map[string]dohTXTEntry{},
+		fbSem:     make(chan struct{}, 4),
 	}
+}
+
+// fallbackSlot bounds concurrent OS-resolver fallbacks; blocks for a slot or the caller's deadline. Returns a release
+// func (nil release when the ctx died first — the caller returns its error without ever hitting the OS resolver).
+// Lazy-inits so a zero-value dohResolver (tests build one as a literal) works.
+func (d *dohResolver) fallbackSlot(ctx context.Context) func() {
+	d.mu.Lock()
+	if d.fbSem == nil {
+		d.fbSem = make(chan struct{}, 4)
+	}
+	sem := d.fbSem
+	d.mu.Unlock()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// cacheIP / cacheTXT store a result with the right TTL; lazy-init for zero-value resolvers, wholesale reset at the
+// size cap (a hostile name flood must not grow memory unboundedly).
+func (d *dohResolver) cacheIP(host string, ips []net.IPAddr, err error) {
+	d.mu.Lock()
+	if d.ipCache == nil || len(d.ipCache) >= dohCacheMax {
+		d.ipCache = map[string]dohIPEntry{}
+	}
+	ttl := dohCacheOK
+	if err != nil {
+		ttl = dohCacheFail
+	}
+	d.ipCache[host] = dohIPEntry{ips: ips, err: err, exp: time.Now().Add(ttl)}
+	d.mu.Unlock()
+}
+
+func (d *dohResolver) cacheTXT(name string, txt []string, err error) {
+	d.mu.Lock()
+	if d.txtCache == nil || len(d.txtCache) >= dohCacheMax {
+		d.txtCache = map[string]dohTXTEntry{}
+	}
+	ttl := dohCacheOK
+	if err != nil {
+		ttl = dohCacheFail
+	}
+	d.txtCache[name] = dohTXTEntry{txt: txt, err: err, exp: time.Now().Add(ttl)}
+	d.mu.Unlock()
 }
 
 type dohAnswer struct {
@@ -143,6 +223,13 @@ func (d *dohResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 	if ip, ok := libp2pDirectIP(host); ok { // AutoTLS name carries the IP → decode locally, ZERO DNS (see libp2pDirectIP)
 		return []net.IPAddr{{IP: ip}}, nil
 	}
+	d.mu.Lock()
+	if e, ok := d.ipCache[host]; ok && time.Now().Before(e.exp) {
+		d.mu.Unlock()
+		return e.ips, e.err
+	}
+	d.mu.Unlock()
+
 	var out []net.IPAddr
 	for _, qt := range []string{"A", "AAAA"} {
 		ans, err := d.query(ctx, host, qt)
@@ -155,24 +242,48 @@ func (d *dohResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 			}
 		}
 	}
-	if len(out) > 0 {
-		return out, nil
+	var err error
+	if len(out) == 0 {
+		// DoH unreachable / empty → the OS resolver, BOUNDED: at most 4 at once, results (and failures) cached.
+		release := d.fallbackSlot(ctx)
+		if release == nil {
+			return nil, ctx.Err() // deadline died waiting for a slot — do not cache, do not stampede
+		}
+		d.fbCalls.Add(1)
+		out, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+		release()
 	}
-	return net.DefaultResolver.LookupIPAddr(ctx, host) // DoH unreachable → fall back to the OS resolver
+	d.cacheIP(host, out, err)
+	return out, err
 }
 
 func (d *dohResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
 	if benchHostBlocked(name) { // covers _dnsaddr.<bootstrap host> TXT lookups too
 		return nil, fmt.Errorf("bench: host %q blocked (VG_BENCH_BLOCK_HOSTS)", name)
 	}
+	d.mu.Lock()
+	if e, ok := d.txtCache[name]; ok && time.Now().Before(e.exp) {
+		d.mu.Unlock()
+		return e.txt, e.err
+	}
+	d.mu.Unlock()
 	ans, err := d.query(ctx, name, "TXT")
 	if err != nil {
-		return net.DefaultResolver.LookupTXT(ctx, name)
+		release := d.fallbackSlot(ctx)
+		if release == nil {
+			return nil, ctx.Err()
+		}
+		d.fbCalls.Add(1)
+		txt, ferr := net.DefaultResolver.LookupTXT(ctx, name)
+		release()
+		d.cacheTXT(name, txt, ferr)
+		return txt, ferr
 	}
 	var out []string
 	for _, a := range ans {
 		out = append(out, strings.Trim(strings.TrimSpace(a.Data), `"`)) // Cloudflare wraps TXT data in quotes
 	}
+	d.cacheTXT(name, out, nil)
 	return out, nil
 }
 
