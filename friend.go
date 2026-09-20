@@ -46,8 +46,9 @@ const (
 type shareItem struct {
 	Cid      string `json:"cid"`
 	Node     string `json:"node,omitempty"`     // NODE_ID — the receiver's on-disk filename
-	Uid      string `json:"uid,omitempty"`      // PACKAGEUID — package-dir name, first half
-	Title    string `json:"title,omitempty"`    // display title — package-dir name, second half
+	Pkg      string `json:"pkg,omitempty"`      // the seeder's package DIR basename — the receiver reproduces the
+	Uid      string `json:"uid,omitempty"`      //   seeder's tree exactly, so a multi-game package stays ONE dir
+	Title    string `json:"title,omitempty"`    //   (uid/title remain the display + legacy-dir fallback)
 	TileCid  string `json:"tilecid,omitempty"`  // LIBRARYITEM tile block CID (empty = no tile)
 	TileNode string `json:"tilenode,omitempty"` // tile's NODE_ID — its on-disk filename
 }
@@ -114,7 +115,7 @@ func libSnapshotOK(m map[string][]shareItem) bool {
 		for _, it := range items {
 			if len(it.Cid) == 0 || len(it.Cid) > maxCidLen || len(it.TileCid) > maxCidLen ||
 				len(it.Node) > maxShareIdLen || len(it.Uid) > maxShareIdLen || len(it.TileNode) > maxShareIdLen ||
-				len(it.Title) > maxShareTitleLen {
+				len(it.Pkg) > maxShareIdLen || len(it.Title) > maxShareTitleLen {
 				return false
 			}
 		}

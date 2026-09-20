@@ -157,7 +157,7 @@ func TestFriendLibraryExchange(t *testing.T) {
 
 	// Share → full snapshot pushed to Bob.
 	fA.setShareLib(hB.ID().String(), "Games", []shareItem{
-		{Cid: "cidX", Node: "x_exec", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"},
+		{Cid: "cidX", Node: "x_exec", Pkg: "[1] Game X", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"},
 		{Cid: "cidY"},
 	})
 	waitFor(t, "bob receives shared snapshot", func() bool {
@@ -165,7 +165,7 @@ func TestFriendLibraryExchange(t *testing.T) {
 		defer mu.Unlock()
 		// The routing metadata must survive the wire VERBATIM — the receiver derives on-disk paths from it.
 		return len(cur["Games"]) == 2 && cur["Games"][0] == shareItem{
-			Cid: "cidX", Node: "x_exec", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"}
+			Cid: "cidX", Node: "x_exec", Pkg: "[1] Game X", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"}
 	})
 
 	// Add a second library, then WITHDRAW the first → snapshot replaces wholesale, "Games" is gone (no lost withdraw).
