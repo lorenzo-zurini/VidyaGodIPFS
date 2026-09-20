@@ -727,6 +727,7 @@ func VgFetchOnce(cidStr *C.char, dest *C.char, isDir C.int, errOut **C.char) C.i
 	onF := func(pct float64) { emit(kindFinalizing, pct, 0, nil) }
 
 	emit(kindStarted, -1, 0, nil)
+	fdiag("VgFetchOnce mode=%d cid=%s", int(isDir), cs)
 	var err error
 	if isDir == 2 {
 		err = n.fetchBlock(cs, onP) // browse: ONE node block into the blockstore (warms friends), no UnixFS write

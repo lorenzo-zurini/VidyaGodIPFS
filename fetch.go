@@ -798,12 +798,20 @@ func (n *node) dagGetMany(cids []cid.Cid) map[string][]byte {
 // (a friend is a guaranteed provider the dead DHT never surfaces — the exact resilience content fetches get and a bare
 // dagGetMany session does NOT). No UnixFS write: `dest` is only the queue's dedup key; the catalog reads the block
 // back from the blockstore (dagGetManyLocal).
+// fdiag is TEMPORARY always-on diagnostics for the friend-browse bring-up (remove once proven end-to-end): the
+// desktop-launched app has VG_LOG unset, so vlog/fdbg are invisible exactly when we need the journal to tell the truth.
+func fdiag(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[fetchdiag] "+format+"\n", args...)
+}
+
 func (n *node) fetchBlock(cidStr string, onProgress func(pct float64)) error {
 	c, err := cid.Decode(cidStr)
 	if err != nil {
+		fdiag("fetchBlock DECODE-FAIL cid=%q err=%v", cidStr, err)
 		return localFatal(err) // malformed CID — no retry can fix it
 	}
 	if n.hasLocal(c) { // already held (a re-dispatch after another requester landed it) → done
+		fdiag("fetchBlock ALREADY-LOCAL cid=%s", cidStr)
 		if onProgress != nil {
 			onProgress(100)
 		}
@@ -813,11 +821,14 @@ func (n *node) fetchBlock(cidStr string, onProgress func(pct float64)) error {
 	n.warmSeedLevelProviders() // whoever seeds our sources has it, even with no fresh DHT record
 	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
 	// EXACT same resilient block getter a file fetch uses (fetchToPathOnce): bitswap first, then a trustless-gateway
-	// CAR fallback on a filtered net. A bare bitswap GetBlock has NO gateway fallback — that was why browse could not
-	// fetch what content can. getRoot stores the fetched block, so the catalog reads it back locally; no UnixFS write.
+	// CAR fallback on a filtered net. getRoot stores the fetched block, so the catalog reads it back locally.
+	fdiag("fetchBlock getRoot START cid=%s conns=%s", cidStr, n.connsDump())
+	start := time.Now()
 	if _, err := n.getRoot(n.ctx, c, cidStr, onProgress); err != nil {
+		fdiag("fetchBlock getRoot FAIL cid=%s in %s err=%v", cidStr, time.Since(start).Round(time.Millisecond), err)
 		return err // still unreachable → retryable; the dispatcher backs off + re-dispatches, like content
 	}
+	fdiag("fetchBlock getRoot OK cid=%s in %s", cidStr, time.Since(start).Round(time.Millisecond))
 	if onProgress != nil {
 		onProgress(100)
 	}
