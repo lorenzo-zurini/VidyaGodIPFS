@@ -109,9 +109,39 @@ func (d *dohResolver) queryOne(ctx context.Context, endpoint, name, qtype string
 	return out.Answer, nil
 }
 
+// libp2pDirectIP decodes an AutoTLS / p2p-forge "*.libp2p.direct" name locally. The leading DNS label IS the peer's IP
+// with the separator replaced by '-' (IPv4 "31-204-136-139" == 31.204.136.139; IPv6 encodes ':' as '-'). The
+// libp2p.direct zone is a wildcard that just echoes that IP back, so the lookup carries nothing the name doesn't already
+// hold — and since every peer's name is unique it NEVER caches, making these the dominant DNS load (measured: ~113k
+// queries in 6h, overwhelmingly unique *.libp2p.direct). Decoding locally returns the identical address with ZERO
+// network DNS; TLS still validates against the "*.libp2p.direct" name, not how it was resolved. Anything that doesn't
+// decode to a valid IP returns ok=false → normal DoH/OS resolution (never guess an address for a name we can't decode).
+func libp2pDirectIP(host string) (net.IP, bool) {
+	const suffix = ".libp2p.direct"
+	trimmed := strings.TrimSuffix(host, ".") // tolerate a trailing root dot
+	h := strings.TrimSuffix(trimmed, suffix)
+	if h == trimmed { // suffix wasn't present → not a forge name
+		return nil, false
+	}
+	label := h
+	if i := strings.IndexByte(label, '.'); i >= 0 {
+		label = label[:i] // leading label = the encoded IP; the rest is the peer id
+	}
+	if ip := net.ParseIP(strings.ReplaceAll(label, "-", ".")); ip != nil && ip.To4() != nil {
+		return ip, true // IPv4: a-b-c-d
+	}
+	if ip := net.ParseIP(strings.ReplaceAll(label, "-", ":")); ip != nil {
+		return ip, true // IPv6: ':' encoded as '-'
+	}
+	return nil, false
+}
+
 func (d *dohResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
 	if benchHostBlocked(host) { // external DNS-layer block (bench.go) - refused outright, no OS fallback
 		return nil, fmt.Errorf("bench: host %q blocked (VG_BENCH_BLOCK_HOSTS)", host)
+	}
+	if ip, ok := libp2pDirectIP(host); ok { // AutoTLS name carries the IP → decode locally, ZERO DNS (see libp2pDirectIP)
+		return []net.IPAddr{{IP: ip}}, nil
 	}
 	var out []net.IPAddr
 	for _, qt := range []string{"A", "AAAA"} {
