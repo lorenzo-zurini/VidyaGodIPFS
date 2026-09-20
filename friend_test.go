@@ -7,9 +7,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	libp2p "github.com/libp2p/go-libp2p"
 	host "github.com/libp2p/go-libp2p/core/host"
@@ -107,7 +109,7 @@ func TestFriendLibraryExchange(t *testing.T) {
 
 	var mu sync.Mutex
 	cur := map[string][]shareItem(nil) // Bob's CURRENT received snapshot (replaced wholesale on each event)
-	var curSeq uint64               // highest stamp applied — models C++'s last-writer-wins (the seq authority lives there)
+	var curSeq uint64                  // highest stamp applied — models C++'s last-writer-wins (the seq authority lives there)
 	events := 0
 	emitB := func(kind int, payload string) {
 		if kind != evFriendLibrary {
@@ -192,6 +194,36 @@ func TestFriendLibraryExchange(t *testing.T) {
 		defer mu.Unlock()
 		return cur != nil && len(cur) == 0
 	})
+}
+
+// TestInboundIdentityBounds: the nick is attacker-controlled and becomes a receiver-side DIRECTORY segment, so an
+// over-long or non-UTF-8 nick must be bounded/dropped AT DISPATCH, before any branch stores it; an over-long PicCID
+// is dropped. Teeth: remove the capUtf8/PicCID gate in dispatch and these fail.
+func TestInboundIdentityBounds(t *testing.T) {
+	s := newSocialState(t.TempDir())
+	f := newFriendService(context.Background(), nil, nil, s, nil)
+	const peer = "12D3KooWBounds"
+	f.dispatch(peer, friendMsg{Type: "request", Nick: strings.Repeat("x", 10000), PicCID: strings.Repeat("y", 500)})
+	c, ok := s.get(peer)
+	if !ok {
+		t.Fatal("request not recorded")
+	}
+	if len(c.Nick) != maxNickLen {
+		t.Fatalf("nick not capped: %d bytes", len(c.Nick))
+	}
+	if c.PicCID != "" {
+		t.Fatalf("oversized PicCID stored: %d bytes", len(c.PicCID))
+	}
+	// Non-UTF-8 nick degrades to EMPTY (downstream falls back to the peer-id suffix), never to invalid bytes.
+	f.dispatch(peer, friendMsg{Type: "profile", Nick: "ok\xff\xfe"})
+	c, _ = s.get(peer)
+	if c.Nick != "" {
+		t.Fatalf("non-UTF-8 nick stored: %q", c.Nick)
+	}
+	// A capped multi-byte nick is trimmed to a VALID boundary, not split mid-rune.
+	if got := capUtf8(strings.Repeat("é", 40), maxNickLen); len(got) != 64 || !utf8.ValidString(got) {
+		t.Fatalf("capUtf8 split a rune: %d bytes valid=%v", len(got), utf8.ValidString(got))
+	}
 }
 
 // TestFriendPushSeederGate proves the seeder half of the bilateral gate at the SEND side (not just the receiver's

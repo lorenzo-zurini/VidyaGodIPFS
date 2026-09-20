@@ -16,6 +16,7 @@ import (
 	"io"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	host "github.com/libp2p/go-libp2p/core/host"
 	network "github.com/libp2p/go-libp2p/core/network"
@@ -83,7 +84,23 @@ const (
 	maxCidLen         = 128     // CID length (cid / tilecid)
 	maxShareIdLen     = 256     // node / uid / tilenode length
 	maxShareTitleLen  = 512     // title length
+	maxNickLen        = 64      // nickname bytes — it becomes a receiver-side directory segment
 )
+
+// capUtf8 bounds s to max BYTES, trimming further to the nearest valid-UTF-8 boundary (empty if s wasn't UTF-8).
+func capUtf8(s string, max int) string {
+	if len(s) <= max {
+		if utf8.ValidString(s) {
+			return s
+		}
+		return ""
+	}
+	s = s[:max]
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
 
 // libSnapshotOK bounds a decoded snapshot; false ⇒ reject (drop, do not store/serve).
 func libSnapshotOK(m map[string][]shareItem) bool {
@@ -187,6 +204,13 @@ func (f *friendService) handleStream(s network.Stream) {
 
 // dispatch applies one inbound message from remote to the address book + emits the UI event.
 func (f *friendService) dispatch(remote string, m friendMsg) {
+	// Inbound identity fields are attacker-controlled, and the nick is consumed as more than display text — the
+	// receiver derives an on-disk DIRECTORY segment from it for received shares — so bound them before any branch
+	// stores them. An over-long / non-UTF-8 nick degrades to empty (downstream falls back to the peer-id suffix).
+	m.Nick = capUtf8(m.Nick, maxNickLen)
+	if len(m.PicCID) > maxCidLen {
+		m.PicCID = ""
+	}
 	vlog("friend", "RECV %-8s from %s (nick=%q)", m.Type, shortPeer(remote), m.Nick)
 	switch m.Type {
 	case "request":

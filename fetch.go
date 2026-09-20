@@ -27,9 +27,9 @@ import (
 	files "github.com/ipfs/boxo/files"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
-	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -598,14 +598,46 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 		//    served) and unpinned (GC-vulnerable). addNoCopy is the idempotent finalize: it references the leaves in
 		//    place from the existing file and (re)pins+announces, converging any crash landing to a seedable state.
 		if !partExists(dest) {
-			fdbg("fetchToPathOnce: dest present, no .part → finalized → no-op cid=%s", cidStr)
-			return nil
+			if c.Prefix().Codec == cid.DagJSON {
+				// A dag-json NODE-block dest (the block path below writes these verbatim). Node dests are REUSED
+				// by design — a re-published node keeps its path but changes CID — so presence alone lies, and
+				// hasLocal alone lies the other way (block fetched, dest still stale). Verify the BYTES against the
+				// requested CID: exact, and cheap (a node block is small). Match → ensure it is stored+pinned (the
+				// out-of-band/restore adopt) and no-op; mismatch → discard the stale file and fetch fresh.
+				if b, rerr := os.ReadFile(dest); rerr == nil && len(b) <= maxNodeBlockBytes {
+					if got, herr := c.Prefix().Sum(b); herr == nil && got.Equals(c) {
+						if !n.hasLocal(c) {
+							if aerr := n.adoptNodeBlock(c, b); aerr != nil {
+								return localFatal(aerr)
+							}
+						}
+						fdbg("fetchToPathOnce: dest bytes match dag-json cid → no-op cid=%s", cidStr)
+						return nil
+					}
+				}
+				fdbg("fetchToPathOnce: dest present but does NOT hold dag-json cid → discard stale + re-fetch cid=%s", cidStr)
+				_ = os.Remove(dest)
+			} else if n.hasLocal(c) {
+				fdbg("fetchToPathOnce: dest present, no .part, cid local → finalized → no-op cid=%s", cidStr)
+				return nil
+			} else {
+				// dest is occupied but the node does NOT hold this CID: either an out-of-band copy of the right
+				// bytes (a restored library — adopt it below, exactly like the .part repair) or a STALE file at a
+				// re-used dest (updated content: same path, NEW cid). Hash decides; a blind no-op here silently
+				// pinned receivers to the stale version forever.
+				fdbg("fetchToPathOnce: dest present, no .part, cid NOT local → verifying on-disk content cid=%s", cidStr)
+			}
+		} else {
+			fdbg("fetchToPathOnce: dest present WITH .part → finalize was interrupted, repairing cid=%s", cidStr)
 		}
-		fdbg("fetchToPathOnce: dest present WITH .part → finalize was interrupted, repairing cid=%s", cidStr)
 		// VERIFY the on-disk bytes hash to the requested CID BEFORE referencing or pinning anything. computeCid has
 		// NO side effects (throwaway in-memory store); addNoCopy would pin+announce FIRST, so on a content mismatch
 		// it would leave a pinned, announced provider record for content whose only backing file we then delete —
-		// an unserveable orphan. Hash first, commit second.
+		// an unserveable orphan. Hash first, commit second. (Skipped when the dag-json branch above already
+		// discarded a stale dest — there is nothing left to verify.)
+		if _, serr := os.Stat(dest); serr != nil {
+			goto fetchFresh
+		}
 		got, cerr := computeCid(dest)
 		switch {
 		case cerr != nil:
@@ -628,6 +660,7 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 			removePartial(dest)
 		}
 	}
+fetchFresh:
 	// Orphaned reference: the node "has" this CID via a filestore reference, but the backing file was deleted.
 	// Surface it cleanly as "missing files" (→ "Errored: missing files" in the UI) instead of reading the gone
 	// file. (cidMissing is local-only; for content we don't have it returns false, so normal fetches proceed.)

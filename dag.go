@@ -111,6 +111,31 @@ func computeDagJSONCid(in []byte) (cid.Cid, error) {
 	return dagJSONCidFor(canon)
 }
 
+// maxNodeBlockBytes bounds what fetchToPathOnce will read back from a dest file to verify it against a dag-json
+// CID — a node block can never legitimately exceed the bitswap block limit, so anything bigger is a mismatch.
+const maxNodeBlockBytes = 4 << 20
+
+// adoptNodeBlock stores + direct-pins + announces bytes that ALREADY hash to c (the caller verified) — the
+// finalize half of the dag-json fetch path, for a block found on disk (a restored library, an out-of-band copy)
+// that the blockstore doesn't hold yet. Mirrors dagPut minus the canonicalization (verified bytes ARE canonical).
+func (n *node) adoptNodeBlock(c cid.Cid, raw []byte) error {
+	blk, err := blocks.NewBlockWithCid(raw, c)
+	if err != nil {
+		return err
+	}
+	if err := n.bserv.AddBlock(n.ctx, blk); err != nil {
+		return err
+	}
+	if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
+		return err
+	}
+	if err := n.pinner.Flush(n.ctx); err != nil {
+		return err
+	}
+	n.announce(c)
+	return nil
+}
+
 // dagPut canonicalizes a node's JSON, stores it as one dag-json block, DIRECT-pins it (each node in a frozen closure
 // is put individually, so the whole closure is pinned block-by-block — no recursive dag-json walk needed), and
 // announces it to the DHT. Returns the block CID = the node's identity.
