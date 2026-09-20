@@ -812,10 +812,11 @@ func (n *node) fetchBlock(cidStr string, onProgress func(pct float64)) error {
 	n.warmProviders(c)         // same warmups as fetchToPathOnce — a dead DHT surfaces no providers on its own
 	n.warmSeedLevelProviders() // whoever seeds our sources has it, even with no fresh DHT record
 	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
-	ctx, cancel := context.WithTimeout(n.ctx, dagGetTimeout)
-	defer cancel()
-	if _, err := n.bserv.GetBlock(ctx, c); err != nil {
-		return err // stalled/unreachable → retryable; the dispatcher backs off + re-dispatches, like content
+	// EXACT same resilient block getter a file fetch uses (fetchToPathOnce): bitswap first, then a trustless-gateway
+	// CAR fallback on a filtered net. A bare bitswap GetBlock has NO gateway fallback — that was why browse could not
+	// fetch what content can. getRoot stores the fetched block, so the catalog reads it back locally; no UnixFS write.
+	if _, err := n.getRoot(n.ctx, c, cidStr, onProgress); err != nil {
+		return err // still unreachable → retryable; the dispatcher backs off + re-dispatches, like content
 	}
 	if onProgress != nil {
 		onProgress(100)
