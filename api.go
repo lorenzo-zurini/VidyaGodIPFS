@@ -301,6 +301,38 @@ func VgDagGetMany(cidsJson *C.char, outJson **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgDagGetManyLocal is like VgDagGetMany but reads ONLY the local blockstore (no bitswap) — for catalog-build time,
+// where we must fold in whatever friend share blocks have already landed without blocking on the network. Returns a
+// JSON object {cid: <block's dag-json>} for the CIDs present locally; absent ones are simply omitted.
+//
+//export VgDagGetManyLocal
+func VgDagGetManyLocal(cidsJson *C.char, outJson **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	var cidStrs []string
+	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &cidStrs); err != nil {
+		return fail(errOut, err)
+	}
+	need := make([]cid.Cid, 0, len(cidStrs))
+	for _, s := range cidStrs {
+		c, err := cid.Decode(s)
+		if err != nil || c.Prefix().Codec != cid.DagJSON {
+			continue
+		}
+		need = append(need, c)
+	}
+	out := make(map[string]json.RawMessage, len(need))
+	for k, v := range n.dagGetManyLocal(need) {
+		out[k] = json.RawMessage(v)
+	}
+	b, _ := json.Marshal(out)
+	setStr(outJson, string(b))
+	return 0
+}
+
 // VgDagHas: 1 if the node block is present locally, 0 if not, -1 if the node is not started or the CID is invalid.
 //
 //export VgDagHas

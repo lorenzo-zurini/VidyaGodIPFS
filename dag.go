@@ -161,3 +161,28 @@ func (n *node) dagGet(c cid.Cid) ([]byte, error) {
 
 // dagHas reports whether a node block is present in the LOCAL blockstore (no network).
 func (n *node) dagHas(c cid.Cid) bool { return n.hasLocal(c) }
+
+// dagGetLocal reads a node block's bytes from the LOCAL blockstore only — never bitswap. Returns ok=false if the block
+// isn't already held, so catalog-build can render whatever is fetched without stalling on a 60s network get for a block
+// a friend hasn't provided yet. n.bstore.Get is the exact filestore-backed path bitswap serves from (see query.go:200).
+func (n *node) dagGetLocal(c cid.Cid) ([]byte, bool) {
+	if !n.hasLocal(c) {
+		return nil, false
+	}
+	blk, err := n.bstore.Get(n.ctx, c)
+	if err != nil {
+		return nil, false
+	}
+	return blk.RawData(), true
+}
+
+// dagGetManyLocal is the batched local-only read used at catalog-build time — no network, fast blockstore lookups.
+func (n *node) dagGetManyLocal(cids []cid.Cid) map[string][]byte {
+	out := map[string][]byte{}
+	for _, c := range cids {
+		if b, ok := n.dagGetLocal(c); ok {
+			out[c.String()] = b
+		}
+	}
+	return out
+}

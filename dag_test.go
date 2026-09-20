@@ -9,6 +9,8 @@ package main
 import (
 	"bytes"
 	"testing"
+
+	cid "github.com/ipfs/go-cid"
 )
 
 // A fixed, link-free node fixture. Link-free so its CID is a stable constant independent of any other computed CID;
@@ -140,5 +142,37 @@ func TestDagPutGetRoundTrip(t *testing.T) {
 	}
 	if _, err := n.dagGet(pbCid); err == nil {
 		t.Fatalf("dagGet accepted a non-dag-json CID %s", pbCid)
+	}
+}
+
+// TestDagGetManyLocal pins the blockstore-only read: a block that's present is returned (canonical bytes), and a valid
+// but ABSENT CID is OMITTED — never fetched, never fabricated. This is what lets catalog-build fold in only the friend
+// blocks that have actually landed, without stalling on the network. Teeth: if the read hit bitswap or returned bytes
+// for a block it doesn't hold, the absent-omitted / count checks fail.
+func TestDagGetManyLocal(t *testing.T) {
+	n := offlineNode(t)
+	present := `{"NODE_ID":"x","TYPE":"DeclareLibraryItem","TITLE":"X"}`
+	c, err := n.dagPut([]byte(present))
+	if err != nil {
+		t.Fatalf("dagPut: %v", err)
+	}
+	absent, err := computeDagJSONCid([]byte(`{"NODE_ID":"ghost","TYPE":"DeclareLibraryItem"}`))
+	if err != nil {
+		t.Fatalf("computeDagJSONCid: %v", err)
+	}
+	got := n.dagGetManyLocal([]cid.Cid{c, absent})
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 present block, got %d", len(got))
+	}
+	b, ok := got[c.String()]
+	if !ok {
+		t.Fatal("present block missing from local read")
+	}
+	if _, ok := got[absent.String()]; ok {
+		t.Fatal("absent block must NOT be returned by a local-only read (would mean a network fetch or fabrication)")
+	}
+	canon, _ := canonicalizeDagJSON([]byte(present))
+	if !bytes.Equal(b, canon) {
+		t.Fatalf("local read returned non-canonical bytes:\n got=%s\n want=%s", b, canon)
 	}
 }
