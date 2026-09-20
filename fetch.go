@@ -27,6 +27,7 @@ import (
 	files "github.com/ipfs/boxo/files"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
+	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	blocks "github.com/ipfs/go-block-format"
@@ -651,6 +652,32 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 	fdbg("fetchToPathOnce: got root block codec=%d in %s cid=%s", root.Cid().Prefix().Codec, time.Since(getStart).Round(time.Millisecond), cidStr)
 	fdbg("fetchToPathOnce: %s", n.connsDump()) // RELAYED vs DIRECT to the seeder — the throughput ceiling
 
+	// A dag-json root is a NODE BLOCK (a friend's shared node / any pasted node CID), not a UnixFS file — its
+	// "content" IS the canonical block bytes getRoot just fetched. Same path, same queue, same dest semantics as any
+	// file: write the bytes to dest, then finalize the way dagPut does (direct pin + announce) — the receiver becomes
+	// a SEEDER of the exact shared CID (the PUBLISH design's multi-seeder requirement), the block is GC-protected,
+	// and it gets a permanent pin row in the IPFS tab. NO caller has to know node blocks exist.
+	if root.Cid().Prefix().Codec == cid.DagJSON {
+		tmp := dest + ".tmp"
+		if err := os.WriteFile(tmp, root.RawData(), 0o644); err != nil {
+			return localFatal(err)
+		}
+		if err := os.Rename(tmp, dest); err != nil {
+			return localFatal(err)
+		}
+		if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
+			return err
+		}
+		if err := n.pinner.Flush(n.ctx); err != nil {
+			return err
+		}
+		n.announce(c) // discoverable now, not after the 22h reprovide
+		removePartial(dest)
+		fdiag("node block fetched+pinned cid=%s", cidStr)
+		onProgress(100)
+		return nil
+	}
+
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
 	wtErr := n.writeThrough(nctx, c, root, dest, cidStr, onProgress, onFinalize)
@@ -792,47 +819,8 @@ func (n *node) dagGetMany(cids []cid.Cid) map[string][]byte {
 	return out
 }
 
-// fetchBlock fetches ONE node block into the local blockstore over the RESILIENT path (warm providers + seed-level +
-// friends, then bitswap) — the rolling-queue primitive for browse. A friend's shared node/tile blocks then land like
-// any file transfer: shown in the transfer table and retried by the dispatcher, and crucially reached via warmFriends
-// (a friend is a guaranteed provider the dead DHT never surfaces — the exact resilience content fetches get and a bare
-// dagGetMany session does NOT). No UnixFS write: `dest` is only the queue's dedup key; the catalog reads the block
-// back from the blockstore (dagGetManyLocal).
-// fdiag is TEMPORARY always-on diagnostics for the friend-browse bring-up (remove once proven end-to-end): the
-// desktop-launched app has VG_LOG unset, so vlog/fdbg are invisible exactly when we need the journal to tell the truth.
 func fdiag(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[fetchdiag] "+format+"\n", args...)
-}
-
-func (n *node) fetchBlock(cidStr string, onProgress func(pct float64)) error {
-	c, err := cid.Decode(cidStr)
-	if err != nil {
-		fdiag("fetchBlock DECODE-FAIL cid=%q err=%v", cidStr, err)
-		return localFatal(err) // malformed CID — no retry can fix it
-	}
-	if n.hasLocal(c) { // already held (a re-dispatch after another requester landed it) → done
-		fdiag("fetchBlock ALREADY-LOCAL cid=%s", cidStr)
-		if onProgress != nil {
-			onProgress(100)
-		}
-		return nil
-	}
-	n.warmProviders(c)         // same warmups as fetchToPathOnce — a dead DHT surfaces no providers on its own
-	n.warmSeedLevelProviders() // whoever seeds our sources has it, even with no fresh DHT record
-	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
-	// EXACT same resilient block getter a file fetch uses (fetchToPathOnce): bitswap first, then a trustless-gateway
-	// CAR fallback on a filtered net. getRoot stores the fetched block, so the catalog reads it back locally.
-	fdiag("fetchBlock getRoot START cid=%s conns=%s", cidStr, n.connsDump())
-	start := time.Now()
-	if _, err := n.getRoot(n.ctx, c, cidStr, onProgress); err != nil {
-		fdiag("fetchBlock getRoot FAIL cid=%s in %s err=%v", cidStr, time.Since(start).Round(time.Millisecond), err)
-		return err // still unreachable → retryable; the dispatcher backs off + re-dispatches, like content
-	}
-	fdiag("fetchBlock getRoot OK cid=%s in %s", cidStr, time.Since(start).Round(time.Millisecond))
-	if onProgress != nil {
-		onProgress(100)
-	}
-	return nil
 }
 
 func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []cid.Cid, refillBatch int) <-chan blocks.Block {

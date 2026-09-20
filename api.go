@@ -729,9 +729,7 @@ func VgFetchOnce(cidStr *C.char, dest *C.char, isDir C.int, errOut **C.char) C.i
 	emit(kindStarted, -1, 0, nil)
 	fdiag("VgFetchOnce mode=%d cid=%s", int(isDir), cs)
 	var err error
-	if isDir == 2 {
-		err = n.fetchBlock(cs, onP) // browse: ONE node block into the blockstore (warms friends), no UnixFS write
-	} else if isDir != 0 {
+	if isDir != 0 {
 		err = n.fetchDirToPath(cs, d, onP, onF)
 	} else {
 		err = n.fetchToPath(cs, d, onP, onF) // single attempt; clears a stale ref on errMissingFiles
