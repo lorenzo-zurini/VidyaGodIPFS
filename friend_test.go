@@ -95,7 +95,7 @@ func TestFriendHandshakeAndProfileExchange(t *testing.T) {
 	})
 }
 
-// TestFriendLibraryExchange: once two peers are friends, a seeder's shared library (launchable CIDs) reaches the
+// TestFriendLibraryExchange: once two peers are friends, a seeder's shared library (shareItem entries) reaches the
 // leecher — pushed on setShareLib, cleared on removeShareLib, and served on an explicit request. The bilateral
 // consumer/UI gates live in C++; this proves the wire exchange itself.
 func TestFriendLibraryExchange(t *testing.T) {
@@ -106,7 +106,7 @@ func TestFriendLibraryExchange(t *testing.T) {
 	ctx := context.Background()
 
 	var mu sync.Mutex
-	cur := map[string][]string(nil) // Bob's CURRENT received snapshot (replaced wholesale on each event)
+	cur := map[string][]shareItem(nil) // Bob's CURRENT received snapshot (replaced wholesale on each event)
 	var curSeq uint64               // highest stamp applied — models C++'s last-writer-wins (the seq authority lives there)
 	events := 0
 	emitB := func(kind int, payload string) {
@@ -115,7 +115,7 @@ func TestFriendLibraryExchange(t *testing.T) {
 		}
 		var m struct {
 			Peer string
-			Libs map[string][]string
+			Libs map[string][]shareItem
 			Seq  uint64
 		}
 		_ = json.Unmarshal([]byte(payload), &m)
@@ -154,21 +154,26 @@ func TestFriendLibraryExchange(t *testing.T) {
 	waitFor(t, "alice accepted", func() bool { c, ok := sA.get(hB.ID().String()); return ok && c.State == stAccepted })
 
 	// Share → full snapshot pushed to Bob.
-	fA.setShareLib(hB.ID().String(), "Games", []string{"cidX", "cidY"})
+	fA.setShareLib(hB.ID().String(), "Games", []shareItem{
+		{Cid: "cidX", Node: "x_exec", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"},
+		{Cid: "cidY"},
+	})
 	waitFor(t, "bob receives shared snapshot", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		return len(cur["Games"]) == 2 && cur["Games"][0] == "cidX"
+		// The routing metadata must survive the wire VERBATIM — the receiver derives on-disk paths from it.
+		return len(cur["Games"]) == 2 && cur["Games"][0] == shareItem{
+			Cid: "cidX", Node: "x_exec", Uid: "1", Title: "Game X", TileCid: "cidXt", TileNode: "x_tile"}
 	})
 
 	// Add a second library, then WITHDRAW the first → snapshot replaces wholesale, "Games" is gone (no lost withdraw).
-	fA.setShareLib(hB.ID().String(), "Retro", []string{"cidZ"})
+	fA.setShareLib(hB.ID().String(), "Retro", []shareItem{{Cid: "cidZ"}})
 	fA.removeShareLib(hB.ID().String(), "Games")
 	waitFor(t, "snapshot reflects Retro-only after withdraw", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		_, hasGames := cur["Games"]
-		return !hasGames && len(cur["Retro"]) == 1 && cur["Retro"][0] == "cidZ"
+		return !hasGames && len(cur["Retro"]) == 1 && cur["Retro"][0].Cid == "cidZ"
 	})
 
 	// Request path returns the authoritative snapshot on demand.
@@ -200,7 +205,7 @@ func TestFriendPushSeederGate(t *testing.T) {
 	// Pending peer: pushSnapshot must schedule no work (pushPending stays clear — nothing to send).
 	s.upsert(peer, func(c *contact) { c.State = stPending })
 	f.pushSnapshot(peer)
-	f.setShareLib(peer, "Games", []string{"cidX"}) // records intent, but must not push to a non-accepted peer
+	f.setShareLib(peer, "Games", []shareItem{{Cid: "cidX"}}) // records intent, but must not push to a non-accepted peer
 	time.Sleep(50 * time.Millisecond)
 	f.shareMu.Lock()
 	pendingPending := f.pushPending[peer]

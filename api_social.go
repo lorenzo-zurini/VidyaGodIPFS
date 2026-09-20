@@ -197,21 +197,22 @@ func VgFriendPing(peerID *C.char) C.int {
 
 // ---- friend library sharing (bilateral, per-(friend,library)) ----
 
-// VgShareLibrary: share library `lib` (launchable CIDs in cidsJson, a JSON string array) with one friend — the
-// seeder's "share" toggle. Recorded + pushed to the friend if online. Re-call to update the CID list.
+// VgShareLibrary: share library `lib` with one friend — the seeder's "share" toggle. itemsJson is a JSON array of
+// shareItem objects ({cid, node, uid, title, tilecid, tilenode} — the node CID plus the metadata the receiver needs
+// to route the block to its final library path). Recorded + pushed to the friend if online. Re-call to update.
 //
 //export VgShareLibrary
-func VgShareLibrary(peerID *C.char, lib *C.char, cidsJson *C.char, errOut **C.char) C.int {
+func VgShareLibrary(peerID *C.char, lib *C.char, itemsJson *C.char, errOut **C.char) C.int {
 	f := friendSvc()
 	if f == nil {
 		setStr(errOut, "networking is offline")
 		return -1
 	}
-	var cids []string
-	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &cids); err != nil {
+	var items []shareItem
+	if err := json.Unmarshal([]byte(C.GoString(itemsJson)), &items); err != nil {
 		return fail(errOut, err)
 	}
-	f.setShareLib(C.GoString(peerID), C.GoString(lib), cids)
+	f.setShareLib(C.GoString(peerID), C.GoString(lib), items)
 	return 0
 }
 

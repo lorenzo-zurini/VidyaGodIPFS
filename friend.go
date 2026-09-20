@@ -34,8 +34,22 @@ const (
 	evFriendPresence = 3 // a friend's online state changed
 	evFriendProfile  = 4 // a friend updated their nickname / picture
 	evFriendRemoved  = 5 // local removal (echoed for UI symmetry)
-	evFriendLibrary  = 6 // a friend sent their COMPLETE shared set (snapshot): payload {peer, libs:{name:[…launchable CIDs]}}
+	evFriendLibrary  = 6 // a friend sent their COMPLETE shared set (snapshot): payload {peer, libs:{name:[shareItem]}, seq}
 )
+
+// shareItem is one shared node in a library snapshot: the node-block CID plus the metadata the RECEIVER needs to
+// place the block at its FINAL working-tree path BEFORE fetching it (LIBRARY/<nick> - <lib>/[uid] <title>/<node>.json)
+// — so a received share rides the ordinary rolling fetch queue straight into the library, with no intermediary dir
+// and no post-fetch materialize step. Tile* names the node's LIBRARYITEM tile block (fetched alongside, same dir).
+// Go relays these opaquely (bounds-checked only); C++ produces them at publish time and consumes them on receipt.
+type shareItem struct {
+	Cid      string `json:"cid"`
+	Node     string `json:"node,omitempty"`     // NODE_ID — the receiver's on-disk filename
+	Uid      string `json:"uid,omitempty"`      // PACKAGEUID — package-dir name, first half
+	Title    string `json:"title,omitempty"`    // display title — package-dir name, second half
+	TileCid  string `json:"tilecid,omitempty"`  // LIBRARYITEM tile block CID (empty = no tile)
+	TileNode string `json:"tilenode,omitempty"` // tile's NODE_ID — its on-disk filename
+}
 
 // friendMsg is the framed wire message. One JSON value per message; a stream may carry several (a decoder loop reads
 // until EOF), so a single connection can, e.g., send request then profile.
@@ -49,9 +63,9 @@ type friendMsg struct {
 	PicCID string `json:"pic,omitempty"`  // sender's profile-picture content CID
 	Note   string `json:"note,omitempty"` // optional greeting on a request
 	// AllLibs (on a "library" message) is the sender's COMPLETE set of libraries shared with the recipient, as
-	// {libName: [launchable CIDs]}. It is a full SNAPSHOT, replaced wholesale by the receiver — so a withdrawn library
+	// {libName: [shareItem]}. It is a full SNAPSHOT, replaced wholesale by the receiver — so a withdrawn library
 	// (absent from the map) is unambiguous and a dropped push self-heals on the next one. Empty map = nothing shared.
-	AllLibs map[string][]string `json:"libs,omitempty"`
+	AllLibs map[string][]shareItem `json:"libs,omitempty"`
 	// LibSeq (on a "library" message) is a monotonic per-sender stamp. Each snapshot rides its own libp2p stream and the
 	// receiver handles streams concurrently, so two rapid share changes can arrive/process out of order — the receiver
 	// keeps only the HIGHEST seq it has seen from a peer and drops any older one, so a stale snapshot can never win.
@@ -64,22 +78,26 @@ type friendMsg struct {
 const (
 	maxFriendMsgBytes = 8 << 20 // 8 MiB per inbound message — bounds the pre-auth decode buffer
 	maxSharedLibs     = 4096    // libraries per snapshot
-	maxLibCids        = 100000  // launchable CIDs per library
+	maxLibCids        = 100000  // shared items per library
 	maxLibNameLen     = 256     // library-name length
-	maxCidLen         = 128     // launchable-CID length
+	maxCidLen         = 128     // CID length (cid / tilecid)
+	maxShareIdLen     = 256     // node / uid / tilenode length
+	maxShareTitleLen  = 512     // title length
 )
 
 // libSnapshotOK bounds a decoded snapshot; false ⇒ reject (drop, do not store/serve).
-func libSnapshotOK(m map[string][]string) bool {
+func libSnapshotOK(m map[string][]shareItem) bool {
 	if len(m) > maxSharedLibs {
 		return false
 	}
-	for name, cids := range m {
-		if len(name) == 0 || len(name) > maxLibNameLen || len(cids) > maxLibCids {
+	for name, items := range m {
+		if len(name) == 0 || len(name) > maxLibNameLen || len(items) > maxLibCids {
 			return false
 		}
-		for _, c := range cids {
-			if len(c) == 0 || len(c) > maxCidLen {
+		for _, it := range items {
+			if len(it.Cid) == 0 || len(it.Cid) > maxCidLen || len(it.TileCid) > maxCidLen ||
+				len(it.Node) > maxShareIdLen || len(it.Uid) > maxShareIdLen || len(it.TileNode) > maxShareIdLen ||
+				len(it.Title) > maxShareTitleLen {
 				return false
 			}
 		}
@@ -101,7 +119,7 @@ type friendService struct {
 	social *socialState
 	emit   func(kind int, jsonPayload string) // may be nil
 
-	// What library lists we serve each friend (peerID → libName → launchable CIDs). Set from C++ per the seeder's
+	// What library lists we serve each friend (peerID → libName → shared items). Set from C++ per the seeder's
 	// per-(friend,library) "share" toggles; consulted when a friend requests our libraries. The BILATERAL gate's
 	// seeder half — we only ever hand a friend a library we deliberately put here.
 	//
@@ -111,7 +129,7 @@ type friendService struct {
 	// coalesces per peer: at most one in-flight push each, which reads the LATEST snapshot at send time — this both
 	// keeps the newest state winning and bounds goroutines against a flood of library_req messages.
 	shareMu     sync.Mutex
-	shareLibs   map[string]map[string][]string
+	shareLibs   map[string]map[string][]shareItem
 	sendSeq     uint64
 	pushPending map[string]bool
 
@@ -257,7 +275,7 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 			// marshal as null and read as malformed downstream).
 			libs := m.AllLibs
 			if libs == nil {
-				libs = map[string][]string{}
+				libs = map[string][]shareItem{}
 			}
 			b, _ := json.Marshal(map[string]any{"peer": remote, "libs": libs, "seq": m.LibSeq})
 			f.emit(evFriendLibrary, string(b))
@@ -286,9 +304,9 @@ func (f *friendService) pushSnapshot(pidStr string) {
 		// and correctly schedules a fresh push, so no update is ever coalesced away.
 		f.shareMu.Lock()
 		f.pushPending[pidStr] = false
-		out := map[string][]string{}
+		out := map[string][]shareItem{}
 		for k, v := range f.shareLibs[pidStr] {
-			out[k] = append([]string(nil), v...)
+			out[k] = append([]shareItem(nil), v...)
 		}
 		f.sendSeq++
 		seq := f.sendSeq
@@ -298,15 +316,15 @@ func (f *friendService) pushSnapshot(pidStr string) {
 }
 
 // setShareLib / removeShareLib are the seeder's per-(friend,library) toggles; each re-pushes the full snapshot.
-func (f *friendService) setShareLib(pidStr, lib string, cids []string) {
+func (f *friendService) setShareLib(pidStr, lib string, items []shareItem) {
 	f.shareMu.Lock()
 	if f.shareLibs == nil {
-		f.shareLibs = map[string]map[string][]string{}
+		f.shareLibs = map[string]map[string][]shareItem{}
 	}
 	if f.shareLibs[pidStr] == nil {
-		f.shareLibs[pidStr] = map[string][]string{}
+		f.shareLibs[pidStr] = map[string][]shareItem{}
 	}
-	f.shareLibs[pidStr][lib] = cids
+	f.shareLibs[pidStr][lib] = items
 	f.shareMu.Unlock()
 	f.pushSnapshot(pidStr)
 }
