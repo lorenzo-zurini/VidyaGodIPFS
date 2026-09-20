@@ -792,6 +792,37 @@ func (n *node) dagGetMany(cids []cid.Cid) map[string][]byte {
 	return out
 }
 
+// fetchBlock fetches ONE node block into the local blockstore over the RESILIENT path (warm providers + seed-level +
+// friends, then bitswap) — the rolling-queue primitive for browse. A friend's shared node/tile blocks then land like
+// any file transfer: shown in the transfer table and retried by the dispatcher, and crucially reached via warmFriends
+// (a friend is a guaranteed provider the dead DHT never surfaces — the exact resilience content fetches get and a bare
+// dagGetMany session does NOT). No UnixFS write: `dest` is only the queue's dedup key; the catalog reads the block
+// back from the blockstore (dagGetManyLocal).
+func (n *node) fetchBlock(cidStr string, onProgress func(pct float64)) error {
+	c, err := cid.Decode(cidStr)
+	if err != nil {
+		return localFatal(err) // malformed CID — no retry can fix it
+	}
+	if n.hasLocal(c) { // already held (a re-dispatch after another requester landed it) → done
+		if onProgress != nil {
+			onProgress(100)
+		}
+		return nil
+	}
+	n.warmProviders(c)         // same warmups as fetchToPathOnce — a dead DHT surfaces no providers on its own
+	n.warmSeedLevelProviders() // whoever seeds our sources has it, even with no fresh DHT record
+	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
+	ctx, cancel := context.WithTimeout(n.ctx, dagGetTimeout)
+	defer cancel()
+	if _, err := n.bserv.GetBlock(ctx, c); err != nil {
+		return err // stalled/unreachable → retryable; the dispatcher backs off + re-dispatches, like content
+	}
+	if onProgress != nil {
+		onProgress(100)
+	}
+	return nil
+}
+
 func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []cid.Cid, refillBatch int) <-chan blocks.Block {
 	out := make(chan blocks.Block, 64)
 	safeGo("fetch.producer", func() {
