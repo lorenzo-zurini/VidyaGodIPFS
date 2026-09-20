@@ -94,12 +94,22 @@ func (n *node) cidSizeLocal(c cid.Cid) int64 {
 	return -1
 }
 
-// pinLs returns the recursively-pinned (seeded) CIDs (drains the streaming pinner API).
+// pinLs returns every pinned CID: recursive (seeded content roots) AND direct (node blocks).
 func (n *node) pinLs() ([]cid.Cid, error) {
 	var out []cid.Cid
 	for sp := range n.pinner.RecursiveKeys(n.ctx, false) {
 		if sp.Err != nil {
 			fmt.Fprintf(os.Stderr, "[pinLs] RecursiveKeys err: %v\n", sp.Err)
+			return out, sp.Err
+		}
+		out = append(out, sp.Pin.Key)
+	}
+	// DIRECT pins too: dag-json node blocks (the freezer and the received-share fetch pin each node individually).
+	// The IPFS tab's row set is pins PLUS in-flight transfers - leaving direct pins out made every received node
+	// row VANISH the moment its transfer finished.
+	for sp := range n.pinner.DirectKeys(n.ctx, false) {
+		if sp.Err != nil {
+			fmt.Fprintf(os.Stderr, "[pinLs] DirectKeys err: %v\n", sp.Err)
 			return out, sp.Err
 		}
 		out = append(out, sp.Pin.Key)

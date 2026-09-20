@@ -84,6 +84,27 @@ func TestUpgradeNestedV0Link(t *testing.T) {
 	}
 }
 
+// TestPinLsIncludesDirectPins: dagPut direct-pins each node block, and the IPFS tab's row set = pinLs ∪ in-flight
+// transfers — so pinLs MUST stream direct pins too, or every received/minted node row vanishes the moment its
+// transfer finishes (the live regression). Teeth: drop the DirectKeys loop in pinLs and this fails.
+func TestPinLsIncludesDirectPins(t *testing.T) {
+	n := offlineNode(t)
+	c, err := n.dagPut([]byte(`{"NODE_ID":"pinls_probe","TYPE":"DeclareLibraryItem","TITLE":"p"}`))
+	if err != nil {
+		t.Fatalf("dagPut: %v", err)
+	}
+	pins, err := n.pinLs()
+	if err != nil {
+		t.Fatalf("pinLs: %v", err)
+	}
+	for _, p := range pins {
+		if p.Equals(c) {
+			return
+		}
+	}
+	t.Fatalf("direct-pinned node block %s missing from pinLs (%d pins listed)", c, len(pins))
+}
+
 func TestDagPutGetRoundTrip(t *testing.T) {
 	n := offlineNode(t)
 
