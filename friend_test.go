@@ -293,6 +293,60 @@ func TestFriendMutualCrossingConverges(t *testing.T) {
 	})
 }
 
+// addFriend returns INSTANTLY (never blocks on the send — the freeze bug) and records the contact as pending
+// immediately, and a request that could NOT be delivered at add time (peer unreachable then) still lands once the
+// peer is reachable, via the request-retry loop folded into the presence tick. Teeth: make addFriend block on send
+// again → the "returned promptly" assert fails; drop the retry loop → the "lands after becoming reachable" fails.
+func TestFriendRequestIsAsyncAndRetries(t *testing.T) {
+	hA, hB := testHost(t), testHost(t) // deliberately NOT connected yet — Alice's first send cannot reach Bob
+	sA := newSocialState(t.TempDir())
+	sB := newSocialState(t.TempDir())
+	ctx := context.Background()
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA.start()
+	fB.start()
+	fA.startPresence(200 * time.Millisecond) // fast tick so the retry fires quickly in-test
+
+	// (1) INSTANT + OPTIMISTIC: addFriend returns promptly and the contact is pending at once, though the send to an
+	// unreachable peer is still in flight/failing in the background.
+	start := time.Now()
+	if err := fA.addFriend(hB.ID().String(), "hi"); err != nil {
+		t.Fatalf("addFriend: %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("addFriend blocked for %v — it must return without waiting on the send", d)
+	}
+	if c, ok := sA.get(hB.ID().String()); !ok || c.State != stPending {
+		t.Fatal("contact must be recorded as pending immediately, independent of handshake")
+	}
+
+	_ = hB // reachability/retry is exercised by TestFriendRequestRetryDeliversPersistedPending below
+}
+
+// The request-retry loop delivers a PERSISTED pending request with NO addFriend call this session — the app-restart
+// case (a pending contact loaded from social.json, or a peer that was offline past the one-shot send's window). ONLY
+// the retry loop can deliver here: nothing fires a send at start. Teeth: drop the pendingPeers re-send in the
+// presence tick and Bob never sees the request → this fails.
+func TestFriendRequestRetryDeliversPersistedPending(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB) // reachable, but no send has EVER been fired for this contact
+	sA := newSocialState(t.TempDir())
+	sB := newSocialState(t.TempDir())
+	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stPending }) // as if loaded from disk
+	ctx := context.Background()
+	fA := newFriendService(ctx, hA, nil, sA, nil)
+	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA.start()
+	fB.start()
+	fA.startPresence(200 * time.Millisecond) // the retry rides this tick
+
+	waitFor(t, "retry loop delivers the persisted pending request", func() bool {
+		c, ok := sB.get(hA.ID().String())
+		return ok && (c.State == stIncoming || c.State == stAccepted)
+	})
+}
+
 // The nickname is never empty where it is USED: defaultNick is always non-empty, setProfile refuses an empty nick
 // (falls back to the hostname), and an explicit nick is kept verbatim and persists. The STORED nick stays empty until
 // the user chooses one (so the LAN self-name keeps its per-peer fallback — see TestLanLaunchVarsSelfName).

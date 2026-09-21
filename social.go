@@ -218,3 +218,18 @@ func (s *socialState) acceptedPeers() []string {
 	}
 	return out
 }
+
+// pendingPeers = contacts we've requested but who haven't accepted yet (state stPending). The request-retry loop
+// re-sends to these until they accept — an outbound request to an offline / not-yet-resolvable peer must not be a
+// one-shot that silently drops (the freeze-and-forget bug).
+func (s *socialState) pendingPeers() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for id, c := range s.contacts {
+		if c.State == stPending {
+			out = append(out, id)
+		}
+	}
+	return out
+}

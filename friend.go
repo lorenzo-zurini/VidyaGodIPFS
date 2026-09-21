@@ -462,8 +462,12 @@ func (f *friendService) helloMsg(t string) friendMsg {
 // addFriend records an outgoing request and sends it (with our profile) to the peer.
 func (f *friendService) addFriend(pidStr, note string) error {
 	if _, err := peer.Decode(pidStr); err != nil {
-		return fmt.Errorf("bad peer id: %w", err)
+		return fmt.Errorf("bad peer id: %w", err) // the only synchronous failure — a malformed id no retry can fix
 	}
+	// Optimistic + non-blocking: record the contact as pending and emit IMMEDIATELY so the UI shows it at once,
+	// independent of handshake state, then fire the request send off-thread. The send (DHT FindPeer + dial + stream)
+	// must NEVER block the caller — it ran on the GUI thread through cgo and froze the app. A failed/offline send is
+	// not an error here: the request-retry loop (startPresence tick) re-sends to every pending peer until accepted.
 	c := f.social.upsert(pidStr, func(c *contact) {
 		if c.State != stAccepted { // don't downgrade an existing friendship
 			c.State = stPending
@@ -472,22 +476,24 @@ func (f *friendService) addFriend(pidStr, note string) error {
 	f.emitContact(evFriendRequest, c)
 	m := f.helloMsg("request")
 	m.Note = note
-	return f.send(pidStr, m)
+	safeGo("friend.request", func() { _ = f.send(pidStr, m) })
+	return nil
 }
 
 // acceptFriend accepts an incoming request: mark accepted locally and notify the peer (with our profile).
 func (f *friendService) acceptFriend(pidStr string) error {
 	c := f.social.upsert(pidStr, func(c *contact) { c.State = stAccepted })
 	f.emitContact(evFriendAccept, c)
-	return f.send(pidStr, f.helloMsg("accept"))
+	safeGo("friend.accept", func() { _ = f.send(pidStr, f.helloMsg("accept")) }) // off-thread: never freeze the GUI
+	return nil
 }
 
 // declineFriend rejects/removes a contact and best-effort notifies the peer.
 func (f *friendService) declineFriend(pidStr string) error {
-	_ = f.send(pidStr, friendMsg{Type: "decline"}) // best-effort; peer may be offline
 	f.social.remove(pidStr)
 	f.purgeShares(pidStr) // consent ends → stop serving them, so a re-add can't silently resume
 	f.emit(evFriendRemoved, fmt.Sprintf(`{"peer":%q}`, pidStr))
+	safeGo("friend.decline", func() { _ = f.send(pidStr, friendMsg{Type: "decline"}) }) // best-effort; off-thread
 	return nil
 }
 
@@ -555,6 +561,12 @@ func (f *friendService) startPresence(interval time.Duration) {
 							continue
 						}
 						safeGo("friend.pingPresence", func() { f.pingPresence(pid) })
+					}
+					// Request-retry: an outbound request to an offline / not-yet-resolvable peer is not one-shot —
+					// re-send to every still-pending contact each tick until they accept (then they leave pending).
+					for _, pid := range f.social.pendingPeers() {
+						pid := pid
+						safeGo("friend.requestRetry", func() { _ = f.send(pid, f.helloMsg("request")) })
 					}
 				})
 			}
