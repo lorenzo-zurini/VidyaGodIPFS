@@ -25,9 +25,10 @@ const (
 	seedReannounceInterval = 3 * time.Hour    // re-run the 3-pass to refresh DHT provider records (TTL ~24-48h)
 )
 
-// setSeedLevels records the level-3 (collection) and level-2 (package) meta-CIDs, then starts the seed-announce loop on
-// the first call (immediate 3-pass + periodic refresh). Later calls update the lists and kick an immediate re-announce
-// (e.g. after a source is added), so a freshly-added source's meta goes live promptly.
+// setSeedLevels records what the app wants announced first and tracked: the published ROOT CIDs (colls — the share
+// record) and every node block of its current tree (pkgs), then starts the seed-announce loop on the first call
+// (immediate ordered passes + periodic refresh). Later calls update the lists and kick an immediate re-announce
+// (after a publish), so fresh roots go live promptly.
 func (n *node) setSeedLevels(colls, pkgs []cid.Cid) {
 	n.seedMu.Lock()
 	n.seedColls = colls
@@ -85,22 +86,38 @@ func (n *node) runSeedAnnounce() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[seed] pinLs failed: %v\n", err)
 	}
-	content := make([]cid.Cid, 0, len(all))
+	// The gigagraph's shareable units are the NODE blocks (dag-json): a share is a set of root CIDs, and a receiver
+	// (or a pin-by-CID service) can find nothing until those are provided. They are few and tiny, so they get the
+	// blocking, tracked pass FIRST — content (thousands of dag-pb / raw CIDs) goes to the provider's batched queue.
+	// Without the split every pin shares one FIFO and a fresh publish's roots sit behind the whole content set.
+	nodes, content := splitSeedPins(all, meta)
+
+	fmt.Fprintf(os.Stderr, "[seed] announce: %d root + %d library node + %d other node + %d content CID(s)\n", len(colls), len(pkgs), len(nodes), len(content))
+	// Meta levels and node blocks are FEW and the shareable units, so provide them with a blocking DHT walk (ordered,
+	// exact "announced" signal). Content is MANY (thousands) — a blocking provide each took ~an hour — so hand it to
+	// the boxo provider's batched queue instead (Provide enqueues + returns); it stays "queued for seeding" only
+	// across the fast passes, then flips to seeding as it's enqueued.
+	n.announcePass("roots", colls)         // the share record: what a receiver / pin-by-CID looks up first
+	n.announcePass("library nodes", pkgs)  // every node block of the app's current tree
+	n.announcePass("other nodes", nodes)   // dag-json pins the app did not list: earlier publishes' blocks
+	n.announceContentBulk(content)
+	fmt.Fprintf(os.Stderr, "[seed] announce complete — %d CID(s) marked seeding\n", n.seedCount())
+}
+
+// splitSeedPins partitions the pinned set (minus the legacy meta levels) into NODE blocks (dag-json — the shareable
+// units, provided first and tracked) and content (everything else — the batched provider queue). Pin order is kept.
+func splitSeedPins(all []cid.Cid, meta map[string]struct{}) (nodes, content []cid.Cid) {
 	for _, c := range all {
-		if _, isMeta := meta[c.String()]; !isMeta {
+		if _, isMeta := meta[c.String()]; isMeta {
+			continue
+		}
+		if c.Prefix().Codec == cid.DagJSON {
+			nodes = append(nodes, c)
+		} else {
 			content = append(content, c)
 		}
 	}
-
-	fmt.Fprintf(os.Stderr, "[seed] announce: %d collection + %d package + %d content CID(s)\n", len(colls), len(pkgs), len(content))
-	// Meta levels are FEW and the shareable units, so provide them with a blocking DHT walk (ordered, exact "announced"
-	// signal). Content is MANY (thousands) — a blocking provide each took ~an hour — so hand it to the boxo provider's
-	// batched queue instead (Provide enqueues + returns); it stays "queued for seeding" only across the fast meta
-	// passes, then flips to seeding as it's enqueued.
-	n.announcePass("collections", colls)
-	n.announcePass("packages", pkgs)
-	n.announceContentBulk(content)
-	fmt.Fprintf(os.Stderr, "[seed] announce complete — %d CID(s) marked seeding\n", n.seedCount())
+	return nodes, content
 }
 
 // announceContentBulk enqueues every content root into the boxo provider's efficient batched provide queue rather than

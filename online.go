@@ -398,6 +398,16 @@ func (n *node) announce(c cid.Cid) {
 	}
 	n.seedMu.Unlock()
 	safeGo("node.announceProvide", func() {
+		// A NODE block (dag-json) is a shareable unit and must be findable the moment it is published — it walks
+		// the DHT directly instead of joining the provider's FIFO behind thousands of queued content CIDs.
+		if c.Prefix().Codec == cid.DagJSON && n.dht != nil {
+			ctx, cancel := context.WithTimeout(n.ctx, seedProvideTimeout)
+			defer cancel()
+			if err := n.dht.Provide(ctx, c, true); err != nil {
+				fmt.Fprintf(os.Stderr, "[node] provide node %s failed: %v\n", c, err)
+			}
+			return
+		}
 		if err := n.provider.Provide(n.ctx, c, true); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
 		}
