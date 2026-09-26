@@ -227,19 +227,19 @@ func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
-// ---- dag-json node graph (the gigagraph: one node = one dag-json block, identity = CID) ----
+// ---- node blocks and package folders (blocks.go): a node is one raw leaf, a package a UnixFS folder ----
 
-// VgDagPut canonicalizes a node's JSON, stores it as one dag-json block (direct-pinned + announced), and returns the
-// block CID — the node's identity. Deterministic: any key order in the input yields the same CID (dag.go).
+// VgBlockPut stores bytes as one raw leaf (direct-pinned + announced now) and returns its CID — the CID `ipfs add`
+// gives the same bytes as a file. Refuses more than one 256 KiB chunk.
 //
-//export VgDagPut
-func VgDagPut(jsonStr *C.char, outCid **C.char, errOut **C.char) C.int {
+//export VgBlockPut
+func VgBlockPut(bytesStr *C.char, outCid **C.char, errOut **C.char) C.int {
 	n := get()
 	if n == nil {
 		setStr(errOut, "node not started")
 		return -1
 	}
-	c, err := n.dagPut([]byte(C.GoString(jsonStr)))
+	c, err := n.blockPut([]byte(C.GoString(bytesStr)))
 	if err != nil {
 		return fail(errOut, err)
 	}
@@ -247,11 +247,11 @@ func VgDagPut(jsonStr *C.char, outCid **C.char, errOut **C.char) C.int {
 	return 0
 }
 
-// VgDagGet returns a node block's raw dag-json bytes (valid JSON; links as {"/":"<cid>"}). Fetches over bitswap when
-// the block is not local. Errors if the CID is not a dag-json node.
+// VgBlockGet returns one raw block's bytes, fetched over bitswap when it is not local (bounded wait). Errors for a
+// CID that is not a single raw block.
 //
-//export VgDagGet
-func VgDagGet(cidStr *C.char, outJson **C.char, errOut **C.char) C.int {
+//export VgBlockGet
+func VgBlockGet(cidStr *C.char, outBytes **C.char, errOut **C.char) C.int {
 	n := get()
 	if n == nil {
 		setStr(errOut, "node not started")
@@ -261,102 +261,29 @@ func VgDagGet(cidStr *C.char, outJson **C.char, errOut **C.char) C.int {
 	if err != nil {
 		return fail(errOut, err)
 	}
-	b, err := n.dagGet(c)
+	b, err := n.blockGet(c)
 	if err != nil {
 		return fail(errOut, err)
 	}
-	setStr(outJson, string(b))
+	setStr(outBytes, string(b))
 	return 0
 }
 
-// VgDagGetMany fetches many dag-json node blocks at once through the windowed session (see dagGetMany) — the browse
-// path's batched fetch, so grouping a friend's 900-variant game doesn't do 900 serial round-trips. Input: JSON array
-// of CID strings. Output: a JSON object {cid: <block's dag-json>} for those fetched (missing ones absent).
+// VgMakeDir builds the UnixFS folder of a JSON object {name: CID} over blocks the node already holds, pins it
+// recursively, announces it now, and returns the folder CID.
 //
-//export VgDagGetMany
-func VgDagGetMany(cidsJson *C.char, outJson **C.char, errOut **C.char) C.int {
+//export VgMakeDir
+func VgMakeDir(entriesJson *C.char, outCid **C.char, errOut **C.char) C.int {
 	n := get()
 	if n == nil {
 		setStr(errOut, "node not started")
 		return -1
 	}
-	var cidStrs []string
-	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &cidStrs); err != nil {
+	var entries map[string]string
+	if err := json.Unmarshal([]byte(C.GoString(entriesJson)), &entries); err != nil {
 		return fail(errOut, err)
 	}
-	need := make([]cid.Cid, 0, len(cidStrs))
-	for _, s := range cidStrs {
-		c, err := cid.Decode(s)
-		if err != nil || c.Prefix().Codec != cid.DagJSON {
-			continue
-		}
-		need = append(need, c)
-	}
-	out := make(map[string]json.RawMessage, len(need))
-	for k, v := range n.dagGetMany(need) {
-		out[k] = json.RawMessage(v)
-	}
-	b, _ := json.Marshal(out)
-	setStr(outJson, string(b))
-	return 0
-}
-
-// VgDagGetManyLocal is like VgDagGetMany but reads ONLY the local blockstore (no bitswap) — for catalog-build time,
-// where we must fold in whatever friend share blocks have already landed without blocking on the network. Returns a
-// JSON object {cid: <block's dag-json>} for the CIDs present locally; absent ones are simply omitted.
-//
-//export VgDagGetManyLocal
-func VgDagGetManyLocal(cidsJson *C.char, outJson **C.char, errOut **C.char) C.int {
-	n := get()
-	if n == nil {
-		setStr(errOut, "node not started")
-		return -1
-	}
-	var cidStrs []string
-	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &cidStrs); err != nil {
-		return fail(errOut, err)
-	}
-	need := make([]cid.Cid, 0, len(cidStrs))
-	for _, s := range cidStrs {
-		c, err := cid.Decode(s)
-		if err != nil || c.Prefix().Codec != cid.DagJSON {
-			continue
-		}
-		need = append(need, c)
-	}
-	out := make(map[string]json.RawMessage, len(need))
-	for k, v := range n.dagGetManyLocal(need) {
-		out[k] = json.RawMessage(v)
-	}
-	b, _ := json.Marshal(out)
-	setStr(outJson, string(b))
-	return 0
-}
-
-// VgDagHas: 1 if the node block is present locally, 0 if not, -1 if the node is not started or the CID is invalid.
-//
-//export VgDagHas
-func VgDagHas(cidStr *C.char) C.int {
-	n := get()
-	if n == nil {
-		return -1
-	}
-	c, err := cid.Decode(C.GoString(cidStr))
-	if err != nil {
-		return -1
-	}
-	if n.dagHas(c) {
-		return 1
-	}
-	return 0
-}
-
-// VgDagCid: the CID a node's JSON WOULD have, with NO side effects (nothing stored/pinned). Same canonicalization as
-// VgDagPut, so it matches what freezing would produce. Needs no started node.
-//
-//export VgDagCid
-func VgDagCid(jsonStr *C.char, outCid **C.char, errOut **C.char) C.int {
-	c, err := computeDagJSONCid([]byte(C.GoString(jsonStr)))
+	c, err := n.makeDir(entries)
 	if err != nil {
 		return fail(errOut, err)
 	}

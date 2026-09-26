@@ -86,38 +86,31 @@ func (n *node) runSeedAnnounce() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[seed] pinLs failed: %v\n", err)
 	}
-	// The gigagraph's shareable units are the NODE blocks (dag-json): a share is a set of root CIDs, and a receiver
-	// (or a pin-by-CID service) can find nothing until those are provided. They are few and tiny, so they get the
-	// blocking, tracked pass FIRST — content (thousands of dag-pb / raw CIDs) goes to the provider's batched queue.
-	// Without the split every pin shares one FIFO and a fresh publish's roots sit behind the whole content set.
-	nodes, content := splitSeedPins(all, meta)
+	// The shareable units are what the app listed — its package folders and its library's node blocks — few and
+	// tiny, so they get the blocking, tracked passes FIRST; everything else pinned is content (thousands of CIDs) for
+	// the provider's batched queue. Without the split every pin shares one FIFO and a fresh publish's packages sit
+	// behind the whole content set. (A node block is a raw leaf like any small file: only the app knows which is which.)
+	content := unlisted(all, meta)
 
-	fmt.Fprintf(os.Stderr, "[seed] announce: %d root + %d library node + %d other node + %d content CID(s)\n", len(colls), len(pkgs), len(nodes), len(content))
-	// Meta levels and node blocks are FEW and the shareable units, so provide them with a blocking DHT walk (ordered,
-	// exact "announced" signal). Content is MANY (thousands) — a blocking provide each took ~an hour — so hand it to
-	// the boxo provider's batched queue instead (Provide enqueues + returns); it stays "queued for seeding" only
-	// across the fast passes, then flips to seeding as it's enqueued.
-	n.announcePass("roots", colls)         // the share record: what a receiver / pin-by-CID looks up first
-	n.announcePass("library nodes", pkgs)  // every node block of the app's current tree
-	n.announcePass("other nodes", nodes)   // dag-json pins the app did not list: earlier publishes' blocks
+	fmt.Fprintf(os.Stderr, "[seed] announce: %d root + %d library node + %d content CID(s)\n", len(colls), len(pkgs), len(content))
+	// Blocking DHT walks for the few listed units (ordered, exact "announced" signal); content is MANY — a blocking
+	// provide each took ~an hour — so it goes to the boxo provider's batched queue (Provide enqueues + returns); it
+	// stays "queued for seeding" only across the fast passes, then flips to seeding as it's enqueued.
+	n.announcePass("roots", colls)        // the share record: what a receiver / pin-by-CID looks up first
+	n.announcePass("library nodes", pkgs) // every node block of the app's current tree
 	n.announceContentBulk(content)
 	fmt.Fprintf(os.Stderr, "[seed] announce complete — %d CID(s) marked seeding\n", n.seedCount())
 }
 
-// splitSeedPins partitions the pinned set (minus the legacy meta levels) into NODE blocks (dag-json — the shareable
-// units, provided first and tracked) and content (everything else — the batched provider queue). Pin order is kept.
-func splitSeedPins(all []cid.Cid, meta map[string]struct{}) (nodes, content []cid.Cid) {
+// unlisted is the pinned set minus what the app listed, in pin order.
+func unlisted(all []cid.Cid, listed map[string]struct{}) []cid.Cid {
+	var out []cid.Cid
 	for _, c := range all {
-		if _, isMeta := meta[c.String()]; isMeta {
-			continue
-		}
-		if c.Prefix().Codec == cid.DagJSON {
-			nodes = append(nodes, c)
-		} else {
-			content = append(content, c)
+		if _, ok := listed[c.String()]; !ok {
+			out = append(out, c)
 		}
 	}
-	return nodes, content
+	return out
 }
 
 // announceContentBulk enqueues every content root into the boxo provider's efficient batched provide queue rather than

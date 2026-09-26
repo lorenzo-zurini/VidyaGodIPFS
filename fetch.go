@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -29,7 +30,6 @@ import (
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
-	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -458,6 +458,33 @@ func classifyFetchErr(cidStr string, err error) int {
 	}
 }
 
+// maxDirBytes bounds a folder fetch. The folders this node fetches are package folders (node files) and dehydrated
+// source trees — kilobytes to a few megabytes. A folder declaring or streaming more is refused: never landed, never
+// pinned, never re-provided (a friend's snapshot is untrusted input).
+const maxDirBytes int64 = 1 << 30
+
+var errFolderRefused = errors.New("folder refused")
+
+// checkLandedFolder refuses a landed tree that is not plain files and directories within the bound: a symlink in it
+// would point into the user's filesystem (and travel with the package when it is installed).
+func checkLandedFolder(root string) error {
+	var total int64
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && !d.Type().IsRegular() { // a symlink, fifo, device…
+			return fmt.Errorf("%w: %s is not a plain file", errFolderRefused, strings.TrimPrefix(p, root))
+		}
+		if info, e := d.Info(); e == nil && !d.IsDir() {
+			if total += info.Size(); total > maxDirBytes {
+				return fmt.Errorf("%w: past the %d-byte folder bound", errFolderRefused, maxDirBytes)
+			}
+		}
+		return nil
+	})
+}
+
 func (n *node) fetchDirToPath(cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
 	return n.fetchDirOnce(cidStr, dest, onProgress, onFinalize) // ONE attempt; the C++ rolling queue re-dispatches
 }
@@ -510,8 +537,11 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 	if sz, serr := fnode.Size(); serr == nil {
 		total = sz
 	}
+	if total > maxDirBytes {
+		return localFatal(fmt.Errorf("folder %s declares %d bytes — over the %d-byte folder bound", cidStr, total, maxDirBytes))
+	}
 	stop := make(chan struct{})
-	var stalled atomic.Bool
+	var stalled, oversize atomic.Bool
 	safeGo("fetch.progress", func() {
 		t := time.NewTicker(250 * time.Millisecond)
 		defer t.Stop()
@@ -522,6 +552,11 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 				return
 			case <-t.C:
 				sz := dirSize(tmp)
+				if sz > maxDirBytes { // a folder can under-declare its size: bound what actually lands
+					oversize.Store(true)
+					acancel()
+					return
+				}
 				if sz != last {
 					last, lastGrow = sz, time.Now()
 				} else if time.Since(lastGrow) > stallTimeout {
@@ -541,8 +576,17 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 	})
 	werr := files.WriteTo(fnode, tmp)
 	close(stop)
+	if werr == nil {
+		werr = checkLandedFolder(tmp)
+	}
 	if werr != nil {
 		_ = os.RemoveAll(tmp)
+		if oversize.Load() {
+			return localFatal(fmt.Errorf("folder %s streamed past the %d-byte folder bound", cidStr, maxDirBytes))
+		}
+		if errors.Is(werr, errFolderRefused) {
+			return localFatal(werr)
+		}
 		if stalled.Load() {
 			return fmt.Errorf("stalled mid-transfer: %w", werr)
 		}
@@ -598,26 +642,7 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 		//    served) and unpinned (GC-vulnerable). addNoCopy is the idempotent finalize: it references the leaves in
 		//    place from the existing file and (re)pins+announces, converging any crash landing to a seedable state.
 		if !partExists(dest) {
-			if c.Prefix().Codec == cid.DagJSON {
-				// A dag-json NODE-block dest (the block path below writes these verbatim). Node dests are REUSED
-				// by design — a re-published node keeps its path but changes CID — so presence alone lies, and
-				// hasLocal alone lies the other way (block fetched, dest still stale). Verify the BYTES against the
-				// requested CID: exact, and cheap (a node block is small). Match → ensure it is stored+pinned (the
-				// out-of-band/restore adopt) and no-op; mismatch → discard the stale file and fetch fresh.
-				if b, rerr := os.ReadFile(dest); rerr == nil && len(b) <= maxNodeBlockBytes {
-					if got, herr := c.Prefix().Sum(b); herr == nil && got.Equals(c) {
-						if !n.hasLocal(c) {
-							if aerr := n.adoptNodeBlock(c, b); aerr != nil {
-								return localFatal(aerr)
-							}
-						}
-						fdbg("fetchToPathOnce: dest bytes match dag-json cid → no-op cid=%s", cidStr)
-						return nil
-					}
-				}
-				fdbg("fetchToPathOnce: dest present but does NOT hold dag-json cid → discard stale + re-fetch cid=%s", cidStr)
-				_ = os.Remove(dest)
-			} else if n.hasLocal(c) {
+			if n.hasLocal(c) {
 				fdbg("fetchToPathOnce: dest present, no .part, cid local → finalized → no-op cid=%s", cidStr)
 				return nil
 			} else {
@@ -684,32 +709,6 @@ fetchFresh:
 	}
 	fdbg("fetchToPathOnce: got root block codec=%d in %s cid=%s", root.Cid().Prefix().Codec, time.Since(getStart).Round(time.Millisecond), cidStr)
 	fdbg("fetchToPathOnce: %s", n.connsDump()) // RELAYED vs DIRECT to the seeder — the throughput ceiling
-
-	// A dag-json root is a NODE BLOCK (a friend's shared node / any pasted node CID), not a UnixFS file — its
-	// "content" IS the canonical block bytes getRoot just fetched. Same path, same queue, same dest semantics as any
-	// file: write the bytes to dest, then finalize the way dagPut does (direct pin + announce) — the receiver becomes
-	// a SEEDER of the exact shared CID (the PUBLISH design's multi-seeder requirement), the block is GC-protected,
-	// and it gets a permanent pin row in the IPFS tab. NO caller has to know node blocks exist.
-	if root.Cid().Prefix().Codec == cid.DagJSON {
-		tmp := dest + ".tmp"
-		if err := os.WriteFile(tmp, root.RawData(), 0o644); err != nil {
-			return localFatal(err)
-		}
-		if err := os.Rename(tmp, dest); err != nil {
-			return localFatal(err)
-		}
-		if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
-			return err
-		}
-		if err := n.pinner.Flush(n.ctx); err != nil {
-			return err
-		}
-		n.announce(c) // discoverable now, not after the 22h reprovide
-		removePartial(dest)
-		fdiag("node block fetched+pinned cid=%s", cidStr)
-		onProgress(100)
-		return nil
-	}
 
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
 	// (the old "stuck at 100%" delay). Falls back to read + re-add for DAGs that aren't all raw leaves.
@@ -830,28 +829,6 @@ fetchFresh:
 // released when its block arrives OR when its GetBlocks channel closes without it (a straggler / ctx-cancel).
 // So tokens are always returned exactly, with no separate exit-drain and no cross-goroutine race. The channel
 // closes when every block has been delivered or ctx is cancelled (the caller's stall watchdog / user-cancel).
-// dagGetManyTimeout bounds a whole browse batch (windowed). Generous when reachable; caps the hang when not.
-const dagGetManyTimeout = 120 * time.Second
-const dagGetManyRefill = 32
-
-// dagGetMany fetches many node blocks CONCURRENTLY via a windowed bitswap session — the SAME rolling want-window
-// content uses (rollingGetBlocks), with the same friend-as-provider routing — not serial single-block gets. 900+ tiny
-// browse blocks must not be 900 round-trips. Returns cid.String() -> raw dag-json bytes for blocks that arrive within
-// the deadline; missing ones are simply absent. Used by the browse path (BuildFrozenIndex Shallow).
-func (n *node) dagGetMany(cids []cid.Cid) map[string][]byte {
-	out := map[string][]byte{}
-	if len(cids) == 0 {
-		return out
-	}
-	ctx, cancel := context.WithTimeout(n.ctx, dagGetManyTimeout)
-	defer cancel()
-	sess := blockservice.NewSession(ctx, n.bserv)
-	for blk := range rollingGetBlocks(ctx, sess, cids, dagGetManyRefill) {
-		out[blk.Cid().String()] = blk.RawData()
-	}
-	return out
-}
-
 func fdiag(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[fetchdiag] "+format+"\n", args...)
 }
