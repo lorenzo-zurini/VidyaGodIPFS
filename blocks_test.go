@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 
+	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	cid "github.com/ipfs/go-cid"
 )
 
@@ -81,6 +82,13 @@ func TestMakeDirLinksHeldBlocks(t *testing.T) {
 	}
 	if _, err := n.blockGet(d1); err == nil {
 		t.Fatal("blockGet accepted a folder CID")
+	}
+	// The folder is pinned recursively (its children are kept by it), and its directory block is stored.
+	if _, pinned, err := n.pinner.IsPinnedWithType(n.ctx, d1, ipfspinner.Recursive); err != nil || !pinned {
+		t.Fatalf("folder not pinned recursively (%v)", err)
+	}
+	if !n.hasLocal(d1) {
+		t.Fatal("folder block not stored")
 	}
 }
 

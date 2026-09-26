@@ -80,6 +80,11 @@ func (n *node) blockGet(c cid.Cid) ([]byte, error) {
 // makeDir builds the UnixFS folder {name: child CID} over children the node already holds (the app put them first),
 // pins it recursively and announces it now. The children are linked, not copied: a folder of node files costs one
 // directory block. Names are added in sorted order, so the same entries always make the same folder.
+//
+// The pin is RECORDED, not walked (PinWithMode, no graph fetch): every child was checked held above, and a folder over
+// a package's content links gigabytes — pinner.Pin re-reads (and re-hashes, through the filestore) every block below
+// on every publish, even for a folder already pinned, and through a bitswap-backed DAG service it would wait on the
+// network for any block missing from a partly-held child.
 func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 	d, err := ufsio.NewDirectory(n.dserv)
 	if err != nil {
@@ -113,7 +118,7 @@ func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 	if err := n.dserv.Add(n.ctx, dn); err != nil {
 		return cid.Undef, err
 	}
-	if err := n.pinner.Pin(n.ctx, dn, true, ""); err != nil {
+	if err := n.pinner.PinWithMode(n.ctx, dn.Cid(), ipfspinner.Recursive, ""); err != nil {
 		return cid.Undef, err
 	}
 	if err := n.pinner.Flush(n.ctx); err != nil {
