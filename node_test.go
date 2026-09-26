@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	chunker "github.com/ipfs/boxo/chunker"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
@@ -660,5 +662,73 @@ func TestFetchDirSurfacesAnUnreplaceableDest(t *testing.T) {
 	}
 	if _, serr := os.Stat(dest + ".tmp"); serr == nil {
 		t.Fatal("the materialized tmp tree must not be left behind")
+	}
+}
+
+// A whole-DB compaction scheduled while a fetch holds a network slot waits for it; it runs once the installs are done.
+// Teeth: drop the waitFgIdle gate in scheduleCompaction and the compaction of this tiny DB finishes at once, fetch
+// or not.
+func TestCompactionWaitsForFetchesToFinish(t *testing.T) {
+	n := offlineNode(t)
+	withQueue(t, 2)
+	rel, ok := netq.acquire(context.Background(), true)
+	if !ok {
+		t.Fatal("acquire")
+	}
+	busy := func() bool { n.compactMu.Lock(); defer n.compactMu.Unlock(); return n.compactBusy }
+	n.scheduleCompaction()
+	time.Sleep(300 * time.Millisecond)
+	if !busy() {
+		t.Fatal("the compaction ran while a fetch held a slot")
+	}
+	rel()
+	deadline := time.Now().Add(5 * time.Second)
+	for busy() {
+		if time.Now().After(deadline) {
+			t.Fatal("the compaction never ran after the last fetch released its slot")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The stall watchdog watches the receiving, not the finalize: a finalize that outlasts stallTimeout (hashing a
+// multi-GB file) must not report "stalled — no data" on a download that has every byte. Teeth: drop the recvDone
+// case from the watchdog and the stall phase appears.
+func TestSlowFinalizeIsNotReportedAsAStall(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	writeFile(t, src, sampleBytes())
+	c, err := n.addNoCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStall := stallTimeout
+	stallTimeout = 50 * time.Millisecond
+	defer func() { stallTimeout = origStall }()
+	var mu sync.Mutex
+	var phases []string
+	phaseHook = func(_, text string) { mu.Lock(); phases = append(phases, text); mu.Unlock() }
+	defer func() { phaseHook = nil }()
+
+	slept := false
+	slowFinalize := func(float64) { // finalize outlasts several watchdog ticks
+		if !slept {
+			slept = true
+			time.Sleep(600 * time.Millisecond)
+		}
+	}
+	if err := n.fetchToPath(c.String(), filepath.Join(dir, "out", "fetched.bin"), nil, slowFinalize); err != nil {
+		t.Fatalf("fetchToPath: %v", err)
+	}
+	if !slept {
+		t.Fatal("finalize callback never ran — the test did not exercise a slow finalize")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range phases {
+		if strings.Contains(p, "stalled") {
+			t.Fatalf("a complete download was reported as %q during finalize", p)
+		}
 	}
 }

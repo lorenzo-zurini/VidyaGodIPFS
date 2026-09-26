@@ -130,4 +130,18 @@ func (n *node) warmFriends() {
 	}
 }
 
+// friendConnected reports whether an accepted friend is connected DIRECTLY (the friends friendFinder offers) — the
+// provider search then gives it the search delay before walking the DHT (combinedFinder.hold).
+func (n *node) friendConnected() bool {
+	if n.host == nil {
+		return false
+	}
+	for _, pid := range friendProviderPeers(n.social, n.host.ID()) {
+		if n.host.Network().Connectedness(pid) == network.Connected {
+			return true
+		}
+	}
+	return false
+}
+
 var _ routing.ContentDiscovery = friendFinder{}

@@ -61,7 +61,7 @@ func kickDoHProbe() {
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := newDoHResolver().LookupIPAddr(ctx, "cloudflare.com")
+		_, err := sharedDoH().LookupIPAddr(ctx, "cloudflare.com")
 		v = fmt.Sprintf("resolving ok (%dms)", time.Since(t0).Milliseconds())
 		if err != nil {
 			v = "lookup failed: " + rootErr(err)

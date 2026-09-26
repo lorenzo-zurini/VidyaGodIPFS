@@ -14,10 +14,10 @@ import (
 
 	bitswap "github.com/ipfs/boxo/bitswap"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
+	tracer "github.com/ipfs/boxo/bitswap/tracer"
 	blockservice "github.com/ipfs/boxo/blockservice"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	namesys "github.com/ipfs/boxo/namesys"
-	provider "github.com/ipfs/boxo/provider"
 	routinghttp "github.com/ipfs/boxo/routing/http/client"
 	routinghttpcr "github.com/ipfs/boxo/routing/http/contentrouter"
 	cid "github.com/ipfs/go-cid"
@@ -28,6 +28,7 @@ import (
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
 	network "github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	protocol "github.com/libp2p/go-libp2p/core/protocol"
 	routing "github.com/libp2p/go-libp2p/core/routing"
 	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
@@ -51,41 +52,121 @@ func loadOrCreateIdentity(repoPath string) (crypto.PrivKey, error) {
 	return priv, nil
 }
 
+// bitswapProtocols: every protocol ID a bitswap peer may speak to us on.
+var bitswapProtocols = []protocol.ID{bsnet.ProtocolBitswap, bsnet.ProtocolBitswapOneOne, bsnet.ProtocolBitswapOneZero, bsnet.ProtocolBitswapNoVers}
+
+// resourceLimits: libp2p's scaled defaults, except that bitswap may use a peer's whole stream and memory allowance.
+// A bitswap server sends every blocks message on a NEW stream (bsnet.SendMessage), so a seeder streaming to us at
+// link speed keeps many inbound bitswap streams open at once — each until we have read and stored its blocks. The
+// default per-peer PROTOCOL cap (64 inbound streams) sat below that: the resource manager reset the excess streams
+// (StreamResourceLimitExceeded, 0x1002) in bursts of 80+, and every reset was a block message lost that nothing asked
+// for again until the fetch stalled. The per-peer scope (and the system scope above it) still bound what one peer gets.
+func resourceLimits() rcmgr.ConcreteLimitConfig {
+	lim := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&lim)
+	pb, pi := lim.PeerBaseLimit, lim.PeerLimitIncrease
+	for _, p := range bitswapProtocols {
+		lim.AddProtocolPeerLimit(p,
+			rcmgr.BaseLimit{Streams: pb.Streams, StreamsInbound: pb.StreamsInbound, StreamsOutbound: pb.StreamsOutbound, Memory: pb.Memory},
+			rcmgr.BaseLimitIncrease{Streams: pi.Streams, StreamsInbound: pi.StreamsInbound, StreamsOutbound: pi.StreamsOutbound, Memory: pi.Memory})
+	}
+	return lim.AutoScale()
+}
+
+// bitswapOptions: the node's bitswap configuration (client and server).
+func bitswapOptions(tr tracer.Tracer) []bitswap.Option {
+	return []bitswap.Option{
+		bitswap.WithTracer(tr), // per-CID upload tracking
+		// Concurrent-UPLOAD tuning. boxo's server defaults cap a SINGLE peer to 1 MiB of outstanding (in-flight) block
+		// bytes (~4× 256 KiB) and 8 send workers. When one downloader fetches several files at once, all its requests
+		// hit the seeder as ONE peer, so that 1 MiB window is monopolized by the first file and the others starve →
+		// they trip the fetch stall watchdog and serialize. Widen the per-peer window to 128 MiB and double the task
+		// workers so the seeder interleaves many files to a single peer at link speed.
+		bitswap.MaxOutstandingBytesPerPeer(128 << 20),
+		bitswap.TaskWorkerCount(16),
+		bitswap.EngineTaskWorkerCount(16),
+		// The engine TRUNCATES each peer's queued wantlist at 1024 entries by default, SILENTLY dropping the rest —
+		// a >256MB single-file fetch (or a few concurrent ones) overflows it, and the client limps through the tail
+		// on periodic rebroadcasts: measured ON LOOPBACK as 177 MB/s for the first 1024 blocks, then 0.3-3 MB/s for
+		// the rest — the GUI's "pulsing" download speed. Raise it so our seeders pipeline entire game layers; the
+		// client ALSO windows its wants (fetch.go rollingGetBlocks) to stay under THIRD-PARTY seeders' default cap.
+		bitswap.MaxQueuedWantlistEntriesPerPeer(1 << 16),
+		// A bitswap session broadcasts its wants once, then only RE-REQUESTS unfulfilled ones after RebroadcastDelay
+		// (default 60s). So the TAIL of a large fetch (last blocks not served in the first pass) sits idle for up to a
+		// minute — looking "stalled — waiting for peers" — until the rebroadcast (or our 20s watchdog tears the
+		// session down and a fresh one re-asks). Cut it to 10s so a session self-heals its tail well before the
+		// watchdog fires, which also un-starves files queued behind another on a slow link (concurrent downloads).
+		bitswap.RebroadcastDelay(10 * time.Second),
+	}
+}
+
 // combinedFinder fans a provider lookup out to several content routers in parallel and merges the results, so bitswap
 // consults the fast delegated HTTP indexer alongside the (slow, cold) Amino DHT and uses whichever answers first.
-type combinedFinder struct{ routers []routing.ContentDiscovery }
+type combinedFinder struct {
+	routers []routing.ContentDiscovery
+	// hold reports that a friend is connected directly — then router 0 (the friends) is asked at once and the rest
+	// (DHT, indexers) wait the search delay; nil = never hold.
+	hold func() bool
+	// noteProvider: a provider found for a fetch — dialing it is what the user waits on (netgate.go priority).
+	noteProvider func(peer.ID)
+}
 
 // delegatedIndexers: every delegated-routing (IPNI) endpoint the finder races. Overridable in tests / the matrix.
 var delegatedIndexers = []string{"https://delegated-ipfs.dev", "https://cid.contact"}
 
 func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, count int) <-chan peer.AddrInfo {
 	out := make(chan peer.AddrInfo)
-	var wg sync.WaitGroup
-	for i, r := range cf.routers {
-		if r == nil {
-			continue
+	forward := func(idx int, rr routing.ContentDiscovery) int {
+		t0 := time.Now()
+		n := 0
+		for ai := range rr.FindProvidersAsync(ctx, c, count) {
+			n++
+			if cf.noteProvider != nil {
+				cf.noteProvider(ai.ID)
+			}
+			if n == 1 {
+				fmt.Fprintf(os.Stderr, "[finder] router %d: first provider in %s\n", idx, time.Since(t0))
+			}
+			select {
+			case out <- ai:
+			case <-ctx.Done():
+				return n
+			}
 		}
-		wg.Add(1)
-		safeGo("finder.fanout", func() {
+		fmt.Fprintf(os.Stderr, "[finder] router %d: %d providers total in %s\n", idx, n, time.Since(t0))
+		return n
+	}
+	safeGo("finder.run", func() {
+		defer close(out)
+		// Every router fans out concurrently (a slow one never delays another) — except that while a friend is connected
+		// directly, the routers past the friends (a DHT walk, HTTPS indexer queries: each a burst of new flows through
+		// the home router) wait the same search delay bitswap applies to connected peers, and are never started if the
+		// block arrives meanwhile (the session ends, boxo's query manager cancels ctx).
+		held := cf.hold != nil && cf.hold()
+		var wg sync.WaitGroup
+		for i, r := range cf.routers {
+			if r == nil {
+				continue
+			}
 			idx, rr := i, r
-			defer wg.Done()
-			t0 := time.Now()
-			n := 0
-			for ai := range rr.FindProvidersAsync(ctx, c, count) {
-				n++
-				if n == 1 {
-					fmt.Fprintf(os.Stderr, "[finder] router %d: first provider in %s\n", idx, time.Since(t0))
-				}
-				select {
-				case out <- ai:
-				case <-ctx.Done():
+			wg.Add(1)
+			safeGo("finder.fanout", func() {
+				defer wg.Done()
+				if idx > 0 && held && !walkNeeded(ctx, nil) {
+					netStats.finderHeld.Add(1)
 					return
 				}
-			}
-			fmt.Fprintf(os.Stderr, "[finder] router %d: %d providers total in %s\n", idx, n, time.Since(t0))
-		})
-	}
-	safeGo("finder.close", func() { wg.Wait(); close(out) })
+				switch {
+				case idx == 1:
+					netStats.finderDHT.Add(1)
+				case idx > 1:
+					netStats.finderIndexer.Add(1)
+				}
+				forward(idx, rr)
+			})
+		}
+		wg.Wait()
+	})
 	return out
 }
 
@@ -99,18 +180,16 @@ func (n *node) goOnline() error {
 	}
 	n.priv = priv // kept for IPNS record signing (ipns.go) — same key as the peer ID / friend code
 
-	// Connectivity vs RAM (project_idle_ram_1gb): a 900 high-water held ~900 conns at ~1.4MB each ≈ 1.3 GB, which
-	// OOM-killed the node during a library publish on a swap-pressured box. High-water 384 (still 2× the libp2p
-	// default of ~192, so multi-provider fan-out stays wide) caps that near ~540 MB; low-water 192 keeps a healthy
-	// resident peer set. rcmgr stays a fixed limiter but bounded (not InfiniteLimits) so a single peer can't balloon
-	// memory underneath the connmgr cap — the scaling defaults grow with the connection count and system RAM.
-	cm, cmErr := connmgr.NewConnManager(192, 384, connmgr.WithGracePeriod(20*time.Second))
+	// Connections: Kubo's defaults (32/96) — a home node holds a small peer set. The high-water once stood at 900
+	// (~1.3 GB of connection state, OOM on a swap-pressured box) and then 384 for provider fan-out; but providers are
+	// found per fetch, and a large resident set is a large churning set — each trimmed peer is redialed later, a new
+	// flow through the home router each time (netgate.go). rcmgr stays a fixed, bounded limiter (not InfiniteLimits)
+	// so a single peer can't balloon memory underneath the connmgr cap.
+	cm, cmErr := connmgr.NewConnManager(32, 96, connmgr.WithGracePeriod(20*time.Second))
 	if cmErr != nil {
 		return cmErr
 	}
-	rmLimits := rcmgr.DefaultLimits
-	libp2p.SetDefaultServiceLimits(&rmLimits)
-	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rmLimits.AutoScale()))
+	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(resourceLimits()))
 	if rmErr != nil {
 		return rmErr
 	}
@@ -148,9 +227,16 @@ func (n *node) goOnline() error {
 	}
 	// Benchmark control (bench.go): VG_BENCH_NO_TUNNEL forces open-internet paths by gating out the WireGuard/ZeroTier
 	// subnets this machine pair shares, so a measured throughput can't secretly be riding the tunnel. No-op otherwise.
-	if gater := newBenchGater(); gater != nil {
-		libp2pOpts = append(libp2pOpts, libp2p.ConnectionGater(gater))
+	// The dial budget + private-address filter (netgate.go), with the bench subnet blocker and the dial trace inside.
+	gate := &netGate{n: n}
+	if bg := newBenchGater(); bg != nil {
+		gate.inner = bg
 	}
+	if dialTraceOn() { // dialtrace.go: who opens our outbound connections
+		activeDialTracer = newDialTracer()
+		gate.trace = activeDialTracer
+	}
+	libp2pOpts = append(libp2pOpts, libp2p.ConnectionGater(gate))
 	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return err
@@ -211,34 +297,13 @@ func (n *node) goOnline() error {
 	// DNS filter too. [finder] router indices: 0 friends, 1 DHT, then the indexers in delegatedIndexers order.
 	routers := []routing.ContentDiscovery{friendFinder{n}, kad}
 	for _, u := range delegatedIndexers {
-		if hc, herr := routinghttp.New(u, routinghttp.WithHTTPClient(dohHTTPClient(newDoHResolver()))); herr == nil {
+		if hc, herr := routinghttp.New(u, routinghttp.WithHTTPClient(sharedHTTPClient())); herr == nil {
 			routers = append(routers, routinghttpcr.NewContentRoutingClient(hc))
 		}
 	}
-	finder = combinedFinder{routers: routers}
+	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider}
 	n.upSeen = make(map[string]int64)
-	// Concurrent-UPLOAD tuning. boxo's server defaults cap a SINGLE peer to 1 MiB of outstanding (in-flight) block
-	// bytes (~4× 256 KiB) and 8 send workers. When one downloader fetches several files at once (e.g. our 3-way
-	// concurrent download), all its requests hit the seeder as ONE peer, so that 1 MiB window is monopolized by the
-	// first file and the others starve → they trip the fetch stall watchdog and serialize. Widen the per-peer window
-	// to 128 MiB and double the task workers so the seeder interleaves many files to a single peer at link speed.
-	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore,
-		bitswap.WithTracer(upTracer{n}), // per-CID upload tracking
-		bitswap.MaxOutstandingBytesPerPeer(128<<20),
-		bitswap.TaskWorkerCount(16),
-		bitswap.EngineTaskWorkerCount(16),
-		// The engine TRUNCATES each peer's queued wantlist at 1024 entries by default, SILENTLY dropping the rest —
-		// a >256MB single-file fetch (or a few concurrent ones) overflows it, and the client limps through the tail
-		// on periodic rebroadcasts: measured ON LOOPBACK as 177 MB/s for the first 1024 blocks, then 0.3-3 MB/s for
-		// the rest — the GUI's "pulsing" download speed. Raise it so our seeders pipeline entire game layers; the
-		// client ALSO windows its wants (fetch.go wantChunk) to stay under THIRD-PARTY seeders' default cap.
-		bitswap.MaxQueuedWantlistEntriesPerPeer(1<<16),
-		// A bitswap session broadcasts its wants once, then only RE-REQUESTS unfulfilled ones after RebroadcastDelay
-		// (default 60s). So the TAIL of a large fetch (last blocks not served in the first pass) sits idle for up to a
-		// minute — looking "stalled — waiting for peers" — until the rebroadcast (or our 20s watchdog tears the
-		// session down and a fresh one re-asks). Cut it to 10s so a session self-heals its tail well before the
-		// watchdog fires, which also un-starves files queued behind another on a slow link (concurrent downloads).
-		bitswap.RebroadcastDelay(10*time.Second))
+	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore, bitswapOptions(upTracer{n})...)
 	cleanupBswap = bswap
 
 	n.host = h
@@ -253,6 +318,7 @@ func (n *node) goOnline() error {
 		fmt.Fprintf(os.Stderr, "[node] IPNS namesys init failed: %v\n", nsErr)
 	}
 	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
+	safeGo("node.netStats", func() { n.logNetStats(n.ctx) })
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
 	}
@@ -263,6 +329,10 @@ func (n *node) goOnline() error {
 	// dialed. Registered here so it covers bitswap, friend and overlay conns alike.
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
+			netStats.connsOpened.Add(1)
+			if c.Stat().Direction == network.DirInbound {
+				netStats.connsInbound.Add(1)
+			}
 			if !logOn() { // don't build the args (ConnsToPeer copies a slice) on every conn event when quiet
 				return
 			}
@@ -292,19 +362,17 @@ func (n *node) goOnline() error {
 	n.bserv = blockservice.New(n.fstore, bswap, blockservice.WriteThrough(true))
 	n.dserv = merkledag.NewDAGService(n.bserv)
 
-	// Reprovider: periodically announce our pinned roots to the DHT so peers can find what we seed.
-	if prov, perr := provider.New(n.ds,
-		provider.Online(kad),
-		provider.KeyProvider(n.reprovideKeys),
-		provider.ReproviderInterval(22*time.Hour),
-	); perr == nil {
+	// Announcing what we hold: the sweeping provider, its walks and sends through netq (provide.go).
+	if prov, perr := newSweepingProvider(n.ctx, kad, n.ds); perr == nil {
 		n.provider = prov
+	} else {
+		fmt.Fprintf(os.Stderr, "[provide] sweeping provider not started: %v\n", perr)
 	}
 
 	// Local-network discovery (mDNS): same-LAN nodes find + connect to each other directly. Essential because the
 	// public DHT does NOT advertise private LAN addresses, so two boxes on one network can't discover each other
 	// through it. Once connected, bitswap serves blocks directly between them (no DHT provider record needed).
-	if svc := mdns.NewMdnsService(h, "", &mdnsNotifee{h: h, ctx: n.ctx}); svc != nil {
+	if svc := mdns.NewMdnsService(h, "", &mdnsNotifee{h: h, ctx: n.ctx, n: n}); svc != nil {
 		if err := svc.Start(); err == nil {
 			n.mdns = svc
 		}
@@ -359,65 +427,16 @@ func (n *node) goOnline() error {
 	// and anything added while it was down — stays undiscoverable for up to 22h, so a pin-by-CID (Pinata) or a peer
 	// just "searches" forever. A short-lived process's one-shot provide barely propagates (immature routing table);
 	// this robust batch sweep runs from the long-lived node once it has peers.
-	safeGo("node.startupReprovide", func() {
-		select {
-		case <-time.After(45 * time.Second): // let bootstrap + DHT routing settle so the provides actually stick
-		case <-n.ctx.Done():
-			return
-		}
-		// FALLBACK only: if the app hasn't driven the level-ordered 3-pass seed announce (seedannounce.go), do a plain
-		// boxo reprovide of all pinned roots. When the app calls setSeedLevels (GUI / long-lived seeder) that runs
-		// instead, giving ordered + tracked announcing; the boxo 22h reprovider remains the long-term backstop either way.
-		n.seedMu.RLock()
-		started := n.seedStarted
-		n.seedMu.RUnlock()
-		if !started && n.provider != nil {
-			if err := n.provider.Reprovide(n.ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "[node] startup reprovide failed: %v\n", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "[node] startup reprovide: announced seeded content to the DHT\n")
-			}
-		}
-	})
 	return nil
 }
 
-// announce eagerly publishes a freshly added/fetched CID to the DHT so peers AND pinning services (Pinata) can find
-// it within seconds, instead of waiting up to ReproviderInterval (22h) for the next reprovide sweep. Without this,
-// newly-added content has ZERO providers on the public routing layer — a pin-by-CID just "searches" forever because
-// there is nothing to discover. Best-effort + async: a DHT provide walks to the ~20 closest peers (a few seconds).
-func (n *node) announce(c cid.Cid) { n.provide(c, false) }
+// announce makes a freshly added/fetched CID findable: handed to the sweeping provider, which announces a key it has
+// never announced promptly (its burst workers) and then reprovides it on schedule — through netq (provide.go).
+func (n *node) announce(c cid.Cid) { n.startProviding(c) }
 
-// announceNow is announce for a shareable unit — a published node block or package folder: it must be findable the
-// moment it exists, so it walks the DHT directly instead of joining the provider's FIFO behind thousands of queued
-// content CIDs.
-func (n *node) announceNow(c cid.Cid) { n.provide(c, true) }
-
-func (n *node) provide(c cid.Cid, now bool) {
-	if n.provider == nil {
-		return // offline node / provider not wired
-	}
-	// Freshly added/downloaded content is being seeded + announced NOW — mark it so the GUI shows "seeding" immediately
-	// instead of "queued for seeding" (which is for pins awaiting the next 3-pass sweep after a restart).
-	n.seedMu.Lock()
-	if n.seedDone != nil {
-		n.seedDone[c.String()] = struct{}{}
-	}
-	n.seedMu.Unlock()
-	safeGo("node.announceProvide", func() {
-		if now && n.dht != nil {
-			ctx, cancel := context.WithTimeout(n.ctx, seedProvideTimeout)
-			defer cancel()
-			if err := n.dht.Provide(ctx, c, true); err != nil {
-				fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
-			}
-			return
-		}
-		if err := n.provider.Provide(n.ctx, c, true); err != nil {
-			fmt.Fprintf(os.Stderr, "[node] provide %s failed: %v\n", c, err)
-		}
-	})
-}
+// announceNow is announce for a shareable unit (a published node block or package folder). The sweeping provider
+// takes a new key on its burst path either way; the name records that the caller needs it findable soon.
+func (n *node) announceNow(c cid.Cid) { n.startProviding(c) }
 
 // relayPeerSource feeds AutoRelay with candidate relays from the DHT routing table — public, well-connected peers;
 // those that support circuit-relay-v2 get used. Called by AutoRelay at runtime (n.dht/n.host are set by then).
@@ -452,6 +471,7 @@ func (n *node) relayPeerSource(ctx context.Context, num int) <-chan peer.AddrInf
 type mdnsNotifee struct {
 	h   host.Host
 	ctx context.Context
+	n   *node
 }
 
 func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
@@ -460,31 +480,15 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	// nudges an upgrade — this is what turns "two PCs on the same LAN" into a direct local connection instead of
 	// a hairpin punch.
 	m.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+	if m.n != nil {
+		m.n.noteLanPeer(pi.ID) // its private addresses are worth dialing (netgate.go)
+	}
 	vlog("mdns", "discovered %s addrs=%v", shortPeer(pi.ID.String()), pi.Addrs)
 	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	defer cancel()
 	if err := m.h.Connect(ctx, pi); err != nil {
 		vlog("mdns", "connect %s failed: %v", shortPeer(pi.ID.String()), err)
 	}
-}
-
-// reprovideKeys streams the recursively-pinned roots for the reprovider to announce.
-func (n *node) reprovideKeys(ctx context.Context) (<-chan cid.Cid, error) {
-	ch := make(chan cid.Cid)
-	safeGo("node.reprovideKeys", func() {
-		defer close(ch)
-		for sp := range n.pinner.RecursiveKeys(ctx, false) {
-			if sp.Err != nil {
-				return
-			}
-			select {
-			case ch <- sp.Pin.Key:
-			case <-ctx.Done():
-				return
-			}
-		}
-	})
-	return ch, nil
 }
 
 // bootstrap connects to the public bootstrap peers then bootstraps the DHT routing table.
@@ -526,6 +530,13 @@ func (n *node) providerCount(c cid.Cid, timeoutMs int) int {
 	if n.dht == nil {
 		return -1
 	}
+	// A DHT walk for a display value: one background slot of the network queue (netq.go), after fetches.
+	release, ok := netq.acquire(n.ctx, false)
+	if !ok {
+		return -1
+	}
+	defer release()
+	netStats.countLookups.Add(1)
 	ctx, cancel := context.WithTimeout(n.ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 	seen := map[peer.ID]bool{}

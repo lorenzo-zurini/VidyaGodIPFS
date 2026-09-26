@@ -80,7 +80,7 @@ func newNATGateway(parent context.Context, write func([]byte) error,
 		dial = func(network, addr string) (net.Conn, error) { return d.Dial(network, addr) }
 	}
 	if resolve == nil {
-		doh := newDoHResolver()
+		doh := sharedDoH()
 		resolve = func(ctx context.Context, host string) ([]net.IP, error) {
 			addrs, err := doh.LookupIPAddr(ctx, host)
 			if err != nil {

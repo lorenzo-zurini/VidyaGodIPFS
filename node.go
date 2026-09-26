@@ -25,7 +25,7 @@ import (
 	namesys "github.com/ipfs/boxo/namesys"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
-	provider "github.com/ipfs/boxo/provider"
+	dhtprov "github.com/libp2p/go-libp2p-kad-dht/provider"
 	cid "github.com/ipfs/go-cid"
 	datastore "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
@@ -67,7 +67,10 @@ type node struct {
 	host     host.Host
 	dht      *dht.IpfsDHT
 	exchange exchange.Interface
-	provider provider.System
+	provider  *dhtprov.SweepingProvider // announces what we hold (provide.go), through netq
+	provideSt provideState
+	lanPeers   sync.Map // peer.ID → struct{}: found on our LAN (mDNS) — netgate.go
+	wantedProv sync.Map // peer.ID → expiry: providers a fetch found — netgate.go
 
 	// IPNS (ipns.go): the peer's Ed25519 identity key (also the friend code) signs a tiny mutable record pointing
 	// the peer's name at the current library-index CID; namesys publishes/resolves via the DHT, with the datastore
@@ -258,10 +261,13 @@ func closeNode() {
 	gNode = nil
 }
 
-// scheduleCompaction kicks off an async whole-DB leveldb compaction to reclaim the disk that deleted blocks leave
-// behind as tombstones (go-ds-leveldb defers reclaim to compaction, so `du` on the repo balloons after a fetch even
-// though the logical block set is tiny). The datastore only ever holds references + small intermediate nodes, so a
-// full-range compaction is cheap. Coalesced via compacting: overlapping requests collapse into one in-flight run.
+// scheduleCompaction runs a whole-DB leveldb compaction to reclaim the disk that deleted blocks leave behind as
+// tombstones (go-ds-leveldb defers reclaim to compaction, so `du` on the repo balloons after a fetch even though the
+// logical block set is tiny) — once no fetch holds or waits for a network slot. While fetches run, the datastore
+// also carries every in-flight 256 KiB leaf and the tombstone of every one written through; compacting after EACH
+// finished fetch rewrote that whole database back to back through a replication (~100 MB/s of writes), and leveldb
+// stalls writers behind it — finalizes took 30–60 s and live fetches starved into the stall watchdog. One run when
+// the installs are done reclaims them all. Coalesced: requests while one is pending or running collapse into it.
 func (n *node) scheduleCompaction() {
 	n.compactMu.Lock()
 	if n.ldb == nil || n.compactBusy || n.compactClosed {
@@ -278,6 +284,9 @@ func (n *node) scheduleCompaction() {
 			n.compactMu.Unlock()
 			n.compactWG.Done()
 		}()
+		if !netq.waitFgIdle(n.ctx) {
+			return // closing
+		}
 		_ = n.ldb.DB.CompactRange(goleveldbutil.Range{})
 	})
 }

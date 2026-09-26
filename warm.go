@@ -6,11 +6,14 @@ package main
 // re-discovers after its RebroadcastDelay — often past the fetch deadline. The transfer "fails" even though the
 // provider is up and reachable on a CURRENT address.
 //
-// warmProviders fixes this proactively and universally: at fetch start it asks the DHT who currently provides the CID,
-// then for each provider does a LIVE FindPeer (a fresh routing walk, not the peerstore cache) to learn its current
-// addresses, refreshes the peerstore, and dials. On a healthy fetch whose cached addr already works this is a cheap
-// redundant connect to an already-connected peer; on a cold/stale cache it is what makes the fetch succeed. Runs in a
-// bounded goroutine in parallel with bitswap, so it never delays a fetch that is already progressing.
+// warmForFetch fixes this: it asks the DHT who currently provides the CID, then for each provider does a LIVE FindPeer
+// (a fresh routing walk, not the peerstore cache) to learn its current addresses, refreshes the peerstore, and dials.
+//
+// It is part of the fetch's JOB — the fetch holds one slot of the one network queue (netq.go) and this runs inside it,
+// on the attempt's context, ending with it. And it follows bitswap's own rule (boxo's ProviderSearchDelay): the peers
+// we are connected to are asked first; only an attempt that has received nothing new after providerSearchDelay walks,
+// one walk at a time. (Started unconditionally at every fetch start on the node's lifetime, a receive of a few hundred
+// small blocks from a connected friend ran ~90 overlapping walks and took the household router down.)
 
 import (
 	"context"
@@ -28,39 +31,82 @@ import (
 // warmProviderCount bounds how many providers we actively freshen — enough to find a reachable one without fanning out.
 const warmProviderCount = 6
 
+// providerSearchDelay: how long a fetch relies on the peers it is already connected to before it walks the DHT —
+// boxo bitswap's default ProviderSearchDelay, the same rule for our own walks and the finder. A var for tests.
+var providerSearchDelay = time.Second
+
 // warmInflight dedupes concurrent warms of the same CID: retry loops call warmProviders every attempt (backoff can be
 // as low as 2s) while a walk runs up to 40s — without this, walks for one CID would pile up.
 var warmInflight sync.Map
 
-// warmProviders runs a live provider+address refresh for c and connects to reachable providers. Non-blocking: launches
-// a bounded goroutine and returns. Safe to call on every fetch; no-op if the node is offline or the DHT isn't wired,
-// or when a walk for this CID is already in flight.
-func (n *node) warmProviders(c cid.Cid) {
+// warmForFetch runs the fetch attempt's provider refresh (see above) for c — and, withSeed, then for the seed-level
+// roots (fresh content may have no DHT record yet; whoever seeds our sources has it) — only if the attempt has not
+// moved (moved() false; nil = never moved) within providerSearchDelay. One goroutine, walks in sequence, all on ctx.
+func (n *node) warmForFetch(ctx context.Context, c cid.Cid, moved func() bool, withSeed bool) {
 	if n.dht == nil || n.host == nil {
 		return
 	}
+	safeGo("node.warmForFetch", func() {
+		if !walkNeeded(ctx, moved) {
+			netStats.warmSkipped.Add(1)
+			return
+		}
+		targets := []cid.Cid{c}
+		if withSeed {
+			n.seedMu.RLock()
+			targets = append(targets, n.seedColls...)
+			n.seedMu.RUnlock()
+		}
+		for _, t := range targets {
+			if ctx.Err() != nil {
+				return
+			}
+			n.warmWalk(ctx, t)
+		}
+	})
+}
+
+// warmWalk walks the DHT for c's providers and connects to them; returns when the walk ends. Skipped when a walk for
+// c is already running (another attempt's).
+func (n *node) warmWalk(ctx context.Context, c cid.Cid) {
 	if _, busy := warmInflight.LoadOrStore(c.String(), struct{}{}); busy {
 		return
 	}
-	safeGo("node.warmProviders", func() {
-		defer warmInflight.Delete(c.String())
-		ctx, cancel := context.WithTimeout(n.ctx, 40*time.Second)
-		defer cancel()
-		self := n.host.ID()
-		t0 := time.Now()
-		provs := n.dht.FindProvidersAsync(ctx, c, warmProviderCount)
-		first := true
-		for pi := range provs {
-			if pi.ID == self || pi.ID == "" {
-				continue
-			}
-			if first {
-				fdbg("warm: first provider %s after %s (walk)", shortPeer(pi.ID.String()), time.Since(t0).Round(time.Millisecond))
-				first = false
-			}
-			safeGo("node.freshenAndConnect", func() { n.freshenAndConnect(ctx, pi) }) // one goroutine per provider — never serialize behind a slow FindPeer
+	defer warmInflight.Delete(c.String())
+	netStats.warmWalks.Add(1)
+	ctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+	self := n.host.ID()
+	t0 := time.Now()
+	provs := n.dht.FindProvidersAsync(ctx, c, warmProviderCount)
+	first := true
+	var wg sync.WaitGroup
+	for pi := range provs {
+		if pi.ID == self || pi.ID == "" {
+			continue
 		}
-	})
+		n.noteWantedProvider(pi.ID)
+		if first {
+			fdbg("warm: first provider %s after %s (walk)", shortPeer(pi.ID.String()), time.Since(t0).Round(time.Millisecond))
+			first = false
+		}
+		wg.Add(1)
+		safeGo("node.freshenAndConnect", func() { defer wg.Done(); n.freshenAndConnect(ctx, pi) }) // never serialize behind a slow FindPeer
+	}
+	wg.Wait()
+}
+
+// walkNeeded waits providerSearchDelay and reports whether the attempt still needs a walk: false once ctx ended (the
+// fetch is over) or moved() says the fetch received something new in the meantime.
+func walkNeeded(ctx context.Context, moved func() bool) bool {
+	t := time.NewTimer(providerSearchDelay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+	}
+	return ctx.Err() == nil && (moved == nil || !moved())
 }
 
 // freshenAndConnect learns a peer's CURRENT addresses via a live DHT walk (bypassing possibly-stale peerstore entries)
@@ -86,6 +132,7 @@ func (n *node) freshenAndConnect(ctx context.Context, pi peer.AddrInfo) {
 	fctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	tf := time.Now()
+	netStats.findPeers.Add(1)
 	fresh, err := n.dht.FindPeer(fctx, pi.ID)
 	fdbg("warm: FindPeer %s → %d addr in %s (err=%v)", shortPeer(pi.ID.String()), len(fresh.Addrs), time.Since(tf).Round(time.Millisecond), err)
 	if c := n.host.Network().Connectedness(pi.ID); err == nil && len(fresh.Addrs) > 0 && c != network.Connected && c != network.Limited {

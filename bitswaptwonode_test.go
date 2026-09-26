@@ -94,6 +94,8 @@ type twoNode struct {
 	bswapA  *bitswap.Bitswap
 	bstoreA blockstore.Blockstore
 	hostB   peerIDer
+	bswapB  *bitswap.Bitswap
+	bstoreB blockstore.Blockstore
 	sess    *blockservice.Session
 	leaves  []cid.Cid
 }
@@ -132,7 +134,7 @@ func setupTwoNode(t *testing.T, ctx context.Context, payloadSize int) twoNode {
 		t.Fatal(err)
 	}
 	sess := blockservice.NewSession(ctx, blockservice.New(bstoreB, bswapB))
-	return twoNode{bswapA: bswapA, bstoreA: bstoreA, hostB: hostB, sess: sess, leaves: leaves}
+	return twoNode{bswapA: bswapA, bstoreA: bstoreA, hostB: hostB, bswapB: bswapB, bstoreB: bstoreB, sess: sess, leaves: leaves}
 }
 
 // Cancelling a two-node transfer mid-flight must return EVERY want-token (the delivered ones per block, and the
@@ -280,5 +282,57 @@ func TestPerFetchCapBoundsASingleFetch(t *testing.T) {
 	t.Logf("max outstanding with maxPerFetch=4: %d", mw)
 	if mw > 4+4 { // cap + one refill batch
 		t.Errorf("per-fetch cap breached: seeder saw %d wants from B with maxPerFetch=4", mw)
+	}
+}
+
+// A write-through's leaves go to the file, so fetching them must not store them: the blockservice's per-block
+// blockstore Put (then our delete, then leveldb's compactions) throttled a replication to the database. leafGetter
+// delivers every leaf over the wire with B's blockstore left without a single copy, and serves a leaf B already
+// holds from B itself. Teeth: Put the received blocks into g.local in leafGetter (what a blockservice session does)
+// and B's blockstore holds them.
+func TestLeafGetterDeliversWithoutStoring(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := setupTwoNode(t, ctx, 8<<20)
+
+	// One leaf is already local on B: it must come from B's blockstore, not the wire.
+	have, err := h.bstoreA.Get(ctx, h.leaves[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.bstoreB.Put(ctx, have); err != nil {
+		t.Fatal(err)
+	}
+
+	g := leafGetter{local: h.bstoreB, sess: h.bswapB.NewSession(ctx)}
+	got := map[cid.Cid][]byte{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for blk := range rollingGetBlocks(ctx, g, h.leaves, 4) {
+			got[blk.Cid()] = blk.RawData()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("fetch did not finish: %d/%d leaves", len(got), len(h.leaves))
+	}
+	if len(got) != len(h.leaves) {
+		t.Fatalf("received %d/%d leaves", len(got), len(h.leaves))
+	}
+	for _, lc := range h.leaves {
+		want, err := h.bstoreA.Get(ctx, lc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[lc], want.RawData()) {
+			t.Fatalf("leaf %s bytes differ", lc)
+		}
+	}
+	for _, lc := range h.leaves[1:] {
+		if ok, _ := h.bstoreB.Has(ctx, lc); ok {
+			t.Fatalf("leaf %s was stored on the receiving side — a fetched leaf must only reach the file", lc)
+		}
 	}
 }

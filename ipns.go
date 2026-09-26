@@ -122,7 +122,7 @@ func (n *node) liveRecordSeq(ctx context.Context, nm ipns.Name) (uint64, bool) {
 			}
 		}
 	}
-	if _, s, err := ipnsRecordOverHTTP(ctx, dohHTTPClient(newDoHResolver()), trustlessGateways, nm); err == nil {
+	if _, s, err := ipnsRecordOverHTTP(ctx, sharedHTTPClient(), trustlessGateways, nm); err == nil {
 		return s, true
 	}
 	return 0, false
@@ -226,7 +226,7 @@ func (n *node) ipnsResolve(ctx context.Context, name string) (string, error) {
 	// Fresh context DERIVED FROM the node ctx (so it dies at VgStop, not context.Background which would outlive it).
 	gwctx, gwcancel := context.WithTimeout(n.ctx, 30*time.Second)
 	defer gwcancel()
-	val, seq, herr := ipnsRecordOverHTTP(gwctx, dohHTTPClient(newDoHResolver()), trustlessGateways, nm)
+	val, seq, herr := ipnsRecordOverHTTP(gwctx, sharedHTTPClient(), trustlessGateways, nm)
 	if herr != nil {
 		return "", herr
 	}

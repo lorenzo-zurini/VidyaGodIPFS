@@ -22,6 +22,7 @@ import "C"
 
 import (
 	"context"
+	"sync"
 	"encoding/json"
 	"time"
 	"unsafe"
@@ -762,3 +763,41 @@ func VgImportIdentity(srcPath *C.char, errOut **C.char) C.int {
 	}
 	return 0
 }
+
+// ---- the one network queue (netq.go), shared with the C++ rolling DownloadQueue ----
+
+var (
+	netHeldMu sync.Mutex
+	netHeld   = map[int64]func(){}
+	netNextID int64
+)
+
+// VgNetAcquire blocks until a FOREGROUND slot of the network queue is free (a fetch job) and returns its handle, to
+// be passed to VgNetRelease exactly once. Works before the node starts (the queue is process-wide).
+//
+//export VgNetAcquire
+func VgNetAcquire() C.longlong {
+	release, _ := netq.acquire(context.Background(), true)
+	netHeldMu.Lock()
+	netNextID++
+	id := netNextID
+	netHeld[id] = release
+	netHeldMu.Unlock()
+	return C.longlong(id)
+}
+
+//export VgNetRelease
+func VgNetRelease(handle C.longlong) {
+	netHeldMu.Lock()
+	release, ok := netHeld[int64(handle)]
+	delete(netHeld, int64(handle))
+	netHeldMu.Unlock()
+	if ok {
+		release()
+	}
+}
+
+// VgSetNetSlots sizes the network queue — the user's "max simultaneous downloads".
+//
+//export VgSetNetSlots
+func VgSetNetSlots(n C.int) { netq.setSlots(int(n)) }

@@ -22,9 +22,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	exchange "github.com/ipfs/boxo/exchange"
 	files "github.com/ipfs/boxo/files"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
@@ -245,6 +245,26 @@ func userCancelCtx(parent context.Context, cidStr string) (context.Context, func
 // is local and is written through in a blink). Unwrapped, the user saw the bar hit 100%, then a second, quick bar
 // from 0 before "pinning". Held at its high-water mark, it is one bar. A RETRY gets a fresh wrapper: a resume really
 // does start where the bitmap says.
+// progressWatch wraps a progress callback and reports whether the attempt has MOVED — a report above the first one it
+// made (a resumed file starts at what it already has; that is not progress). The wrapped callback is never nil.
+func progressWatch(f func(pct float64)) (func(pct float64), func() bool) {
+	var mu sync.Mutex
+	first, moved := -1.0, false
+	wrapped := func(pct float64) {
+		mu.Lock()
+		if first < 0 {
+			first = pct
+		} else if pct > first {
+			moved = true
+		}
+		mu.Unlock()
+		if f != nil {
+			f(pct)
+		}
+	}
+	return wrapped, func() bool { mu.Lock(); defer mu.Unlock(); return moved }
+}
+
 func monotoneProgress(f func(pct float64)) func(pct float64) {
 	if f == nil {
 		return nil
@@ -501,10 +521,12 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 		return err
 	}
 	onProgress = monotoneProgress(onProgress)
-	// A meta/collection CID is a DIRECTORY, and fetching one on a hostile network needs the same proactive provider
-	// warming that single-file fetches get (warm.go): a live DHT provider walk + connect in parallel with bitswap, so a
-	// NAT'd provider is holepunched before getRoot's deadline instead of relying on bitswap's slower passive connect.
-	n.warmProviders(c)
+	onProgress, moved := progressWatch(onProgress)
+	// A meta/collection CID is a DIRECTORY, and fetching one on a hostile network needs the same provider warming that
+	// single-file fetches get (warm.go) — for this attempt only, and only if it has not moved within the search delay.
+	wctx, wcancel := context.WithCancel(n.ctx)
+	defer wcancel()
+	n.warmForFetch(wctx, c, moved, false)
 	// Directory (meta) fetches run under the sync worker with a bounded attempt count, not a wall-clock deadline, so
 	// the attempt context is just n.ctx — getRoot still caps each root fetch at 30s.
 	root, err := n.getRoot(n.ctx, c, cidStr, onProgress) // libp2p, or an HTTPS trustless-gateway CAR fallback on hostile nets
@@ -624,16 +646,18 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 		return errors.New("cancelled")
 	}
 	onProgress = monotoneProgress(onProgress)
+	onProgress, moved := progressWatch(onProgress)
 	c, err := cid.Decode(cidStr)
 	if err != nil {
 		return localFatal(err) // malformed CID — no retry can fix it
 	}
-	// Proactively freshen provider addresses on EVERY attempt (moved here from the deleted retry loop): a live DHT
-	// walk + connect in parallel with bitswap, so a provider that restarted (new ports) or a NAT'd seeder is
-	// re-discovered/holepunched instead of the C++ rotation re-dialing a stale peerstore forever. All no-op offline.
-	n.warmProviders(c)
-	n.warmSeedLevelProviders() // fresh content may have no DHT record yet — whoever seeds our sources has it
-	n.warmFriends()            // a friend is a guaranteed provider the DHT never surfaces
+	// Freshen provider addresses for an attempt that is NOT being served by the peers we are connected to (warm.go):
+	// a provider that restarted (new ports) or a NAT'd seeder is re-discovered/holepunched instead of the C++ rotation
+	// re-dialing a stale peerstore forever. Ends with this attempt. All no-op offline.
+	wctx, wcancel := context.WithCancel(nctx)
+	defer wcancel()
+	n.warmForFetch(wctx, c, moved, true)
+	n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces
 	if _, err := os.Stat(dest); err == nil {
 		// dest already on disk. Two cases:
 		//  * no .part sidecar → finalize completed fully (referenced + pinned + announced) → fast no-op.
@@ -833,7 +857,58 @@ func fdiag(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[fetchdiag] "+format+"\n", args...)
 }
 
-func rollingGetBlocks(ctx context.Context, sess *blockservice.Session, need []cid.Cid, refillBatch int) <-chan blocks.Block {
+// blockGetter: what rollingGetBlocks pulls from — leafGetter in production (a *blockservice.Session also fits).
+type blockGetter interface {
+	GetBlocks(ctx context.Context, ks []cid.Cid) <-chan blocks.Block
+}
+
+// leafGetter fetches a write-through's leaves: blocks already in the blockstore from there, the rest from a bitswap
+// session — and stores NOTHING. A blockservice session writes every block it fetches into the blockstore (one
+// synchronous leveldb Put per 256 KiB block) before handing it over; writeThrough writes the block to the file and
+// references it there, so that copy was only ever deleted again — and leveldb paid for the Put, the delete and the
+// compactions of both: measured 112 MB/s of disk writes for 7.5 MB/s of download on a replication, the transfer
+// throttled to the database. The spine (root + intermediate dag-pb nodes) still goes through the blockservice.
+type leafGetter struct {
+	local blockstore.Blockstore
+	sess  exchange.Fetcher // nil offline: local hits only
+}
+
+func (g leafGetter) GetBlocks(ctx context.Context, ks []cid.Cid) <-chan blocks.Block {
+	out := make(chan blocks.Block)
+	safeGo("fetch.leafGetter", func() {
+		defer close(out)
+		var misses []cid.Cid
+		for _, c := range ks {
+			b, err := g.local.Get(ctx, c)
+			if err != nil {
+				misses = append(misses, c)
+				continue
+			}
+			select {
+			case out <- b:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if len(misses) == 0 || g.sess == nil {
+			return
+		}
+		ch, err := g.sess.GetBlocks(ctx, misses)
+		if err != nil {
+			return
+		}
+		for b := range ch {
+			select {
+			case out <- b:
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+	return out
+}
+
+func rollingGetBlocks(ctx context.Context, sess blockGetter, need []cid.Cid, refillBatch int) <-chan blocks.Block {
 	out := make(chan blocks.Block, 64)
 	safeGo("fetch.producer", func() {
 		defer close(out)
@@ -1021,18 +1096,23 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 
 	if len(need) > 0 {
 		// Cancel + STALL watcher: cancel the fetch on user-cancel, OR when no block has arrived for stallTimeout (a dead
-		// peer), so the wrapper can back off + resume from the bitmap instead of hanging.
+		// peer), so the wrapper can back off + resume from the bitmap instead of hanging. It watches the RECEIVING only:
+		// once the session ends it stops — finalize reads and hashes the whole file, which on a multi-GB file outlasts
+		// stallTimeout and read as a "stalled — no data" on a download that had every byte.
 		fctx, fcancel := context.WithCancel(nctx)
 		defer fcancel()
 		var lastBlk atomic.Int64
 		lastBlk.Store(time.Now().UnixNano())
 		var stalled atomic.Bool
+		recvDone := make(chan struct{})
 		safeGo("fetch.worker", func() {
 			t := time.NewTicker(200 * time.Millisecond)
 			defer t.Stop()
 			for {
 				select {
 				case <-fctx.Done():
+					return
+				case <-recvDone:
 					return
 				case <-t.C:
 					if isCancelled(cidStr) {
@@ -1054,17 +1134,18 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		// One long-lived bitswap SESSION with a SINGLE continuous want-list for EVERY missing leaf — the session pipelines
 		// to link speed with its own bounded in-flight window, and blocks stream in out of order. THROUGHPUT-CRITICAL: the
 		// receive loop only does WriteAt (page cache — cheap, non-blocking) + a bitmap set; the expensive durability work
-		// (fsync + bitmap sidecar) and memory reclaim (dropping the redundant blockstore copies) run in a BACKGROUND
-		// flusher so they never stall the pipeline. The previous design fetched in windows and fsync'd on the hot path
-		// every 2s, which parked the want-list during each multi-hundred-ms fsync → the download visibly PULSED. Resident
-		// memory stays bounded because the flusher drops blocks as soon as ~dropBatch accumulate (independent of file
-		// size — no windowing needed). Durability invariant preserved: each sync flushes the FILE (out.Sync) BEFORE
-		// persisting the bitmap snapshot, so a crash never marks a leaf done whose bytes aren't on disk (it re-fetches
-		// via the .part bitmap). Dropping a block without an fsync is safe — it's redundant with the file bytes, and an
-		// un-synced leaf isn't in the saved bitmap, so resume re-fetches it.
+		// (fsync + bitmap sidecar) runs in a BACKGROUND flusher so it never stalls the pipeline. The previous design
+		// fetched in windows and fsync'd on the hot path every 2s, which parked the want-list during each
+		// multi-hundred-ms fsync → the download visibly PULSED. The blocks themselves are never stored (leafGetter): the
+		// file is their only copy. Durability invariant: each sync flushes the FILE (out.Sync) BEFORE persisting the
+		// bitmap snapshot, so a crash never marks a leaf done whose bytes aren't on disk (it re-fetches via the .part
+		// bitmap); an un-synced leaf isn't in the saved bitmap, so resume re-fetches it.
 		fdbg("writeThrough: opening bitswap session, %d leaves, ONE continuous want-list cid=%s", len(need), cidStr)
 		phase(cidStr, fmt.Sprintf("downloading %d block(s) over p2p", len(need)))
-		sess := blockservice.NewSession(fctx, n.bserv)
+		sess := leafGetter{local: n.bstore}
+		if se, ok := n.exchange.(exchange.SessionExchange); ok {
+			sess.sess = se.NewSession(fctx)
+		}
 		recv := 0
 		sessStart := time.Now()
 
@@ -1094,24 +1175,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			})
 		}
 
-		const dropBatch = 256 // ~64 MiB of received blocks before the flusher reclaims them → bounded residency
-		var mu sync.Mutex     // guards bits (set + snapshot) and dropQ
-		var dropQ []cid.Cid
-		doDrop := func() {
-			mu.Lock()
-			q := dropQ
-			dropQ = nil
-			mu.Unlock()
-			if len(q) == 0 {
-				return
-			}
-			if batch, berr := n.ds.Batch(n.ctx); berr == nil {
-				for _, c := range q {
-					_ = batch.Delete(n.ctx, blockstore.BlockPrefix.Child(dshelp.MultihashToDsKey(c.Hash())))
-				}
-				_ = batch.Commit(n.ctx)
-			}
-		}
+		var mu sync.Mutex  // guards bits (set + snapshot)
 		doSync := func() { // fsync the file THEN persist a bitmap snapshot — order matters for crash-consistency
 			mu.Lock()
 			snap := &partBits{root: bits.root, total: bits.total, count: bits.count, nset: bits.nset,
@@ -1121,7 +1185,6 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			_ = savePart(dest, snap)
 		}
 		flushStop := make(chan struct{})
-		dropSig := make(chan struct{}, 1)
 		var flusher sync.WaitGroup
 		flusher.Add(1)
 		safeGo("fetch.flusher", func() {
@@ -1132,11 +1195,8 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 				select {
 				case <-flushStop:
 					return
-				case <-dropSig:
-					doDrop()
 				case <-t.C:
 					doSync()
-					doDrop()
 				}
 			}
 		})
@@ -1196,19 +1256,12 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			for _, i := range idxOf[c] {
 				bits.set(i)
 			}
-			dropQ = append(dropQ, c)
-			qlen := len(dropQ)
 			mu.Unlock()
-			if qlen >= dropBatch { // nudge the flusher to reclaim memory (non-blocking — it coalesces)
-				select {
-				case dropSig <- struct{}{}:
-				default:
-				}
-			}
 			if recv%512 == 0 {
 				fdbg("writeThrough: recv %d/%d leaves, written=%d/%d (%.1f%%) cid=%s", recv, len(need), written, total, 100.0*float64(written)/float64(total), cidStr)
 			}
 		}
+		close(recvDone)
 		// Session ended (all received, or torn down by stall/cancel/write-error). rollingGetBlocks has drained the
 		// channel and returned every want-token by the time its channel closed, so there is nothing to join or
 		// drain here — token lifecycle is entirely inside it.
@@ -1221,12 +1274,11 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			_ = out.Close()
 			return writeErr
 		}
-		// Stop the flusher, then do a final durability + reclaim pass on the main goroutine so the returned state
-		// is fully persisted.
+		// Stop the flusher, then do a final durability pass on the main goroutine so the returned state is fully
+		// persisted.
 		close(flushStop)
 		flusher.Wait()
 		doSync()
-		doDrop()
 		fdbg("writeThrough: session ended cid=%s recv=%d/%d elapsed=%s stalled=%v cancelled=%v allSet=%v", cidStr, recv, len(need), time.Since(sessStart).Round(time.Millisecond), stalled.Load(), isCancelled(cidStr), bits.allSet())
 		wire.report("[wire-final " + shortCid(root) + "]")
 

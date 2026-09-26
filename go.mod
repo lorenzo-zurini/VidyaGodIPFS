@@ -10,7 +10,6 @@ require (
 	github.com/ipfs/go-ds-leveldb v0.5.2
 	github.com/ipfs/go-ipld-format v0.6.3
 	github.com/ipld/go-car/v2 v2.17.0
-	github.com/ipld/go-ipld-prime v0.24.0
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-kad-dht v0.40.0
 	github.com/libp2p/zeroconf/v2 v2.2.0
@@ -49,6 +48,7 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/guillaumemichel/reservedpool v0.3.0 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
@@ -59,10 +59,13 @@ require (
 	github.com/ipfs/go-ipfs-pq v0.0.4 // indirect
 	github.com/ipfs/go-ipld-cbor v0.2.1 // indirect
 	github.com/ipfs/go-ipld-legacy v0.3.0 // indirect
+	github.com/ipfs/go-libdht v0.5.0 // indirect
 	github.com/ipfs/go-log/v2 v2.9.2 // indirect
 	github.com/ipfs/go-metrics-interface v0.3.0 // indirect
 	github.com/ipfs/go-peertaskqueue v0.8.3 // indirect
+	github.com/ipfs/go-test v0.3.0 // indirect
 	github.com/ipld/go-codec-dagpb v1.7.0 // indirect
+	github.com/ipld/go-ipld-prime v0.24.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

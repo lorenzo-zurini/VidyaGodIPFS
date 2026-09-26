@@ -119,6 +119,7 @@ func (n *node) pinLs() ([]cid.Cid, error) {
 
 // unpin removes a recursive pin.
 func (n *node) unpin(c cid.Cid) error {
+	n.stopProviding(c)
 	return n.pinner.Unpin(n.ctx, c, true)
 }
 

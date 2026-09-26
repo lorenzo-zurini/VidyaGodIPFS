@@ -114,13 +114,13 @@ func resumeFixture(t *testing.T, n *node, ctx context.Context, rootNode ipld.Nod
 	if err := n.bstore.Put(ctx, rootNode); err != nil {
 		t.Fatal(err)
 	}
-	origDserv, origBserv, origDht := n.dserv, n.bserv, n.dht
-	n.dserv, n.bserv, n.dht = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}
+	origDserv, origBserv, origDht, origExch := n.dserv, n.bserv, n.dht, n.exchange
+	n.dserv, n.bserv, n.dht, n.exchange = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}, bs.Exchange()
 	origGWs, origStall := trustlessGateways, stallTimeout
 	trustlessGateways, stallTimeout = []string{gwURL}, 300*time.Millisecond
 	t.Cleanup(func() { // before closeNode (LIFO)
 		trustlessGateways, stallTimeout = origGWs, origStall
-		n.dserv, n.bserv, n.dht = origDserv, origBserv, origDht
+		n.dserv, n.bserv, n.dht, n.exchange = origDserv, origBserv, origDht, origExch
 		stop()
 	})
 }
@@ -271,9 +271,9 @@ func TestWriteThroughResumesMissingLeavesOverTheGatewayWhenBitswapStalls(t *test
 	if err := n.bstore.Put(ctx, rootNode); err != nil { // the root is here; every leaf is not
 		t.Fatal(err)
 	}
-	origDserv, origBserv, origDht := n.dserv, n.bserv, n.dht
-	n.dserv, n.bserv, n.dht = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}
-	t.Cleanup(func() { n.dserv, n.bserv, n.dht = origDserv, origBserv, origDht }) // before closeNode (LIFO)
+	origDserv, origBserv, origDht, origExch := n.dserv, n.bserv, n.dht, n.exchange
+	n.dserv, n.bserv, n.dht, n.exchange = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}, bs.Exchange()
+	t.Cleanup(func() { n.dserv, n.bserv, n.dht, n.exchange = origDserv, origBserv, origDht, origExch }) // before closeNode (LIFO)
 	origGWs, origStall := trustlessGateways, stallTimeout
 	trustlessGateways, stallTimeout = []string{gw.URL}, 300*time.Millisecond
 	defer func() { trustlessGateways, stallTimeout = origGWs, origStall }()
@@ -344,9 +344,9 @@ func TestOneAttemptsProgressNeverRunsBackwardsAcrossTheGatewayHandoff(t *testing
 
 	bs, stop := peerlessBitswapOver(t, ctx, n.bstore) // nothing local: the root itself must come from the gateway
 	defer stop()
-	origDserv, origBserv, origDht := n.dserv, n.bserv, n.dht
-	n.dserv, n.bserv, n.dht = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}
-	t.Cleanup(func() { n.dserv, n.bserv, n.dht = origDserv, origBserv, origDht })
+	origDserv, origBserv, origDht, origExch := n.dserv, n.bserv, n.dht, n.exchange
+	n.dserv, n.bserv, n.dht, n.exchange = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}, bs.Exchange()
+	t.Cleanup(func() { n.dserv, n.bserv, n.dht, n.exchange = origDserv, origBserv, origDht, origExch })
 	origGWs, origT := trustlessGateways, rootLibp2pTimeout
 	trustlessGateways, rootLibp2pTimeout = []string{gw.URL}, 300*time.Millisecond
 	defer func() { trustlessGateways, rootLibp2pTimeout = origGWs, origT }()
@@ -625,9 +625,9 @@ func TestAFetchNarratesItsPhases(t *testing.T) {
 
 	bs, stop := peerlessBitswapOver(t, ctx, n.bstore) // nothing local, no peers: p2p must fail → gateway
 	defer stop()
-	origDserv, origBserv, origDht := n.dserv, n.bserv, n.dht
-	n.dserv, n.bserv, n.dht = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}
-	t.Cleanup(func() { n.dserv, n.bserv, n.dht = origDserv, origBserv, origDht })
+	origDserv, origBserv, origDht, origExch := n.dserv, n.bserv, n.dht, n.exchange
+	n.dserv, n.bserv, n.dht, n.exchange = merkledag.NewDAGService(bs), bs, &dht.IpfsDHT{}, bs.Exchange()
+	t.Cleanup(func() { n.dserv, n.bserv, n.dht, n.exchange = origDserv, origBserv, origDht, origExch })
 	origGWs, origT := trustlessGateways, rootLibp2pTimeout
 	trustlessGateways, rootLibp2pTimeout = []string{gw.URL}, 300*time.Millisecond
 	defer func() { trustlessGateways, rootLibp2pTimeout = origGWs, origT }()

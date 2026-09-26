@@ -70,6 +70,33 @@ var dohEndpoints = []string{
 	"https://8.8.4.4/resolve",
 }
 
+// The node's ONE resolver and its two HTTPS clients. Built per call before, each call brought its own DoH client and
+// its own empty cache, and each HTTPS client its own transport: every lookup and every gateway request opened fresh
+// TCP+TLS connections. The IPFS tab asked a gateway size per row on every refresh — thousands of answered HTTPS
+// connections in seconds filled a home router's connection table (2026-09-27, "nf_conntrack: table full"). Shared,
+// the cache works and connections are reused (keep-alive).
+var (
+	sharedDoHOnce sync.Once
+	sharedDoHRes  *dohResolver
+	sharedHTTPC   *http.Client
+	sharedStreamC *http.Client
+)
+
+func initSharedDoH() {
+	sharedDoHOnce.Do(func() {
+		sharedDoHRes = newDoHResolver()
+		sharedHTTPC = dohHTTPClient(sharedDoHRes)
+		sharedStreamC = dohStreamingClient(sharedDoHRes)
+	})
+}
+
+// sharedDoH: the node's resolver (production code uses this; newDoHResolver builds a private one, for tests).
+func sharedDoH() *dohResolver { initSharedDoH(); return sharedDoHRes }
+
+// sharedHTTPClient / sharedStreamingClient: dohHTTPClient / dohStreamingClient over sharedDoH, built once.
+func sharedHTTPClient() *http.Client      { initSharedDoH(); return sharedHTTPC }
+func sharedStreamingClient() *http.Client { initSharedDoH(); return sharedStreamC }
+
 func newDoHResolver() *dohResolver {
 	return &dohResolver{
 		endpoints: dohEndpoints,
@@ -290,7 +317,7 @@ func (d *dohResolver) LookupTXT(ctx context.Context, name string) ([]string, err
 // dohMultiaddrResolver builds a madns resolver that resolves every domain via DoH — pass it to libp2p (wrapped in
 // swarm.ResolverFromMaDNS) so /dnsaddr + /dns dials (bootstrap peers AND Pinata providers) work through a DNS filter.
 func dohMultiaddrResolver() (*madns.Resolver, error) {
-	return madns.NewResolver(madns.WithDefaultResolver(newDoHResolver()))
+	return madns.NewResolver(madns.WithDefaultResolver(sharedDoH()))
 }
 
 // dohHTTPClient returns an http.Client whose connections resolve hostnames via DoH before dialing — for the delegated

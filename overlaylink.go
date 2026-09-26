@@ -60,9 +60,11 @@ const (
 	linkBeatEvery   = 4 * time.Second // heartbeat cadence — well under mobile-NAT UDP idle timeouts (~30s)
 	linkBeatMiss    = 3               // missed pongs on a previously-responsive peer ⇒ demote datagrams to stream
 	linkDialBackoff = 2 * time.Second // reconnect backoff floor (doubles to linkDialMax)
-	linkDialMax     = 30 * time.Second
-	linkUpgradeTry  = 30 * time.Second // how often to nudge a relayed/unproven link toward a fresh direct path
-	linkProtectTag  = "vg-lan"
+	// An offline friend is looked up on the DHT at every dial (a walk: dozens of new flows through the router), so an
+	// unreachable one backs off to minutes; a friend coming online dials us (presence) and the link comes up anyway.
+	linkDialMax    = 5 * time.Minute
+	linkUpgradeTry = 30 * time.Second // how often to nudge a relayed/unproven link toward a fresh direct path
+	linkProtectTag = "vg-lan"
 )
 
 var overlayDebug = os.Getenv("VG_OVERLAY_DEBUG") != ""

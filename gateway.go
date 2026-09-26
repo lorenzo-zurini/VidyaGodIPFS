@@ -65,7 +65,7 @@ func headSize(ctx context.Context, hc *http.Client, url string) int64 {
 // gatewaySize asks the trustless gateways for a CID's file size over HTTPS (HEAD → Content-Length). Used as cidSize's
 // fallback so the UI can show a size/speed even on a network where the DHT can't fetch the root block.
 func (n *node) gatewaySize(ctx context.Context, root cid.Cid) int64 {
-	hc := dohHTTPClient(newDoHResolver())
+	hc := sharedHTTPClient()
 	for _, gw := range trustlessGateways {
 		if sz := headSize(ctx, hc, gw+"/ipfs/"+root.String()); sz > 0 {
 			return sz
@@ -119,7 +119,7 @@ func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte int64
 	if len(trustlessGateways) == 0 {
 		return fmt.Errorf("no trustless gateways configured")
 	}
-	hc := dohStreamingClient(newDoHResolver()) // DoH-resolving, NO whole-request timeout (large CARs stream for minutes)
+	hc := sharedStreamingClient() // DoH-resolving, NO whole-request timeout (large CARs stream for minutes); shared: keep-alive
 	rctx, rcancel := context.WithCancel(ctx)
 	defer rcancel()
 	type report struct {
