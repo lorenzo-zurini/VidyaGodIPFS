@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"crypto/rand"
-	"sync/atomic"
 	bitswap "github.com/ipfs/boxo/bitswap"
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	pb "github.com/ipfs/boxo/bitswap/message/pb"
@@ -29,6 +28,8 @@ import (
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	protocol "github.com/libp2p/go-libp2p/core/protocol"
 	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
+	"sync"
+	"sync/atomic"
 )
 
 // fixedFinder names the same providers for every CID.
@@ -322,5 +323,179 @@ func TestAPromiserKeptBusyAnsweringStillGoesOut(t *testing.T) {
 	}
 	if second.got != len(big) {
 		t.Fatalf("the big fetch got %d of %d leaves", second.got, len(big))
+	}
+}
+
+// trickleRecv answers HAVE to every want-have and hands over one wanted block every `every` (a pinning node that
+// delivers now and then: bitswap.pinata.cloud on replication 7, 51 blocks in 26 minutes).
+type trickleRecv struct {
+	net   bsnetwork.BitSwapNetwork
+	store blockstore.Blockstore
+	every time.Duration
+	wb    atomic.Int64 // want-blocks received
+	mu    sync.Mutex
+	queue []struct {
+		p peer.ID
+		c cid.Cid
+	}
+}
+
+func (r *trickleRecv) ReceiveMessage(_ context.Context, p peer.ID, m bsmsg.BitSwapMessage) {
+	out := bsmsg.New(false)
+	r.mu.Lock()
+	for _, e := range m.Wantlist() {
+		switch {
+		case e.Cancel:
+		case e.WantType == pb.Message_Wantlist_Have:
+			out.AddHave(e.Cid)
+		default:
+			r.wb.Add(1)
+			r.queue = append(r.queue, struct {
+				p peer.ID
+				c cid.Cid
+			}{p, e.Cid})
+		}
+	}
+	r.mu.Unlock()
+	if len(out.Haves()) > 0 {
+		go func() { _ = r.net.SendMessage(context.Background(), p, out) }()
+	}
+}
+func (r *trickleRecv) run(ctx context.Context) {
+	t := time.NewTicker(r.every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		r.mu.Lock()
+		if len(r.queue) == 0 {
+			r.mu.Unlock()
+			continue
+		}
+		w := r.queue[0]
+		r.queue = r.queue[1:]
+		r.mu.Unlock()
+		if b, err := r.store.Get(ctx, w.c); err == nil {
+			m := bsmsg.New(false)
+			m.AddBlock(b)
+			_ = r.net.SendMessage(ctx, w.p, m)
+		}
+	}
+}
+func (r *trickleRecv) ReceiveError(error)       {}
+func (r *trickleRecv) PeerConnected(peer.ID)    {}
+func (r *trickleRecv) PeerDisconnected(peer.ID) {}
+
+// Replication 7's crawl: file after file (a fresh session each), with promisers that drop and redial their connection
+// and a trickler that hands over a block now and then. Each is taken out for sitting on want-blocks — and must STAY
+// out longer each time: its record survives its connection, and a trickle neither clears it nor wins it new wants.
+// Before, every redial and every trickled block reset it to the first cooldown, and each new file's session handed
+// it wants again. Teeth: keep offences on the per-connection ledger; clear the record (or bring the peer fully back)
+// on any block.
+func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
+	a, c, m, tk := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick
+	quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick = time.Second, 2*time.Second, time.Minute, 100*time.Millisecond
+	defer func() { quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick = a, c, m, tk }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const promisers = 3
+	mn, err := mocknet.FullMeshLinked(3 + promisers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mn.Close()
+	mn.SetLinkDefaults(mocknet.LinkOptions{Latency: 5 * time.Millisecond})
+	hosts := mn.Hosts()
+	hostA, hostT, hostB, hostP := hosts[0], hosts[1], hosts[2], hosts[3:]
+	bstoreA := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	dservA := merkledag.NewDAGService(blockservice.New(bstoreA, offline.Exchange(bstoreA)))
+	var files [][]cid.Cid
+	for i := 0; i < 16; i++ {
+		b := make([]byte, 4<<20)
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+		_, l := buildLeafDAG(t, dservA, b)
+		files = append(files, l)
+	}
+	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA, bitswapOptions(nil)...)
+	defer bswapA.Close()
+	netT := bsnet.NewFromIpfsHost(hostT)
+	tr := &trickleRecv{net: netT, store: bstoreA, every: 3 * time.Second}
+	netT.Start(tr)
+	defer netT.Stop()
+	go tr.run(ctx)
+	finder := fixedFinder{{ID: hostT.ID()}}
+	var pins []*pinataRecv
+	for _, h := range hostP {
+		n := bsnet.NewFromIpfsHost(h)
+		pr := &pinataRecv{net: n}
+		pins = append(pins, pr)
+		n.Start(pr)
+		defer n.Stop()
+		finder = append(finder, peer.AddrInfo{ID: h.ID()})
+	}
+	finder = append(finder, peer.AddrInfo{ID: hostA.ID()})
+	bstoreB := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	q := newQuarantineNet(bsnet.NewFromIpfsHost(hostB))
+	go q.run(ctx)
+	bswapB := bitswap.New(ctx, q, finder, bstoreB, bitswapOptions(nil)...)
+	defer bswapB.Close()
+	if err := mn.ConnectAllButSelf(); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range mn.LinksBetweenPeers(hostA.ID(), hostB.ID()) { // a busy seeder: its HAVEs come last
+		l.SetOptions(mocknet.LinkOptions{Latency: 300 * time.Millisecond})
+	}
+	go func() { // the promisers drop and redial, as public nodes do
+		tick := time.NewTicker(3 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			for _, h := range hostP {
+				_ = mn.DisconnectPeers(hostB.ID(), h.ID())
+				_, _ = mn.ConnectPeers(hostB.ID(), h.ID())
+			}
+		}
+	}()
+	bsvc := blockservice.New(bstoreB, bswapB)
+	start := time.Now()
+	var took []time.Duration
+	given := func() int64 { // want-blocks the peers that never pay have been given
+		n := tr.wb.Load()
+		for _, pr := range pins {
+			n += pr.wb.Load()
+		}
+		return n
+	}
+	var half int64
+	for i, l := range files {
+		if i == len(files)/2 {
+			half = given()
+		}
+		t0 := time.Now()
+		fctx, fc := context.WithTimeout(ctx, stallTimeout)
+		n := 0
+		for range rollingGetBlocks(fctx, blockservice.NewSession(ctx, bsvc), l, 32) {
+			n++
+		}
+		fc()
+		if n != len(l) {
+			t.Fatalf("file %d: %d of %d leaves within %s", i, n, len(l), stallTimeout)
+		}
+		took = append(took, time.Since(t0).Round(10*time.Millisecond))
+	}
+	firstHalf, secondHalf := half, given()-half
+	t.Logf("per file: %v; total %s; want-blocks to the promisers and the trickler: %d in the first half, %d in the second",
+		took, time.Since(start).Round(100*time.Millisecond), firstHalf, secondHalf)
+	if secondHalf > firstHalf/2 {
+		t.Fatalf("the promisers and the trickler were given %d want-block(s) in the second half (%d in the first): they keep winning wants", secondHalf, firstHalf)
 	}
 }

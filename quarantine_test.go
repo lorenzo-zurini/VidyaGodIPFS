@@ -37,9 +37,9 @@ type quarantineRig struct {
 }
 
 func newQuarantineRig(t *testing.T) *quarantineRig {
-	a, c, m := quarantineAfter, quarantineCool, quarantineMaxCool
-	quarantineAfter, quarantineCool, quarantineMaxCool = 5*time.Second, 30*time.Second, 10*time.Minute
-	t.Cleanup(func() { quarantineAfter, quarantineCool, quarantineMaxCool = a, c, m })
+	a, c, m, f := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineForget
+	quarantineAfter, quarantineCool, quarantineMaxCool, quarantineForget = 5*time.Second, 30*time.Second, 10*time.Minute, 10*time.Minute
+	t.Cleanup(func() { quarantineAfter, quarantineCool, quarantineMaxCool, quarantineForget = a, c, m, f })
 	g := &quarantineRig{t: t, now: time.Unix(1000, 0), client: &fakeSide{}, server: &fakeSide{}, all: &fakeSide{}}
 	g.q = newQuarantineNet(nil)
 	g.q.now = func() time.Time { return g.now }
@@ -233,24 +233,171 @@ func TestQuarantineRules(t *testing.T) {
 		}
 	})
 
-	t.Run("the cooldown doubles, and starts over after a delivery", func(t *testing.T) {
-		g := rig(t)
+	t.Run("the cooldown doubles, and only paying in full starts it over", func(t *testing.T) {
+		g := rig(t) // out, owing x (offence 1)
+		cooldown := func() time.Duration { return g.q.peers[promiser].until.Sub(g.now) }
 		g.advance(30 * time.Second)
 		g.offer(seeder, x.Cid())
 		g.want(promiser, x.Cid())
 		g.advance(5 * time.Second)
-		if l := g.q.peers[promiser]; !g.q.out(promiser) || l.until.Sub(g.now) != 60*time.Second {
-			t.Fatalf("second offence: out=%v for %s, want 1m0s", g.q.out(promiser), l.until.Sub(g.now))
+		if !g.q.out(promiser) || cooldown() != 60*time.Second {
+			t.Fatalf("second offence: out=%v for %s, want 1m0s", g.q.out(promiser), cooldown())
 		}
 		g.advance(60 * time.Second)
-		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddBlock(x) })
-		g.offer(seeder, y.Cid())
-		g.want(promiser, y.Cid())
+		g.offer(seeder, y.Cid(), z.Cid())
+		g.want(promiser, y.Cid(), z.Cid())
 		g.advance(5 * time.Second)
-		if l := g.q.peers[promiser]; l.until.Sub(g.now) != 30*time.Second {
-			t.Fatalf("after a delivery its next cooldown is %s, want the first (30s)", l.until.Sub(g.now))
+		if cooldown() != 2*time.Minute {
+			t.Fatalf("third offence: out for %s, want 2m0s", cooldown())
+		}
+		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddBlock(y) }) // a trickle: one of the two it owes
+		if g.q.records[promiser] == nil || g.q.records[promiser].strikes != 3 {
+			t.Fatal("one block of two owed cleared the record: a trickle must not")
+		}
+		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddDontHave(z.Cid()) }) // the rest: paid in full
+		if _, ok := g.q.records[promiser]; ok {
+			t.Fatal("paid in full, its record is still held against it")
+		}
+		g.offer(seeder, u.Cid())
+		g.want(promiser, u.Cid())
+		g.advance(5 * time.Second)
+		if cooldown() != 30*time.Second {
+			t.Fatalf("after paying in full its next cooldown is %s, want the first (30s)", cooldown())
 		}
 	})
+}
+
+// A peer that delivers while out is back with the client — told first, so the sessions its block reaches find it
+// registered — but on probation: its blocks and DONT_HAVEs reach the client, its HAVEs neither reach it nor count as
+// offers, so no session picks it for a want-block on the strength of a trickle. A want-block it is still given (a
+// bitswap 1.1 peer gets want-blocks for want-haves) is held against it again, and so is its record. Its probation ends
+// with its cooldown, its record kept. Teeth: forward a probation peer's HAVEs; note them as offers; forward its block
+// before telling the client it is back; tell the client twice; clear its record on a trickle; keep it on probation past
+// its cooldown.
+func TestQuarantineProbation(t *testing.T) {
+	g := newQuarantineRig(t)
+	p, seeder := peer.ID("trickler"), peer.ID("seeder")
+	g.r.PeerConnected(p)
+	g.r.PeerConnected(seeder)
+	x, y, z, u := blk("x"), blk("y"), blk("z"), blk("u")
+	g.offer(seeder, x.Cid(), y.Cid())
+	g.want(p, x.Cid(), y.Cid())
+	g.advance(5 * time.Second)
+	if !g.q.out(p) {
+		t.Fatal("setup: the trickler is not out")
+	}
+	var order []string
+	g.q.client = &orderSide{fakeSide: g.client, order: &order}
+	g.q.recv = &orderSide{fakeSide: g.all, order: &order}
+
+	g.send(p, pb.Message_Wantlist_Have, u.Cid())
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddBlock(x); m.AddHave(u.Cid()); m.AddDontHave(z.Cid()) })
+	if g.q.out(p) {
+		t.Fatal("a peer that delivered is still out of the client's rotation")
+	}
+	if len(order) != 2 || order[0] != "connected" || order[1] != "message" {
+		t.Fatalf("the client heard %v; want [connected message]: told it is back before its block arrives", order)
+	}
+	m := g.all.msgs[len(g.all.msgs)-1]
+	if len(m.Blocks()) != 1 || len(m.DontHaves()) != 1 || len(m.Haves()) != 0 {
+		t.Fatalf("on probation its message reached bitswap with %d block(s), %d DONT_HAVE(s), %d HAVE(s); want 1, 1, 0",
+			len(m.Blocks()), len(m.DontHaves()), len(m.Haves()))
+	}
+	if _, ok := g.q.haves[u.Cid()][p]; ok {
+		t.Fatal("a HAVE on probation was noted as an offer")
+	}
+	if r := g.q.records[p]; r == nil || r.strikes != 1 {
+		t.Fatal("a trickle (one of two owed) cleared the record")
+	}
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddHave(u.Cid()) })
+	if len(order) != 2 {
+		t.Fatalf("the client heard %v after a HAVE-only message on probation; want nothing more", order)
+	}
+
+	g.offer(seeder, z.Cid())
+	g.want(p, z.Cid()) // a want-block it is still given
+	g.advance(5 * time.Second)
+	if !g.q.out(p) || g.q.records[p].strikes != 2 {
+		t.Fatalf("sitting on a want-block on probation: out=%v, offence %d; want out, offence 2", g.q.out(p), g.q.records[p].strikes)
+	}
+	if n := len(g.client.disconns); n != 2 {
+		t.Fatalf("the client was told %d disconnect(s), want 2", n)
+	}
+
+	// Probation ends with the cooldown (1 m now), the record kept, the client told nothing more.
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddBlock(y) }) // still owes z: probation again
+	conns := len(g.client.conns)
+	g.advance(60 * time.Second)
+	if l := g.q.peers[p]; l.probation || l.held(g.now) {
+		t.Fatal("still on probation after its cooldown")
+	}
+	if len(g.client.conns) != conns {
+		t.Fatal("the client was told again of a peer it already had")
+	}
+	if g.q.records[p] == nil || g.q.records[p].strikes != 2 {
+		t.Fatal("its probation ended with the cooldown and its record went with it")
+	}
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddHave(u.Cid()) })
+	if last := g.all.msgs[len(g.all.msgs)-1]; len(last.Haves()) != 1 {
+		t.Fatal("back in, its HAVEs are still kept from the client")
+	}
+}
+
+// orderSide records the order in which the client and bitswap hear of things.
+type orderSide struct {
+	*fakeSide
+	order *[]string
+}
+
+func (o *orderSide) ReceiveMessage(ctx context.Context, p peer.ID, m bsmsg.BitSwapMessage) {
+	*o.order = append(*o.order, "message")
+	o.fakeSide.ReceiveMessage(ctx, p, m)
+}
+func (o *orderSide) PeerConnected(p peer.ID) {
+	*o.order = append(*o.order, "connected")
+	o.fakeSide.PeerConnected(p)
+}
+
+// Offences outlive the connection: a public node that drops and redials comes back with its record (replication 7:
+// the same promiser taken out twelve times, each time for the first cooldown), until quarantineForget after its last.
+// Teeth: keep strikes on the ledger (dropped with the connection); never forget a record; forget it early.
+func TestQuarantineRemembersAcrossConnections(t *testing.T) {
+	g := newQuarantineRig(t)
+	p, seeder := peer.ID("churner"), peer.ID("seeder")
+	x := blk("x")
+	offend := func() time.Duration {
+		g.r.PeerConnected(p)
+		g.offer(seeder, x.Cid())
+		g.want(p, x.Cid())
+		g.advance(5 * time.Second)
+		if !g.q.out(p) {
+			t.Fatal("setup: the churner is not out")
+		}
+		return g.q.peers[p].until.Sub(g.now)
+	}
+	g.r.PeerConnected(seeder)
+	offend()
+	g.r.PeerDisconnected(p)
+	g.advance(31 * time.Second)
+	if _, ok := g.q.peers[p]; ok {
+		t.Fatal("setup: its ledger outlived its connection and its cooldown")
+	}
+	if c := offend(); c != time.Minute {
+		t.Fatalf("back on a new connection, its second offence is out for %s, want 1m0s", c)
+	}
+	g.r.PeerDisconnected(p)
+	g.advance(quarantineForget - 5*time.Second)
+	if c := offend(); c != 2*time.Minute {
+		t.Fatalf("within quarantineForget of its last offence, its third is out for %s, want 2m0s", c)
+	}
+	g.r.PeerDisconnected(p)
+	g.advance(quarantineForget + time.Second)
+	if _, ok := g.q.records[p]; ok {
+		t.Fatal("a record outlived quarantineForget")
+	}
+	if c := offend(); c != 30*time.Second {
+		t.Fatalf("forgotten, its next offence is out for %s, want the first (30s)", c)
+	}
 }
 
 // What a quarantined peer says, and where it goes. Out, its HAVEs never reach the client (they would make it the

@@ -71,10 +71,20 @@ invariants any future change must preserve.*
    never taken out: slow must not become stopped. Progress is a block, not bytes: a promiser's HAVE replies are
    bitswap bytes too (counting them caused replication 6's three stalls); an honest peer taken out mid-block is
    brought back by that block. While out, its HAVEs and DONT_HAVEs are kept from the client and the finder skips it;
-   its wants still reach our server, and the first block it delivers brings it back and reaches the client. Cooldown
-   30 s, doubling per offence to 10 min, reset by a delivery. Moving a peer in or out is exclusive with message
+   its wants still reach our server. It owes the want-blocks it held: the first block it delivers brings it back to
+   the client (told first — a session registers any peer a block comes from) but on PROBATION, its HAVEs still kept
+   from the client, until it has paid everything it owed (then its record clears) or its cooldown ends. Offences are
+   remembered per peer across connections (public nodes churn theirs), forgotten an hour after the last; cooldown
+   30 s, doubling per offence to 10 min. Moving a peer in or out is exclusive with message
    delivery (`dmu`), so a HAVE cannot slip it back into a session mid-move — and only a tick that moves someone takes
    that lock.
+
+9. **A restarted node must be heard at once: listen on the same ports every run** (`listenports.go`). A killed
+   process's QUIC connection lingers at its peers until the idle timeout, and the swarm sends new streams down the
+   connection with the most streams — the dead one. Every reply we were owed vanished for ~30 s after a restart
+   (replication 7: 38 s; two root fetches fell to a 14-minute gateway crawl). On the same UDP port the new process
+   answers the dead connection's next packet with a QUIC stateless reset (the key derives from the identity) and the
+   peer drops it in a round trip. One UDP port for QUIC and WebTransport, each port the same on IPv4 and IPv6.
 
 ## Known failure modes and where they're handled
 
@@ -88,6 +98,7 @@ invariants any future change must preserve.*
 | Friend offline | connectedness lost | down + dial with backoff; conn re-protected on return |
 | Panic in any network goroutine | `guard` recover + stack log | that iteration/goroutine dies; node lives |
 | goOnline fails/panics at startup | `guardErr` | offline node + background retry with backoff |
+| A peer restarts under the same identity | its old QUIC connection gets our streams | same ports → stateless reset kills it in a round trip |
 | A provider answers HAVE and never delivers (a public pinning node) | want-blocks held 6 s, no block, another peer offers them | `[quarantine]` line; out of the client's rotation, wants re-routed |
 
 ## Diagnostics
