@@ -91,6 +91,13 @@ invariants any future change must preserve.*
    replaced for the run, so the node always listens. Limit: TCP's SO_REUSEPORT shares a port still held by a live
    process instead of replacing it.
 
+10. **Keep about 2 s of downloading in flight, not a fixed count** (`fetch.go` `wantPool.adapt`). The global want
+   budget circulates rate × `wantLatency` tokens (between `wantFloor` 32 and 768), the rate being blocks landing per
+   second. A fixed 768 was ~0.8 s of wants on a LAN but ~48 s over a 4 MB/s internet path: a small fetch started
+   beside a big one queued behind ~190 MB at the provider, saw no block for 20 s and was torn down (laptop
+   replication: 10 stalls, 5 root fetches past 30 s — all resumed through a gateway). One fetch may hold half of
+   what circulates.
+
 ## Known failure modes and where they're handled
 
 | Failure | Detection | Response |
@@ -103,6 +110,7 @@ invariants any future change must preserve.*
 | Friend offline | connectedness lost | down + dial with backoff; conn re-protected on return |
 | Panic in any network goroutine | `guard` recover + stack log | that iteration/goroutine dies; node lives |
 | goOnline fails/panics at startup | `guardErr` | offline node + background retry with backoff |
+| A slow link, a deep queue at the provider | wants take seconds to come back | the pool shrinks to ~2 s of flight; new fetches are served at once |
 | A peer restarts under the same identity | its old QUIC connection gets our streams | same ports → stateless reset kills it in a round trip |
 | A provider answers HAVE and never delivers (a public pinning node) | want-blocks held 3 s (a slow deliverer: 3 of its intervals, ≤10 s), no block, another peer offers them | `[quarantine]` line; out of the client's rotation, wants re-routed |
 

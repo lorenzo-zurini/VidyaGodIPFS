@@ -176,6 +176,8 @@ func openNode(repoPath string) error {
 	}
 	// The address book loads independently of the network so contacts survive offline; the live protocol attaches
 	// in goOnline.
+	// The want budget follows the link (fetch.go wantPool.adapt): ~2 s of downloading in flight.
+	safeGo("node.wantpool", func() { globalWantPool.adapt(ctx, time.Second) })
 	gNode.social = newSocialState(repoPath)
 
 	// Join the public network (best-effort): swaps the DAG service to online bitswap. On failure the node stays

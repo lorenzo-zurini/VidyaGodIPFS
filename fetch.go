@@ -64,14 +64,77 @@ var maxPerFetch = wantBudget / 2 // var (not const) so tests can shrink it to pr
 // in-flight want and releases it when the block lands (or when the fetch ends), so len(tokens-in-use) — summed
 // across every fetch — never exceeds wantBudget. This is provable by construction, unlike a per-fetch window
 // that is fixed at session start (which, with staggered starts, can transiently exceed the cap).
-type wantPool struct{ tokens chan struct{} }
+//
+// How many of its tokens circulate follows the link (adapt): about wantLatency of downloading in flight. A fixed 768
+// is ~0.8 s of wants on a LAN (~240 MB/s) but ~48 s over a 4 MB/s internet path — a small fetch started beside a big
+// one then queued behind 190 MB at the provider, got no block for 20 s and was torn down as stalled (the laptop
+// replication: three such stalls, each recovered only through a gateway).
+type wantPool struct {
+	tokens    chan struct{}
+	size      int
+	limit     atomic.Int64 // tokens in circulation: size minus the parked
+	delivered atomic.Int64 // tokens returned by a block landing (not by a fetch ending)
+	parked    int          // tokens the controller holds back (adapt's goroutine only)
+	rate      float64      // blocks landing per second, smoothed (adapt's goroutine only)
+}
 
 func newWantPool(n int) *wantPool {
-	p := &wantPool{tokens: make(chan struct{}, n)}
+	p := &wantPool{tokens: make(chan struct{}, n), size: n}
 	for i := 0; i < n; i++ {
 		p.tokens <- struct{}{}
 	}
+	p.limit.Store(int64(n))
 	return p
+}
+
+// wantLatency: how much downloading the pool keeps in flight, in time; wantFloor: the fewest tokens it circulates
+// (one refill batch — a burst on a fast link sees its rate within a tick and opens up).
+var (
+	wantLatency = 2 * time.Second
+	wantFloor   = 32
+)
+
+// adapt sizes the pool to the link every `every` until ctx ends, then gives back every parked token.
+func (p *wantPool) adapt(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	defer p.setLimit(p.size)
+	last := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			p.step(now.Sub(last).Seconds())
+			last = now
+		}
+	}
+}
+
+// step: blocks that landed in the last dt seconds set the rate; the rate times wantLatency sets the limit (Little's
+// law: in flight = rate × time in flight).
+func (p *wantPool) step(dt float64) {
+	if dt <= 0 {
+		return
+	}
+	p.rate = 0.5*p.rate + 0.5*float64(p.delivered.Swap(0))/dt
+	p.setLimit(int(math.Ceil(p.rate * wantLatency.Seconds())))
+}
+
+// setLimit parks or returns tokens toward n circulating (at least wantFloor; never more than the pool has); a token
+// in use is parked when it comes back, at a later step.
+func (p *wantPool) setLimit(n int) {
+	if n < wantFloor {
+		n = wantFloor
+	}
+	for p.size-p.parked < n && p.parked > 0 {
+		p.tokens <- struct{}{}
+		p.parked--
+	}
+	for p.size-p.parked > n && p.tryAcquire() {
+		p.parked++
+	}
+	p.limit.Store(int64(p.size - p.parked))
 }
 
 // acquire blocks for one token, returning false if ctx is cancelled first (teardown). tryAcquire never blocks.
@@ -842,6 +905,20 @@ fetchFresh:
 // the slow "pinning" step the old path did via addNoCopy). Only the small dag-pb root/intermediate nodes remain as
 // plain blocks. Returns errNotRawLeaves if the DAG isn't all raw leaves (filestore refs require raw leaves; the
 // caller then falls back to read + re-add).
+// perFetch: the most tokens one fetch may hold now — half of what circulates, at most maxPerFetch: a small fetch
+// started beside a big one on a slow link gets tokens at once instead of waiting for the big one's to come back
+// (measured: 2.7 s against 4.5 s beside a 64 MB fetch at 4 MB/s).
+func perFetch() int64 {
+	c := globalWantPool.limit.Load() / 2
+	if c < 1 {
+		c = 1
+	}
+	if c > int64(maxPerFetch) {
+		c = int64(maxPerFetch)
+	}
+	return c
+}
+
 // rollingGetBlocks streams every cid in `need` from a bitswap session as a ROLLING, bounded want-window and
 // delivers the blocks on the returned channel (arrival order). It is the fix for the head-of-line wedge: instead
 // of chunk slots that free only when a whole chunk arrives, it keeps a bounded number of wants outstanding and
@@ -935,6 +1012,7 @@ func rollingGetBlocks(ctx context.Context, sess blockGetter, need []cid.Cid, ref
 			}()
 			for b := range ch {
 				relOne() // this block's token is done the moment it arrives
+				globalWantPool.delivered.Add(1)
 				select {
 				case out <- b:
 				case <-ctx.Done():
@@ -949,7 +1027,7 @@ func rollingGetBlocks(ctx context.Context, sess blockGetter, need []cid.Cid, ref
 			}
 			// Per-fetch cap: if we already hold maxPerFetch, wait for our own blocks to land (fans release tokens)
 			// rather than taking more of the shared budget. Cheap poll; a fan freeing room unblocks us.
-			if held.Load() >= int64(maxPerFetch) {
+			if held.Load() >= perFetch() {
 				select {
 				case <-time.After(50 * time.Millisecond):
 				case <-ctx.Done():
@@ -963,7 +1041,7 @@ func rollingGetBlocks(ctx context.Context, sess blockGetter, need []cid.Cid, ref
 			}
 			held.Add(1)
 			got := 1
-			for got < refillBatch && requested+got < len(need) && held.Load() < int64(maxPerFetch) && globalWantPool.tryAcquire() {
+			for got < refillBatch && requested+got < len(need) && held.Load() < perFetch() && globalWantPool.tryAcquire() {
 				held.Add(1)
 				got++
 			}
