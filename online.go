@@ -109,6 +109,8 @@ type combinedFinder struct {
 	hold func() bool
 	// noteProvider: a provider found for a fetch — dialing it is what the user waits on (netgate.go priority).
 	noteProvider func(peer.ID)
+	// skip: a provider not to hand the sessions now (quarantined: quarantine.go); nil = none.
+	skip func(peer.ID) bool
 }
 
 // delegatedIndexers: every delegated-routing (IPNI) endpoint the finder races. Overridable in tests / the matrix.
@@ -120,6 +122,9 @@ func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, coun
 		t0 := time.Now()
 		n := 0
 		for ai := range rr.FindProvidersAsync(ctx, c, count) {
+			if cf.skip != nil && cf.skip(ai.ID) {
+				continue
+			}
 			n++
 			if cf.noteProvider != nil {
 				cf.noteProvider(ai.ID)
@@ -194,9 +199,10 @@ func (n *node) goOnline() error {
 		return rmErr
 	}
 	bwc := metrics.NewBandwidthCounter() // global up/down byte counters + rolling rates for every stream
+	bsBytes := newBitswapBytes(bwc)      // + per peer, the bytes of its bitswap streams (quarantine.go)
 	libp2pOpts := []libp2p.Option{
 		libp2p.Identity(priv),
-		libp2p.BandwidthReporter(bwc),
+		libp2p.BandwidthReporter(bsBytes),
 		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
 		// WebSocket, WebTransport). More transports = more usable providers when content has many hosts.
 		libp2p.ListenAddrStrings(
@@ -247,6 +253,7 @@ func (n *node) goOnline() error {
 	published := false
 	var cleanupKad *dht.IpfsDHT
 	var cleanupBswap interface{ Close() error }
+	var cleanupQuarantine func()
 	defer func() {
 		if !published {
 			// Close EVERYTHING built so far, newest-first — the retry loop otherwise accretes a DHT (on n.ctx,
@@ -264,6 +271,9 @@ func (n *node) goOnline() error {
 			}
 			if cleanupBswap != nil {
 				_ = cleanupBswap.Close()
+			}
+			if cleanupQuarantine != nil {
+				cleanupQuarantine()
 			}
 			if cleanupKad != nil {
 				_ = cleanupKad.Close()
@@ -301,13 +311,17 @@ func (n *node) goOnline() error {
 			routers = append(routers, routinghttpcr.NewContentRoutingClient(hc))
 		}
 	}
-	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider}
-	n.upSeen = make(map[string]int64)
-	// A peer sitting on our want-blocks is taken out of the download rotation (quarantine.go).
+	// A peer sitting on our want-blocks while another offers them is taken out of the download rotation
+	// (quarantine.go) — and our finder does not hand it back to the sessions meanwhile.
 	qnet := newQuarantineNet(bsn)
-	safeGo("node.quarantine", func() { qnet.run(n.ctx) })
+	qnet.bytes, qnet.forget = bsBytes.of, bsBytes.drop
+	qctx, qstop := context.WithCancel(n.ctx)
+	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider, skip: qnet.out}
+	n.upSeen = make(map[string]int64)
+	safeGo("node.quarantine", func() { qnet.run(qctx) })
 	bswap := bitswap.New(n.ctx, qnet, finder, n.fstore, bitswapOptions(upTracer{n})...)
 	cleanupBswap = bswap
+	cleanupQuarantine = qstop
 
 	n.host = h
 	n.dht = kad

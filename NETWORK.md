@@ -9,6 +9,7 @@ invariants any future change must preserve.*
 | Layer | Files | Job |
 |---|---|---|
 | **Substrate** | `online.go`, `doh.go`, `peers.go` | libp2p host (TCP/QUIC/WS/WebTransport), Kademlia DHT + delegated HTTP routing, AutoRelay + DCUtR hole-punching, mDNS same-LAN discovery, bitswap (tuned), DoH for filtered networks. |
+| **Download rotation** | `quarantine.go` | Wraps bitswap's network: a peer sitting on our want-blocks while another peer offers them is reported *disconnected* to the bitswap client (never closed), so boxo re-routes its wants. |
 | **Social** | `friend.go`, `social.go` | `/vidyagod/friend/1.0.0`: mutual-consent friendship, profiles, online/offline liveness (45 s pings). No play-state/lobby/join — excised 2026-09-04. Address book survives offline (`social.json`). |
 | **Link** | `overlaylink.go` | ALWAYS-ON per-friend heartbeat/state machine: proves + repairs each friend link for the app's lifetime. The trust oracle for the datagram fast path. |
 | **Datapath** | `overlay.go` | `/vidyagod/overlay/1.0.0`: L3 forwarder between a TUN (in the game's netns) and friends. TX = proven-QUIC-datagram fast path over reliable-stream fallback. |
@@ -61,6 +62,18 @@ invariants any future change must preserve.*
    never got a datagram receive loop, and the `dgRecv` dedupe made the miss permanent (pongs land in the void
    forever). The maintainer calls `ensureRecvLoops` every evaluate — idempotent, cheap.
 
+8. **A peer leaves the download rotation only when somewhere better exists — and nothing it sends is lost.**
+   boxo's sessions can park want-blocks on a peer forever (a HAVE is never undone by a DONT_HAVE; a re-sent
+   want-block is dropped as already sent, so no new timeout starts; bitswap 1.1 peers get no timeout at all).
+   `quarantine.go` reports such a peer disconnected to the client — which re-routes every want it held — only when
+   all three hold: it has held a want-block for `quarantineAfter` (6 s), no bitswap *bytes* arrived from it in that
+   time (a block still crossing a slow link is progress), and another peer in the rotation said HAVE for one of the
+   blocks it holds. A sole provider is never taken out: slow must not become stopped. While out, its HAVEs and
+   DONT_HAVEs are kept from the client and the finder skips it; its wants still reach our server, and the first
+   block it delivers brings it back and reaches the client. Cooldown 30 s, doubling per offence to 10 min, reset by
+   a delivery. Moving a peer in or out is exclusive with message delivery (`dmu`), so a HAVE cannot slip it back
+   into a session mid-move.
+
 ## Known failure modes and where they're handled
 
 | Failure | Detection | Response |
@@ -73,6 +86,7 @@ invariants any future change must preserve.*
 | Friend offline | connectedness lost | down + dial with backoff; conn re-protected on return |
 | Panic in any network goroutine | `guard` recover + stack log | that iteration/goroutine dies; node lives |
 | goOnline fails/panics at startup | `guardErr` | offline node + background retry with backoff |
+| A provider answers HAVE and never delivers (a public pinning node) | want-blocks held 6 s, no bytes, another peer offers them | `[quarantine]` line; out of the client's rotation, wants re-routed |
 
 ## Diagnostics
 

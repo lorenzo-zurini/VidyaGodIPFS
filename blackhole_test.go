@@ -61,9 +61,24 @@ func (s promiseStore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) 
 	return nil, ctx.Err()
 }
 
+// hiccupStore hands nothing over until its deadline: a seeder busy elsewhere (a disk flush, a compaction).
+type hiccupStore struct {
+	blockstore.Blockstore
+	until time.Time
+}
+
+func (s hiccupStore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) {
+	select {
+	case <-time.After(time.Until(s.until)):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Blockstore.Get(ctx, c)
+}
+
 // setupBlackhole: seeder A, provider H of the given kind, client B whose finder names H first for every CID; B's
-// network is wrapped in the quarantine when quarantine is set.
-func setupBlackhole(t *testing.T, ctx context.Context, payloadSize int, kind int, quarantine bool) blackholeRig {
+// network is wrapped in the quarantine when quarantine is set. A hands nothing over for its first hiccup.
+func setupBlackhole(t *testing.T, ctx context.Context, payloadSize int, kind int, quarantine bool, hiccup time.Duration) blackholeRig {
 	t.Helper()
 	mn, err := mocknet.FullMeshLinked(3)
 	if err != nil {
@@ -80,7 +95,11 @@ func setupBlackhole(t *testing.T, ctx context.Context, payloadSize int, kind int
 		t.Fatal(err)
 	}
 	_, leaves := buildLeafDAG(t, dservA, payload)
-	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA, bitswapOptions(nil)...) // the seeder as configured
+	var serveA blockstore.Blockstore = bstoreA
+	if hiccup > 0 {
+		serveA = hiccupStore{bstoreA, time.Now().Add(hiccup)}
+	}
+	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, serveA, bitswapOptions(nil)...) // the seeder as configured
 
 	var bswapH *bitswap.Bitswap
 	switch kind {
@@ -105,8 +124,13 @@ func setupBlackhole(t *testing.T, ctx context.Context, payloadSize int, kind int
 		t.Fatal(err)
 	}
 	// A busy seeder: its first answer comes after the session's first idle tick (1 s), so the session asks the finder
-	// and takes on the other provider — as the replication's receiver, busy with other files, did.
-	for _, l := range mn.LinksBetweenPeers(hostA.ID(), hostB.ID()) {
+	// and takes on the other provider — as the replication's receiver, busy with other files, did. A seeder that
+	// hiccups answers first instead: the want-blocks go to it, and the other provider's HAVEs come after.
+	slowA, slowB := hostA.ID(), hostB.ID()
+	if hiccup > 0 {
+		slowA = hostH.ID()
+	}
+	for _, l := range mn.LinksBetweenPeers(slowA, slowB) {
 		l.SetOptions(mocknet.LinkOptions{Latency: 600 * time.Millisecond})
 	}
 	sess := blockservice.NewSession(ctx, blockservice.New(bstoreB, bswapB))
@@ -130,7 +154,7 @@ func TestAProviderThatNeverAnswersDoesNotStrandWants(t *testing.T) {
 		t.Run(map[int]string{providerSilent: "silent", providerNoBitswap: "no-bitswap"}[kind], func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			rig := setupBlackhole(t, ctx, 32<<20, kind, false) // 128 leaves
+			rig := setupBlackhole(t, ctx, 32<<20, kind, false, 0) // 128 leaves
 			defer rig.stop()
 			fctx, fcancel := context.WithTimeout(ctx, stallTimeout)
 			defer fcancel()
@@ -156,7 +180,7 @@ func TestAProviderThatPromisesAndNeverDeliversIsQuarantined(t *testing.T) {
 	defer func() { quarantineAfter, quarantineCool, quarantineTick = a, c, tk }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rig := setupBlackhole(t, ctx, 32<<20, providerPromiser, true)
+	rig := setupBlackhole(t, ctx, 32<<20, providerPromiser, true, 0)
 	defer rig.stop()
 	fctx, fcancel := context.WithTimeout(ctx, stallTimeout)
 	defer fcancel()
@@ -166,5 +190,31 @@ func TestAProviderThatPromisesAndNeverDeliversIsQuarantined(t *testing.T) {
 	}
 	if len(got) != len(rig.leaves) {
 		t.Fatalf("%d of %d leaves arrived within %s (the rest stranded on the provider that never delivers)", len(got), len(rig.leaves), stallTimeout)
+	}
+}
+
+// An honest seeder that hiccups — nothing for longer than quarantineAfter — while the promiser offers everything too
+// is taken out, and must not be starved for it: the blocks it then delivers bring it back and reach the client, and
+// the promiser, holding wants the seeder offers, goes out in turn. The whole file lands well inside the stall
+// watchdog. Teeth: drop an out peer's blocks (they are lost, and the promiser — offered only by a peer that is out —
+// holds the rest until the seeder's cooldown ends, past the watchdog).
+func TestAnHonestSeederThatHiccupsIsNotStarved(t *testing.T) {
+	a, c, tk := quarantineAfter, quarantineCool, quarantineTick
+	quarantineAfter, quarantineCool, quarantineTick = 2*time.Second, time.Minute, 200*time.Millisecond
+	defer func() { quarantineAfter, quarantineCool, quarantineTick = a, c, tk }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rig := setupBlackhole(t, ctx, 16<<20, providerPromiser, true, 5*time.Second)
+	defer rig.stop()
+	fctx, fcancel := context.WithTimeout(ctx, stallTimeout)
+	defer fcancel()
+	start := time.Now()
+	got := map[cid.Cid]bool{}
+	for b := range rollingGetBlocks(fctx, rig.sess, rig.leaves, 32) {
+		got[b.Cid()] = true
+	}
+	t.Logf("%d of %d leaves in %s", len(got), len(rig.leaves), time.Since(start).Round(100*time.Millisecond))
+	if len(got) != len(rig.leaves) {
+		t.Fatalf("%d of %d leaves arrived within %s (the seeder was starved after its hiccup)", len(got), len(rig.leaves), stallTimeout)
 	}
 }
