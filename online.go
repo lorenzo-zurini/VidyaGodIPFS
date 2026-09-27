@@ -303,7 +303,10 @@ func (n *node) goOnline() error {
 	}
 	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider}
 	n.upSeen = make(map[string]int64)
-	bswap := bitswap.New(n.ctx, bsn, finder, n.fstore, bitswapOptions(upTracer{n})...)
+	// A peer sitting on our want-blocks is taken out of the download rotation (quarantine.go).
+	qnet := newQuarantineNet(bsn)
+	safeGo("node.quarantine", func() { qnet.run(n.ctx) })
+	bswap := bitswap.New(n.ctx, qnet, finder, n.fstore, bitswapOptions(upTracer{n})...)
 	cleanupBswap = bswap
 
 	n.host = h
