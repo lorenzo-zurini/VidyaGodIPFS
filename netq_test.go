@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -497,7 +498,7 @@ func TestMemLineAndPprofGuard(t *testing.T) {
 	if _, err := fmt.Sscanf(memLine(), "[mem] go: heap in use %d", &goInUse); err != nil || goInUse <= 0 {
 		t.Fatalf("[mem] line %q: go heap in use %d (%v)", memLine(), goInUse, err)
 	}
-	if in, _ := cAllocator(); in == 0 {
+	if in, _ := cAllocator(); in == 0 && runtime.GOOS == "linux" { // measured on glibc only
 		t.Fatal("the C allocator reads as empty")
 	}
 	if a := servePprof("0.0.0.0:0"); a != "" {
