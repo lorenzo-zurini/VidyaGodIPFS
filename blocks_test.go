@@ -46,6 +46,39 @@ func TestBlockPutIsTheFileCidOfItsBytes(t *testing.T) {
 	}
 }
 
+// A node file landed in place and then moved (a pruned copy, an adopt) leaves a reference whose file is gone. Putting
+// the same node's bytes must store them anyway: the filestore's Put took the dead reference for "held" and stored
+// nothing, so the node read as unheld and publishing its package folder failed — and the whole publish with it.
+// Teeth: put through bserv (the filestore) again and blockGet fails; keep the dead reference and it reads as missing.
+func TestBlockPutStoresOverADeadReference(t *testing.T) {
+	n := offlineNode(t)
+	node := []byte(`{"LABEL":"landed","LAYERS":[{"DIR":"x"}]}`)
+	p := filepath.Join(t.TempDir(), "landed.json")
+	writeFile(t, p, node)
+	c, err := n.addNoCopy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if !n.hasLocal(c) || !n.cidMissing(c) {
+		t.Fatal("precondition: a dead reference that still claims the block")
+	}
+	if got, err := n.blockPut(node); err != nil || !got.Equals(c) {
+		t.Fatalf("blockPut = %s, %v", got, err)
+	}
+	if b, err := n.blockGet(c); err != nil || string(b) != string(node) {
+		t.Fatalf("blockGet after the put = %q, %v", b, err)
+	}
+	if n.cidMissing(c) {
+		t.Fatal("the dead reference still reads the block as missing")
+	}
+	if _, err := n.makeDir(map[string]string{c.String() + ".json": c.String()}); err != nil {
+		t.Fatalf("a package folder naming the node: %v", err)
+	}
+}
+
 func mustRaw(t *testing.T, n *node, b []byte) cid.Cid {
 	t.Helper()
 	c, err := n.blockPut(b)

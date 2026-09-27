@@ -49,14 +49,28 @@ func (n *node) blockPut(b []byte) (cid.Cid, error) {
 	if err != nil {
 		return cid.Undef, err
 	}
-	if err := n.bserv.AddBlock(n.ctx, blk); err != nil {
+	// Stored bytes, straight into the blockstore under the filestore (which Get reads first). Through the filestore, a
+	// reference to the same bytes whose file has since moved or gone "has" the block: the put stored nothing, the node
+	// read as unheld, and its package folder was refused — the whole publish with it. That dead reference goes too, or
+	// the block would still read as missing.
+	if err := n.plain.Put(n.ctx, blk); err != nil {
 		return cid.Undef, err
 	}
-	if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
-		return cid.Undef, err
+	if n.cidMissing(c) {
+		if err := n.fstore.FileManager().DeleteBlock(n.ctx, c); err != nil {
+			return cid.Undef, err
+		}
 	}
-	if err := n.pinner.Flush(n.ctx); err != nil {
+	// Kept already (a node file landed in place is pinned recursively): pinning it Direct again is an error, not a no-op.
+	if _, pinned, err := n.pinner.IsPinned(n.ctx, c); err != nil {
 		return cid.Undef, err
+	} else if !pinned {
+		if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
+			return cid.Undef, err
+		}
+		if err := n.pinner.Flush(n.ctx); err != nil {
+			return cid.Undef, err
+		}
 	}
 	n.announceNow(c)
 	return c, nil
