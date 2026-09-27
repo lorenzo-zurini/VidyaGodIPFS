@@ -769,7 +769,7 @@ func TestMoveRefsFollowsAMovedFolder(t *testing.T) {
 	if !n.cidMissing(cBig) {
 		t.Fatal("precondition: after the move the old references must read as missing")
 	}
-	moved, err := n.moveRefs(n.ctx, oldDir, newDir)
+	moved, err := n.moveRefs(n.ctx, refMove{oldDir, newDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,5 +795,46 @@ func TestMoveRefsFollowsAMovedFolder(t *testing.T) {
 	}
 	if res := filestore.List(n.ctx, n.fstore, cSib); res == nil || filepath.Join("/", res.FilePath) != filepath.Join(sib, "other.bin") {
 		t.Fatalf("the sibling folder's reference was re-pointed: %+v", res)
+	}
+}
+
+// Installing a received package moves two folders at once: the package dir, and inside it the landed folder whose
+// files moved up into the package dir. One scan re-points both, each file by the longest folder holding it. Teeth:
+// take the first move that holds a file instead of the longest and the landed node is re-pointed to
+// new/.package/x.json — a path that does not exist.
+func TestMoveRefsNestedMovesInOneScan(t *testing.T) {
+	n := offlineNode(t)
+	root := t.TempDir()
+	pkg, landed, dest := filepath.Join(root, "pkg"), filepath.Join(root, "pkg", ".package"), filepath.Join(root, "lib", "pkg")
+	writeFile(t, filepath.Join(pkg, "game.zip"), sampleBytes())
+	writeFile(t, filepath.Join(landed, "node.json"), []byte(`{"LABEL":"landed"}`))
+	cZip, err := n.addNoCopy(filepath.Join(pkg, "game.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cNode, err := n.addNoCopy(filepath.Join(landed, "node.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The install: the landed node moves up, the landed folder goes, the package moves.
+	if err := os.Rename(filepath.Join(landed, "node.json"), filepath.Join(pkg, "node.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(landed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(pkg, dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.moveRefs(n.ctx, refMove{pkg, dest}, refMove{landed, dest}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []cid.Cid{cZip, cNode} {
+		if n.cidMissing(c) {
+			t.Fatalf("%s reads as missing after the one-scan move", c)
+		}
 	}
 }

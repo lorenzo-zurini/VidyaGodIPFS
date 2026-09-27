@@ -204,3 +204,46 @@ func TestMakeDirRefusesAnEntryThatIsNotWhole(t *testing.T) {
 		t.Fatalf("a whole entry must link: %v", err)
 	}
 }
+
+// Choosing what a pin folder links: the entries held whole go in, the rest are named (not a refused folder), and with
+// none whole there is no folder. A pin folder nesting a folder this node just made does not walk that content again
+// (publishing walked every content DAG several times over). Teeth: refuse instead of leaving out and the folder is
+// not made; drop the madeDirs check and the pin folder walks the content folder again.
+func TestMakeWholeDirLeavesOutWhatIsNotWholeAndWalksOnce(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	add := func(name string) cid.Cid {
+		b := make([]byte, 2*chunkSize+77)
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, name)
+		writeFile(t, p, b)
+		c, err := n.addNoCopy(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	whole, gone := add("whole.bin"), add("gone.bin")
+	if err := os.Remove(filepath.Join(dir, "gone.bin")); err != nil {
+		t.Fatal(err)
+	}
+	content, notWhole, err := n.makeWholeDir(map[string]string{"w": whole.String(), "g": gone.String()}, true)
+	if err != nil || !content.Defined() {
+		t.Fatalf("the whole entries make a folder: %s, %v", content, err)
+	}
+	if len(notWhole) != 1 || notWhole[0] != "g" {
+		t.Fatalf("not whole: %v, want [g]", notWhole)
+	}
+	if none, nw, err := n.makeWholeDir(map[string]string{"g": gone.String()}, true); err != nil || none.Defined() || len(nw) != 1 {
+		t.Fatalf("nothing whole: folder %s, named %v, err %v — want no folder", none, nw, err)
+	}
+	before := wholeWalks.Load()
+	if _, err := n.makeDir(map[string]string{"content": content.String()}); err != nil {
+		t.Fatal(err)
+	}
+	if walked := wholeWalks.Load() - before; walked != 0 {
+		t.Fatalf("the pin folder walked the content folder it nests again (%d walks)", walked)
+	}
+}

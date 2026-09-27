@@ -65,6 +65,12 @@ func TestDialBudgetLetsWhatTheUserWaitsOnThrough(t *testing.T) {
 	if g.InterceptPeerDial("old") {
 		t.Fatal("an expired provider still skipped the line")
 	}
+	// A LAN peer not heard from for lanPeerTTL (the laptop left the network) is a stranger again. Teeth: store the
+	// LAN mark without an expiry and it skips the line forever.
+	n.lanPeers.Store(peer.ID("gone"), time.Now().Add(-time.Second))
+	if g.InterceptPeerDial("gone") {
+		t.Fatal("a LAN peer long gone still skipped the line")
+	}
 }
 
 // A stranger's private addresses are not dialed across the internet; a friend's or LAN peer's are; public ones always.

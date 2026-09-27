@@ -22,8 +22,8 @@ import "C"
 
 import (
 	"context"
-	"sync"
 	"encoding/json"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -289,6 +289,34 @@ func VgMakeDir(entriesJson *C.char, outCid **C.char, errOut **C.char) C.int {
 		return fail(errOut, err)
 	}
 	setStr(outCid, c.String())
+	return 0
+}
+
+// VgMakeWholeDir is VgMakeDir over the entries held whole: the others are left out and named in outNotWhole (a JSON
+// array of entry names) instead of failing the folder.
+//
+//export VgMakeWholeDir
+func VgMakeWholeDir(entriesJson *C.char, outCid, outNotWhole, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	var entries map[string]string
+	if err := json.Unmarshal([]byte(C.GoString(entriesJson)), &entries); err != nil {
+		return fail(errOut, err)
+	}
+	c, notWhole, err := n.makeWholeDir(entries, true)
+	if err != nil {
+		return fail(errOut, err)
+	}
+	nw, _ := json.Marshal(append([]string{}, notWhole...))
+	if c.Defined() {
+		setStr(outCid, c.String())
+	} else {
+		setStr(outCid, "") // nothing whole: no folder
+	}
+	setStr(outNotWhole, string(nw))
 	return 0
 }
 
@@ -687,8 +715,11 @@ func VgClearCancel(cidStr *C.char) { clearCancel(C.GoString(cidStr)) }
 
 // VgSetExpectedSize records a CID's known payload byte size (the manifest's stamped SOURCE.SIZE) so a gateway
 // fallback can show a real progress %. size <= 0 clears it. Idempotent; safe to call repeatedly.
+//
 //export VgSetExpectedSize
-func VgSetExpectedSize(cidStr *C.char, size C.longlong) { setExpectedSize(C.GoString(cidStr), int64(size)) }
+func VgSetExpectedSize(cidStr *C.char, size C.longlong) {
+	setExpectedSize(C.GoString(cidStr), int64(size))
+}
 
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
@@ -797,40 +828,60 @@ func VgNetRelease(handle C.longlong) {
 	}
 }
 
+// VgNetHold keeps the network queue in foreground mode (background work at most one slot, compaction deferred) for a
+// multi-wave job — between its fetches no fetch holds a slot. Release the handle with VgNetRelease exactly once.
+//
+//export VgNetHold
+func VgNetHold() C.longlong {
+	release := netq.hold()
+	netHeldMu.Lock()
+	netNextID++
+	id := netNextID
+	netHeld[id] = release
+	netHeldMu.Unlock()
+	return C.longlong(id)
+}
+
+// VgDebugNetForegroundIdle: 1 when no fetch holds or waits for a slot and nobody holds the foreground. Tests only.
+//
+//export VgDebugNetForegroundIdle
+func VgDebugNetForegroundIdle() C.int {
+	netq.mu.Lock()
+	defer netq.mu.Unlock()
+	if netq.fgBusyLocked() {
+		return 0
+	}
+	return 1
+}
+
 // VgSetNetSlots sizes the network queue — the user's "max simultaneous downloads".
 //
 //export VgSetNetSlots
 func VgSetNetSlots(n C.int) { netq.setSlots(int(n)) }
 
-// VgMoveRefs re-points the filestore references of every file under oldDir to newDir (the folder was moved on disk).
-// Returns the number of references moved, -1 on error.
+// VgMoveRefs re-points the filestore references of files in moved folders: movesJson is [[oldDir, newDir], …], each
+// file mapped by the longest oldDir holding it, all in one scan. Returns the number of references moved, -1 on error.
 //
 //export VgMoveRefs
-func VgMoveRefs(oldDir, newDir *C.char, errOut **C.char) C.longlong {
+func VgMoveRefs(movesJson *C.char, errOut **C.char) C.longlong {
 	n := get()
 	if n == nil {
 		setStr(errOut, "node not started")
 		return -1
 	}
-	moved, err := n.moveRefs(n.ctx, C.GoString(oldDir), C.GoString(newDir))
+	var pairs [][2]string
+	if err := json.Unmarshal([]byte(C.GoString(movesJson)), &pairs); err != nil {
+		setStr(errOut, err.Error())
+		return -1
+	}
+	moves := make([]refMove, 0, len(pairs))
+	for _, p := range pairs {
+		moves = append(moves, refMove{p[0], p[1]})
+	}
+	moved, err := n.moveRefs(n.ctx, moves...)
 	if err != nil {
 		setStr(errOut, err.Error())
 		return -1
 	}
 	return C.longlong(moved)
-}
-
-// VgHeldWhole: 1 if every block of the CID's DAG is held and every file it is referenced into is present, else 0.
-//
-//export VgHeldWhole
-func VgHeldWhole(cidStr *C.char) C.int {
-	n := get()
-	if n == nil {
-		return 0
-	}
-	c, err := cid.Decode(C.GoString(cidStr))
-	if err != nil || n.heldWhole(c) != nil {
-		return 0
-	}
-	return 1
 }

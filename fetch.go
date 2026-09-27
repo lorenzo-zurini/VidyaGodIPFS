@@ -196,7 +196,7 @@ func (n *node) getRoot(nctx context.Context, c cid.Cid, cidStr string, onProgres
 	// streams for minutes); its stall watchdog + nctx bound it.
 	fdbg("getRoot: libp2p root fetch failed (%v) → HTTPS trustless-gateway fallback cid=%s", err, cidStr)
 	phase(cidStr, "no p2p source answered — trying HTTPS gateways")
-	gerr := n.fetchViaGateway(gwCtx, c, -1, func(read, total int64) {
+	gerr := n.fetchViaGateway(gwCtx, c, -1, -1, func(read, total int64) {
 		// A streaming CAR usually carries no Content-Length, so total is -1 here. Fall back to the manifest's
 		// stamped SOURCE.SIZE (pushed down via setExpectedSize) so the % moves instead of staying blank. read is
 		// CAR bytes (slightly > the payload total by the dag-pb spine), so cap at 99 and let finalize reach 100.
@@ -1288,7 +1288,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			return errors.New("cancelled")
 		}
 		// The session STALLED with leaves missing while the node is online: before giving the attempt up, ask the HTTPS
-		// gateways for exactly what is missing — an entity-bytes CAR from the first missing leaf's offset on. This is
+		// gateways for exactly what is missing — entity-bytes CARs of the runs of missing leaves (gatewayRanges). This is
 		// the second transport for LEAVES, the same way getRoot has it for the root. Without it a DAG whose root had
 		// landed (a hedge winner that died mid-stream; a CAR cut by the stall watchdog) was stuck for good on a
 		// gateway-only network: every later attempt found the root locally, never re-entered the gateway, and looped
@@ -1300,21 +1300,36 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		// whose session stalled — and while that friend stays offline the loop cycles stall → probe → backoff,
 		// ~80 s per lap, on every lap. No cheaper definitive negative exists: see gatewayHeaderTimeout.
 		if !bits.allSet() && stalled.Load() && n.dht != nil && nctx.Err() == nil {
-			from := int64(-1)
+			var missing []byteRange // leaves are in file order
+			var missingCids []string
 			for i, lf := range leaves {
-				if !bits.get(i) && (from < 0 || int64(lf.off) < from) {
-					from = int64(lf.off)
+				if !bits.get(i) {
+					missing = append(missing, byteRange{int64(lf.off), int64(lf.off) + int64(lf.sz) - 1})
+					if len(missingCids) < 8 {
+						missingCids = append(missingCids, lf.c.String())
+					}
 				}
 			}
+			ranges := gatewayRanges(missing)
 			base := written
-			fdbg("writeThrough: bitswap stalled with %d/%d leaves missing → HTTPS gateway resume from byte %d cid=%s", bits.count-bits.nset, bits.count, from, cidStr)
+			// The first missing leaves by CID: a stall is matched against the seeder's own log by them.
+			fdbg("writeThrough: bitswap stalled with %d/%d leaves missing (first: %s) → HTTPS gateway resume of %d range(s) %v cid=%s",
+				bits.count-bits.nset, bits.count, strings.Join(missingCids, " "), len(ranges), ranges, cidStr)
 			phase(cidStr, fmt.Sprintf("resuming the missing %d block(s) over HTTPS gateway", bits.count-bits.nset))
 			rctx, rstop := userCancelCtx(nctx, cidStr)
-			gerr := n.fetchViaGateway(rctx, root, from, func(read, _ int64) {
-				if total > 0 && onProgress != nil {
-					onProgress(math.Min(99, 100.0*float64(base+read)/float64(total)))
+			var gerr error
+			var done int64 // bytes of the ranges already fetched, so progress runs on across them
+			for _, r := range ranges {
+				gerr = n.fetchViaGateway(rctx, root, r.from, r.to, func(read, _ int64) {
+					if total > 0 && onProgress != nil {
+						onProgress(math.Min(99, 100.0*float64(base+done+read)/float64(total)))
+					}
+				})
+				if gerr != nil {
+					break
 				}
-			})
+				done += r.to - r.from + 1
+			}
 			rstop()
 			if gerr != nil {
 				fdbg("writeThrough: gateway resume failed cid=%s: %v", cidStr, gerr)

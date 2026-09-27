@@ -10,9 +10,11 @@ package main
 //   - a provider walk or a provider-record send of the sweeping provider (provide.go) — BACKGROUND.
 //
 // The size is the user's "max simultaneous downloads". A slot goes to a waiting foreground job before any background
-// one, and background work never holds the LAST slot (with more than one): a walk holds its slot for its whole
-// duration, so a slot freed while the downloader sat between jobs — every wave boundary of a closure landing — went to
-// a walk, and the next fetch waited behind it. Rolling: a freed slot is handed straight to the next waiter it may go to.
+// one, and background work never holds the LAST slot (with more than one). While a download runs — a fetch holds or
+// waits for a slot, or a caller holds the foreground for a multi-wave job (hold: a closure landing, a download's
+// whole run) — background work holds at most ONE slot: a walk keeps its slot for its whole duration, and every wave
+// boundary (no fetch holding or waiting for an instant) handed all but one slot to walks, the next wave waiting
+// behind them. Rolling: a freed slot is handed straight to the next waiter it may go to.
 
 import (
 	"context"
@@ -25,7 +27,8 @@ type netQueue struct {
 	active   int
 	fgActive int             // … of which foreground (fetch) jobs
 	fg, bg   []chan struct{} // FIFO waiters per priority; a closed channel = granted
-	fgIdle   chan struct{}   // closed while no foreground job holds or waits for a slot
+	holds    int             // callers holding the foreground between their fetches (hold)
+	fgIdle   chan struct{}   // closed while no foreground job holds or waits for a slot, and nobody holds the foreground
 }
 
 var netq = newNetQueue(3)
@@ -36,12 +39,35 @@ func newNetQueue(slots int) *netQueue {
 	return &netQueue{slots: slots, fgIdle: idle}
 }
 
-// bgMax: the slots background work may hold at once — all but one, so a fetch always finds a slot.
+// bgMax: the slots background work may hold at once — one while a download runs, else all but one, so a fetch always
+// finds a slot. q.mu held.
 func (q *netQueue) bgMax() int {
-	if q.slots > 1 {
-		return q.slots - 1
+	if q.slots <= 1 || q.fgBusyLocked() {
+		return 1
 	}
-	return 1
+	return q.slots - 1
+}
+
+// fgBusyLocked: a foreground job holds or waits for a slot, or a caller holds the foreground. q.mu held.
+func (q *netQueue) fgBusyLocked() bool { return q.fgActive > 0 || len(q.fg) > 0 || q.holds > 0 }
+
+// hold keeps the queue in foreground mode until release (called exactly once) — across the gaps between a multi-wave
+// job's fetches, where no fetch holds or waits for a slot.
+func (q *netQueue) hold() (release func()) {
+	q.mu.Lock()
+	q.holds++
+	q.markFgBusyLocked()
+	q.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			q.mu.Lock()
+			q.holds--
+			q.grantLocked()
+			q.markFgIdleIfLocked()
+			q.mu.Unlock()
+		})
+	}
 }
 
 // acquire blocks until a slot is granted (fg first) or ctx ends. release must be called exactly once when ok.
@@ -128,7 +154,7 @@ func (q *netQueue) markFgBusyLocked() {
 }
 
 func (q *netQueue) markFgIdleIfLocked() {
-	if q.fgActive > 0 || len(q.fg) > 0 {
+	if q.fgBusyLocked() {
 		return
 	}
 	select {
@@ -138,8 +164,8 @@ func (q *netQueue) markFgIdleIfLocked() {
 	}
 }
 
-// waitFgIdle blocks until no foreground job holds or waits for a slot (true), or ctx ends (false). Work that should
-// not compete with installs — a whole-datastore compaction — waits here.
+// waitFgIdle blocks until no foreground job holds or waits for a slot and nobody holds the foreground (true), or ctx
+// ends (false). Work that should not compete with installs — a whole-datastore compaction — waits here.
 func (q *netQueue) waitFgIdle(ctx context.Context) bool {
 	q.mu.Lock()
 	idle := q.fgIdle

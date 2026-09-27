@@ -111,11 +111,11 @@ func (e gatewayStatusError) Error() string { return fmt.Sprintf("status %d", e.c
 // aliases are one flaky backend behind several CDN routes — sequential meant ~28 s of dead time per bad route.
 //
 // fromByte < 0 pulls the WHOLE DAG (dag-scope=all: the root fetch, files and directories alike). fromByte >= 0 pulls
-// the entity's bytes from that offset to the end (IPIP-402 entity-bytes): the RESUME form writeThrough uses when a
-// stream broke mid-file or bitswap stalled — the CAR then carries the root, the spine and only the leaves from the
-// first missing one on, instead of re-sending the whole file. (Probed: Pinata honours it — 877 KB for the last 0.8 MB
-// of a 9.8 MB file.) onRead reports (bytes read so far, total or -1) so each caller maps it onto ITS progress bar.
-func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte int64, onRead func(read, total int64)) error {
+// the entity's bytes fromByte..toByte inclusive, or to the end when toByte < 0 (IPIP-402 entity-bytes): the RESUME
+// form writeThrough uses when bitswap stalled — the CAR then carries the root, the spine and only the leaves of that
+// range. (Probed: Pinata honours it — 877 KB for the last 0.8 MB of a 9.8 MB file.) onRead reports (bytes read so
+// far, total or -1) so each caller maps it onto ITS progress bar.
+func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte, toByte int64, onRead func(read, total int64)) error {
 	if len(trustlessGateways) == 0 {
 		return fmt.Errorf("no trustless gateways configured")
 	}
@@ -140,7 +140,7 @@ func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte int64
 			// moment the open returns, so a winner's long stream is never touched.
 			var timedOut atomic.Bool
 			tm := time.AfterFunc(gatewayHeaderTimeout, func() { timedOut.Store(true); ccancel() })
-			c, err := n.openCarCandidate(cctx, hc, gw, root, fromByte)
+			c, err := n.openCarCandidate(cctx, hc, gw, root, fromByte, toByte)
 			tm.Stop()
 			if err != nil && timedOut.Load() {
 				err = fmt.Errorf("open exceeded gatewayHeaderTimeout (%s): %w", gatewayHeaderTimeout, err)
@@ -219,9 +219,9 @@ func (n *node) fetchViaGateway(ctx context.Context, root cid.Cid, fromByte int64
 // openCarCandidate opens a gateway's CAR stream and reads + verifies its FIRST block. It returns a candidate only when
 // that block is real; a non-200, a CAR header error, an EMPTY body ("200 with no bytes") or a CID mismatch all fail
 // here, so the race can never commit to a route that isn't serving. Bounded by ctx + the transport's header timeout.
-func (n *node) openCarCandidate(ctx context.Context, hc *http.Client, gw string, root cid.Cid, fromByte int64) (*carCandidate, error) {
+func (n *node) openCarCandidate(ctx context.Context, hc *http.Client, gw string, root cid.Cid, fromByte, toByte int64) (*carCandidate, error) {
 	gctx, cancel := context.WithCancel(ctx)
-	url := gw + "/ipfs/" + root.String() + "?format=car&car-order=dfs&" + carScopeQuery(fromByte)
+	url := gw + "/ipfs/" + root.String() + "?format=car&car-order=dfs&" + carScopeQuery(fromByte, toByte)
 	req, err := http.NewRequestWithContext(gctx, http.MethodGet, url, nil)
 	if err != nil {
 		cancel()
@@ -270,16 +270,57 @@ func (n *node) openCarCandidate(ctx context.Context, hc *http.Client, gw string,
 	return c, nil
 }
 
-// streamCarCandidate imports the winning candidate's CAR: its already-verified first block, then the rest, each block
-// CID-verified (trustless), under a stall watchdog (no bytes for stallTimeout → abort so the outer loop retries).
-// carScopeQuery is the trustless-gateway scope for a fetch: the whole DAG, or the entity's bytes from an offset on.
-func carScopeQuery(fromByte int64) string {
+// carScopeQuery is the trustless-gateway scope for a fetch: the whole DAG, or the entity's bytes fromByte..toByte
+// (inclusive; to the end when toByte < 0).
+func carScopeQuery(fromByte, toByte int64) string {
 	if fromByte < 0 {
 		return "dag-scope=all"
 	}
-	return fmt.Sprintf("dag-scope=entity&entity-bytes=%d:*", fromByte)
+	if toByte < 0 {
+		return fmt.Sprintf("dag-scope=entity&entity-bytes=%d:*", fromByte)
+	}
+	return fmt.Sprintf("dag-scope=entity&entity-bytes=%d:%d", fromByte, toByte)
 }
 
+// byteRange is an inclusive span of a file's bytes.
+type byteRange struct{ from, to int64 }
+
+// gatewayRunGap and gatewayMaxRanges shape a leaf resume: runs of missing leaves closer than gatewayRunGap are asked
+// for as one range (a few present leaves re-sent cost less than another request's round trips), and at most
+// gatewayMaxRanges requests are made — past that the closest ranges merge — so a file with thousands of scattered
+// holes costs a handful of requests, never thousands.
+const (
+	gatewayRunGap    = 1 << 20
+	gatewayMaxRanges = 8
+)
+
+// gatewayRanges turns the missing spans of a file (sorted by offset, not overlapping) into the ranges to ask a
+// gateway for. Asking from the first missing byte to the end re-sent everything after it: 545 MB from Pinata for 37
+// leaves on the replication.
+func gatewayRanges(missing []byteRange) []byteRange {
+	var out []byteRange
+	for _, m := range missing {
+		if n := len(out); n > 0 && m.from-out[n-1].to-1 <= gatewayRunGap {
+			out[n-1].to = max(out[n-1].to, m.to)
+			continue
+		}
+		out = append(out, m)
+	}
+	for len(out) > gatewayMaxRanges { // merge the closest neighbours until the request count fits
+		best := 0
+		for i := 1; i < len(out)-1; i++ {
+			if out[i+1].from-out[i].to < out[best+1].from-out[best].to {
+				best = i
+			}
+		}
+		out[best].to = out[best+1].to
+		out = append(out[:best+1], out[best+2:]...)
+	}
+	return out
+}
+
+// streamCarCandidate imports the winning candidate's CAR: its already-verified first block, then the rest, each block
+// CID-verified (trustless), under a stall watchdog (no bytes for stallTimeout → abort so the outer loop retries).
 func (n *node) streamCarCandidate(c *carCandidate, root cid.Cid, onRead func(read, total int64)) error {
 	sctx, scancel := context.WithCancel(context.Background())
 	defer scancel()

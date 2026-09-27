@@ -154,9 +154,23 @@ func (n *node) isFriend(p peer.ID) bool {
 	return false
 }
 
-// lanPeers: peers found on our own network (mDNS).
-func (n *node) noteLanPeer(p peer.ID)    { n.lanPeers.Store(p, struct{}{}) }
-func (n *node) isLanPeer(p peer.ID) bool { _, ok := n.lanPeers.Load(p); return ok }
+// lanPeers: peers found on our own network (mDNS, re-announced while they stay) or connected to by address, for as
+// long as the peerstore keeps the addresses mDNS found. A laptop that left the network (or a benchmark peer) is a
+// stranger again after that: its private addresses are not dialed across the internet, its dials take the budget.
+const lanPeerTTL = time.Hour
+
+func (n *node) noteLanPeer(p peer.ID) { n.lanPeers.Store(p, time.Now().Add(lanPeerTTL)) }
+func (n *node) isLanPeer(p peer.ID) bool {
+	v, ok := n.lanPeers.Load(p)
+	if !ok {
+		return false
+	}
+	if time.Now().After(v.(time.Time)) {
+		n.lanPeers.Delete(p)
+		return false
+	}
+	return true
+}
 
 // wantedProviders: providers a fetch found, for a while — dialing them is what the user is waiting on.
 const wantedProviderTTL = 2 * time.Minute

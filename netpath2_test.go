@@ -10,9 +10,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -188,7 +190,13 @@ func TestGatewayProgressUsesExpectedSizeWhenNoContentLength(t *testing.T) {
 
 	var maxPct float64
 	var pmu sync.Mutex
-	onP := func(pct float64) { pmu.Lock(); if pct > maxPct { maxPct = pct }; pmu.Unlock() }
+	onP := func(pct float64) {
+		pmu.Lock()
+		if pct > maxPct {
+			maxPct = pct
+		}
+		pmu.Unlock()
+	}
 
 	nctx, ncancel := context.WithTimeout(ctx, 3*time.Second)
 	defer ncancel()
@@ -290,8 +298,8 @@ func TestWriteThroughResumesMissingLeavesOverTheGatewayWhenBitswapStalls(t *test
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(q, "dag-scope=entity") || !strings.Contains(q, "entity-bytes=0:*") {
-		t.Fatalf("the resume must ask for the entity's bytes from the first missing leaf on; query was %q", q)
+	if want := "entity-bytes=0:" + strconv.Itoa(len(payload)-1); !strings.Contains(q, "dag-scope=entity") || !strings.Contains(q, want) {
+		t.Fatalf("the resume must ask for the entity's missing bytes (%s); query was %q", want, q)
 	}
 }
 
@@ -315,7 +323,7 @@ func TestGatewayBytesCountOnTheGlobalSpeedometer(t *testing.T) {
 	trustlessGateways = []string{gw.URL}
 	defer func() { trustlessGateways = orig }()
 
-	if err := n.fetchViaGateway(ctx, pn.Cid(), -1, nil); err != nil {
+	if err := n.fetchViaGateway(ctx, pn.Cid(), -1, -1, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The counter's totals are flow meters swept once a second — read until the sweep lands, bounded.
@@ -437,8 +445,109 @@ func TestGatewayLeafResumeAsksFromTheFirstMissingLeaf(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if want := "entity-bytes=" + strconv.FormatInt(chunkSize, 10) + ":*"; !strings.Contains(q, want) {
-		t.Fatalf("resume must start at the first MISSING leaf (%s); query was %q", want, q)
+	if want := "entity-bytes=" + strconv.FormatInt(chunkSize, 10) + ":" + strconv.Itoa(len(payload)-1); !strings.Contains(q, want) {
+		t.Fatalf("resume must ask for exactly the MISSING leaves (%s); query was %q", want, q)
+	}
+}
+
+// A partial with two far-apart holes resumes with one request per hole, each for exactly that leaf's bytes. Teeth:
+// fetch only the first range in writeThrough's loop and the second hole is never asked for (the file still completes
+// here only because this fake gateway sends the whole CAR for any range).
+func TestGatewayLeafResumeAsksForEachHole(t *testing.T) {
+	n := offlineNode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	payload, root, rootNode, carBytes, leaves := scratchLeafDAGWithLeaves(t, ctx, 16*int(chunkSize))
+	var mu sync.Mutex
+	var queries []string
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		queries = append(queries, r.URL.RawQuery)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/vnd.ipld.car")
+		w.Header().Set("Content-Length", strconv.Itoa(len(carBytes)))
+		_, _ = w.Write(carBytes)
+	}))
+	defer gw.Close()
+	resumeFixture(t, n, ctx, rootNode, gw.URL)
+
+	dest := t.TempDir() + "/out.bin"
+	tmp, err := os.Create(tmpPath(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Truncate(int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	bits := newPartBits(root.String(), int64(len(payload)), len(leaves))
+	for i := range leaves { // every leaf on disk but 1 and 14
+		if i == 1 || i == 14 {
+			continue
+		}
+		off := int64(i) * chunkSize
+		if _, err := tmp.WriteAt(payload[off:off+chunkSize], off); err != nil {
+			t.Fatal(err)
+		}
+		bits.set(i)
+	}
+	_ = tmp.Close()
+	if err := savePart(dest, bits); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.writeThrough(ctx, root, rootNode, dest, root.String(), nil, nil); err != nil {
+		t.Fatalf("resume must complete: %v", err)
+	}
+	if got, rerr := os.ReadFile(dest); rerr != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("materialized bytes differ from the payload (err=%v)", rerr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var asked []string
+	for _, q := range queries {
+		if i := strings.Index(q, "entity-bytes="); i >= 0 {
+			asked = append(asked, q[i:])
+		}
+	}
+	want := []string{
+		fmt.Sprintf("entity-bytes=%d:%d", 1*chunkSize, 2*chunkSize-1),
+		fmt.Sprintf("entity-bytes=%d:%d", 14*chunkSize, 15*chunkSize-1),
+	}
+	if !slices.Equal(asked, want) {
+		t.Fatalf("resume asked %v, want %v", asked, want)
+	}
+}
+
+// The resume asks for the runs of missing leaves, not everything from the first one on (545 MB from Pinata for 37
+// leaves on the replication): runs closer than gatewayRunGap merge, and past gatewayMaxRanges the closest ranges merge
+// so scattered holes cost a handful of requests. Teeth: return one range from the first missing byte to the last
+// and the far-apart holes come back as one; drop the gap merge and the near runs stay apart; drop the cap and
+// scattered holes come back as one range each.
+func TestGatewayRangesAskForTheMissingRunsOnly(t *testing.T) {
+	const L = int64(chunkSize)
+	leaf := func(i int64) byteRange { return byteRange{i * L, (i+1)*L - 1} }
+	// Dino Crisis: runs at 224–225 and 320, one far leaf at 2155 (the file is 2301 leaves).
+	got := gatewayRanges([]byteRange{leaf(224), leaf(225), leaf(320), leaf(2155)})
+	want := []byteRange{{224 * L, 226*L - 1}, {320 * L, 321*L - 1}, {2155 * L, 2156*L - 1}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("far-apart runs: got %v want %v", got, want)
+	}
+	// Two leaves apart (512 KiB): one range, the present leaves in between re-sent.
+	if got := gatewayRanges([]byteRange{leaf(10), leaf(13)}); !slices.Equal(got, []byteRange{{10 * L, 14*L - 1}}) {
+		t.Fatalf("near runs: got %v", got)
+	}
+	// 100 holes, 10 leaves apart each: at most gatewayMaxRanges requests, still covering every hole.
+	var holes []byteRange
+	for i := int64(0); i < 100; i++ {
+		holes = append(holes, leaf(i*10))
+	}
+	got = gatewayRanges(holes)
+	if len(got) > gatewayMaxRanges {
+		t.Fatalf("%d ranges for scattered holes, want at most %d", len(got), gatewayMaxRanges)
+	}
+	for _, h := range holes {
+		if !slices.ContainsFunc(got, func(r byteRange) bool { return r.from <= h.from && h.to <= r.to }) {
+			t.Fatalf("hole %v not covered by %v", h, got)
+		}
 	}
 }
 
@@ -528,7 +637,7 @@ func TestHedgeLosersAreCancelledAtCommitNotAtStreamEnd(t *testing.T) {
 	defer func() { trustlessGateways, gatewayHedgeDelay = origGWs, origHedge }()
 
 	start := time.Now()
-	if err := n.fetchViaGateway(ctx, pn.Cid(), -1, nil); err != nil {
+	if err := n.fetchViaGateway(ctx, pn.Cid(), -1, -1, nil); err != nil {
 		t.Fatal(err)
 	}
 	end := time.Now()
@@ -559,7 +668,7 @@ func TestAGatewayThatNeverAnswersCostsAtMostTheHeaderTimeout(t *testing.T) {
 	trustlessGateways, gatewayHeaderTimeout = []string{hang.URL}, 300*time.Millisecond
 	defer func() { trustlessGateways, gatewayHeaderTimeout = origGWs, origHdr }()
 	start := time.Now()
-	err := n.fetchViaGateway(ctx, pn.Cid(), -1, nil)
+	err := n.fetchViaGateway(ctx, pn.Cid(), -1, -1, nil)
 	el := time.Since(start)
 	if err == nil {
 		t.Fatal("a route that never answers must fail")
@@ -596,7 +705,7 @@ func TestARedirectChainCannotMultiplyTheHeaderTimeout(t *testing.T) {
 	trustlessGateways, gatewayHeaderTimeout, gatewayHedgeDelay = []string{srv.URL}, 400*time.Millisecond, time.Hour
 	defer func() { trustlessGateways, gatewayHeaderTimeout, gatewayHedgeDelay = origGWs, origHdr, origHedge }()
 	start := time.Now()
-	err := n.fetchViaGateway(context.Background(), pn.Cid(), -1, nil)
+	err := n.fetchViaGateway(context.Background(), pn.Cid(), -1, -1, nil)
 	el := time.Since(start)
 	if err == nil {
 		t.Fatal("the chain never serves: the fetch must fail")

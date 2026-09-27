@@ -263,7 +263,7 @@ func TestGatewayFetchHedgesAndCommitsOnlyToAVerifiedFirstBlock(t *testing.T) {
 	defer func() { trustlessGateways, gatewayHedgeDelay = origGWs, origHedge }()
 
 	start := time.Now()
-	err = n.fetchViaGateway(ctx, blk.Cid(), -1, nil)
+	err = n.fetchViaGateway(ctx, blk.Cid(), -1, -1, nil)
 	el := time.Since(start)
 	if err != nil {
 		t.Fatalf("the hedged fetch must succeed via the good route, got: %v", err)

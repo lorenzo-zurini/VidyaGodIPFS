@@ -6,9 +6,9 @@ func TestLibp2pDirectDecodesLocally(t *testing.T) {
 	// Forge names decode to the IP in the leading label — ZERO DNS. Real observed names + go-libp2p's own test vector.
 	ok := map[string]string{
 		"31-204-136-139.k51qzi5uqu5dhqqipontlec6lapd61yde1hb46dluro3l5bo6nsexnkpaygmcg.libp2p.direct": "31.204.136.139",
-		"192-0-2-1.k51qzi5uqu5dgutdk6i1ynyzgkqngpha5xpgia3a5qqp4jsh0u4csozksxel3r.libp2p.direct":       "192.0.2.1",
-		"31-204-136-139.k51.libp2p.direct.":                                                            "31.204.136.139", // trailing root dot
-		"2001-db8--1.somepeer.libp2p.direct":                                                           "2001:db8::1",    // IPv6 (':' as '-')
+		"192-0-2-1.k51qzi5uqu5dgutdk6i1ynyzgkqngpha5xpgia3a5qqp4jsh0u4csozksxel3r.libp2p.direct":      "192.0.2.1",
+		"31-204-136-139.k51.libp2p.direct.":  "31.204.136.139", // trailing root dot
+		"2001-db8--1.somepeer.libp2p.direct": "2001:db8::1",    // IPv6 (':' as '-')
 	}
 	for name, want := range ok {
 		ip, got := libp2pDirectIP(name)

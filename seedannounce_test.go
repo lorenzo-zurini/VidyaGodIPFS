@@ -17,9 +17,9 @@ func TestUnlistedIsContentInPinOrder(t *testing.T) {
 		}
 		return c
 	}
-	file := mk("QmPHyCZfwPaf8emAPEUsGeZwesgncCmmFkvLP4AQ9WZtBT")             // dag-pb
-	raw := mk("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")   // raw: content…
-	node := mk("bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am")  // …and a listed node block, also raw
+	file := mk("QmPHyCZfwPaf8emAPEUsGeZwesgncCmmFkvLP4AQ9WZtBT")                // dag-pb
+	raw := mk("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")    // raw: content…
+	node := mk("bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am")   // …and a listed node block, also raw
 	folder := mk("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi") // a listed package folder
 	listed := map[string]struct{}{node.String(): {}, folder.String(): {}}
 

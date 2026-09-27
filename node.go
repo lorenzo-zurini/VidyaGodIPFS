@@ -59,17 +59,18 @@ type node struct {
 	bserv         blockservice.BlockService
 	dserv         ipld.DAGService
 	localDserv    ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
+	madeDirs      sync.Map        // folder CID → struct{}: folders makeDir built, each entry verified whole (blocks.go)
 	pinner        ipfspinner.Pinner
 	serveFails    *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
 
 	// network (M3) — nil/false until goOnline succeeds
-	online   bool
-	host     host.Host
-	dht      *dht.IpfsDHT
-	exchange exchange.Interface
-	provider  keyProvider               // announces what we hold (provide.go), through netq
-	provideSt provideState
-	lanPeers   sync.Map // peer.ID → struct{}: found on our LAN (mDNS) — netgate.go
+	online     bool
+	host       host.Host
+	dht        *dht.IpfsDHT
+	exchange   exchange.Interface
+	provider   keyProvider // announces what we hold (provide.go), through netq
+	provideSt  provideState
+	lanPeers   sync.Map // peer.ID → expiry: found on our LAN (mDNS) or connected to by address — netgate.go
 	wantedProv sync.Map // peer.ID → expiry: providers a fetch found — netgate.go
 
 	// IPNS (ipns.go): the peer's Ed25519 identity key (also the friend code) signs a tiny mutable record pointing
@@ -80,8 +81,8 @@ type node struct {
 	ns          namesys.NameSystem
 	ipnsMu      sync.Mutex
 	ipnsCurrent string
-	mdns     interface{ Close() error } // local-network discovery service (mDNS)
-	bwc      *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
+	mdns        interface{ Close() error } // local-network discovery service (mDNS)
+	bwc         *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
 
 	// friends / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
 	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.

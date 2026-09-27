@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	filestore "github.com/ipfs/boxo/filestore"
@@ -152,12 +153,18 @@ func (n *node) hasLocal(c cid.Cid) bool {
 	return err == nil && has
 }
 
+// wholeWalks counts heldWhole walks (a test reads it: publishing must not walk the same content again and again).
+var wholeWalks atomic.Int64
+
 // heldWhole: every block of c's DAG is held here and every file a block is referenced into is present — what a
 // recursive pin of c claims, and what serving it needs. hasLocal answers for the top block only: a file whose leaves
-// are partly missing (an interrupted fetch) or whose backing file moved still "has" its root. Reads only the dag-pb
-// interior (small); a leaf is checked by Has, each distinct backing file by one stat (cidMissing) — nothing re-hashed.
+// are partly missing (an interrupted fetch) or whose backing file moved still "has" its root. ONE walk: reads only the
+// dag-pb interior (small); a leaf is checked by Has, and, referenced into a file, that file by one stat per distinct
+// path — nothing re-hashed.
 func (n *node) heldWhole(c cid.Cid) error {
+	wholeWalks.Add(1)
 	seen := cid.NewSet()
+	present := map[string]bool{} // backing path → exists (a large file's thousands of leaves share one path)
 	var walk func(c cid.Cid) error
 	walk = func(c cid.Cid) error {
 		if !seen.Visit(c) {
@@ -167,6 +174,18 @@ func (n *node) heldWhole(c cid.Cid) error {
 			return fmt.Errorf("%s is not held", c)
 		}
 		if c.Prefix().Codec == cid.Raw {
+			if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
+				p := filepath.Join("/", res.FilePath) // relative to the FileManager root ("/", see node.go)
+				ok, done := present[p]
+				if !done {
+					_, err := os.Stat(p)
+					ok = err == nil
+					present[p] = ok
+				}
+				if !ok {
+					return fmt.Errorf("%s: the file it is referenced into (%s) is gone", c, p)
+				}
+			}
 			return nil
 		}
 		nd, err := n.localDserv.Get(n.ctx, c)
@@ -180,13 +199,7 @@ func (n *node) heldWhole(c cid.Cid) error {
 		}
 		return nil
 	}
-	if err := walk(c); err != nil {
-		return err
-	}
-	if n.cidMissing(c) {
-		return fmt.Errorf("%s: a file it is referenced into is gone", c)
-	}
-	return nil
+	return walk(c)
 }
 
 // cidMissing reports whether content the node believes it holds (via filestore references) is actually un-serveable

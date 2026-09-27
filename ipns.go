@@ -93,6 +93,7 @@ func (n *node) ipnsRecordSeq(nameStr string, seq uint64) {
 		}
 	}
 }
+
 // ipnsAcceptSeq enforces monotonicity: accept iff seq >= the highest seen for this name, then record the new high-water.
 func (n *node) ipnsAcceptSeq(nameStr string, seq uint64) bool {
 	if seq < n.ipnsSeenSeq(nameStr) {

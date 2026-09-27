@@ -100,46 +100,67 @@ func (n *node) blockGet(c cid.Cid) ([]byte, error) {
 // pinned. That walk was also the only completeness check, so each child is checked whole first (heldWhole: every
 // block held, every backing file present — without re-reading the bytes); a child that is not is refused.
 func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
+	c, _, err := n.makeWholeDir(entries, false)
+	return c, err
+}
+
+// makeWholeDir is makeDir that, with leaveOut, builds the folder of the entries held whole and names the rest instead
+// of refusing — so a caller choosing what to include does not check each entry first (a second walk of every DAG).
+// When no entry is whole it makes no folder (cid.Undef, no error).
+func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, []string, error) {
 	d, err := ufsio.NewDirectory(n.dserv)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, nil, err
 	}
 	names := make([]string, 0, len(entries))
 	for name := range entries {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var notWhole []string
 	for _, name := range names {
 		c, err := cid.Decode(entries[name])
 		if err != nil {
-			return cid.Undef, fmt.Errorf("entry %q: %w", name, err)
+			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
 		// The folder is pinned recursively WITHOUT walking it (below), so each entry must be whole here first: a pin
 		// over a partly-held entry is a package "pinned" and published that no one — nor a pinning service — can get.
-		if err := n.heldWhole(c); err != nil {
-			return cid.Undef, fmt.Errorf("entry %q: not held whole — %w", name, err)
+		// A folder this node made is whole already (each of its entries was checked as it was made): a pin folder
+		// nesting a package's content folder walked all of that content again.
+		if _, made := n.madeDirs.Load(c.String()); !made || !n.hasLocal(c) {
+			if err := n.heldWhole(c); err != nil {
+				if leaveOut {
+					notWhole = append(notWhole, name)
+					continue
+				}
+				return cid.Undef, nil, fmt.Errorf("entry %q: not held whole — %w", name, err)
+			}
 		}
 		var child ipld.Node
 		if child, err = n.dserv.Get(n.ctx, c); err != nil {
-			return cid.Undef, fmt.Errorf("entry %q: %w", name, err)
+			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
 		if err := d.AddChild(n.ctx, name, child); err != nil {
-			return cid.Undef, fmt.Errorf("entry %q: %w", name, err)
+			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
+	}
+	if leaveOut && len(notWhole) > 0 && len(notWhole) == len(entries) {
+		return cid.Undef, notWhole, nil
 	}
 	dn, err := d.GetNode()
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, nil, err
 	}
 	if err := n.dserv.Add(n.ctx, dn); err != nil {
-		return cid.Undef, err
+		return cid.Undef, nil, err
 	}
 	if err := n.pinner.PinWithMode(n.ctx, dn.Cid(), ipfspinner.Recursive, ""); err != nil {
-		return cid.Undef, err
+		return cid.Undef, nil, err
 	}
 	if err := n.pinner.Flush(n.ctx); err != nil {
-		return cid.Undef, err
+		return cid.Undef, nil, err
 	}
+	n.madeDirs.Store(dn.Cid().String(), struct{}{})
 	n.announceNow(dn.Cid())
-	return dn.Cid(), nil
+	return dn.Cid(), notWhole, nil
 }

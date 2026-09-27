@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync/atomic"
@@ -8,6 +9,9 @@ import (
 	"time"
 
 	cid "github.com/ipfs/go-cid"
+	datastore "github.com/ipfs/go-datastore"
+	dsq "github.com/ipfs/go-datastore/query"
+	dssync "github.com/ipfs/go-datastore/sync"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 	stats "github.com/libp2p/go-libp2p-kad-dht/provider/stats"
 	peer "github.com/libp2p/go-libp2p/core/peer"
@@ -306,12 +310,20 @@ func TestNetQueueKeepsASlotForFetches(t *testing.T) {
 
 // fakeProvider stands in for the sweeping provider: online or not, and what it was handed.
 type fakeProvider struct {
-	online bool
-	handed []mh.Multihash
+	online    bool
+	handed    []mh.Multihash
+	forced    []mh.Multihash // … of which handed with force
+	dropsOnce bool           // goes offline during the next hand-over (after the readiness reading)
 }
 
-func (f *fakeProvider) StartProviding(_ bool, keys ...mh.Multihash) error {
+func (f *fakeProvider) StartProviding(force bool, keys ...mh.Multihash) error {
 	f.handed = append(f.handed, keys...)
+	if force {
+		f.forced = append(f.forced, keys...)
+	}
+	if f.dropsOnce {
+		f.online, f.dropsOnce = false, false
+	}
 	return nil // like the real one offline: no error, whether it queued them or not
 }
 func (f *fakeProvider) StopProviding(...mh.Multihash) error { return nil }
@@ -346,5 +358,73 @@ func TestProvidingWaitsUntilTheProviderIsOnline(t *testing.T) {
 	n.flushProvides()
 	if len(fp.handed) != 1 || len(n.provideSt.pending) != 0 {
 		t.Fatalf("online: handed %d, pending %d — the key must go over", len(fp.handed), len(n.provideSt.pending))
+	}
+}
+
+// While a download runs — here a multi-wave job holding the foreground between its fetches, when no fetch holds or
+// waits for a slot — background work gets one slot, not all but one: at every wave boundary the walks took the rest
+// and the next wave waited behind them. Released, background may use all but one again; compaction (waitFgIdle)
+// waits for the release. Teeth: ignore holds in fgBusyLocked and the second background job gets a slot mid-download.
+func TestNetQueueGivesBackgroundOneSlotWhileADownloadRuns(t *testing.T) {
+	withQueue(t, 3)
+	release := netq.hold()
+	if fgIdleNow() {
+		t.Fatal("a held foreground reads as idle: compaction would run between the waves")
+	}
+	b1, c1 := acquired(false)
+	defer c1()
+	r1 := waitGot(t, b1, "the first background job")
+	defer r1()
+	b2, c2 := acquired(false)
+	defer c2()
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-b2:
+		t.Fatal("a second background job got a slot while a download runs")
+	default:
+	}
+	release()
+	r2 := waitGot(t, b2, "the second background job, once the download is over")
+	r2()
+	if !fgIdleNow() {
+		t.Fatal("the released foreground still reads as busy")
+	}
+}
+
+// The provider goes offline between the readiness reading and the hand-over: it files the key without announcing it,
+// silently, and the key is "not new" ever after. The key stays ours, handed over again FORCED once the provider is
+// back — also by the next run, if this one ends first. Teeth: skip the fresh readiness read after the hand-over and
+// the key is dropped as announced; hand it over again without force and the provider ignores it.
+func TestAKeyFiledWhileTheProviderDroppedIsHandedOverAgainForced(t *testing.T) {
+	saved := providerReadyTTL
+	providerReadyTTL = time.Hour // the reading before the hand-over is a cached one, as in production
+	defer func() { providerReadyTTL = saved }()
+	fp := &fakeProvider{online: true, dropsOnce: true}
+	ds := dssync.MutexWrap(datastore.NewMapDatastore())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := &node{seedDone: map[string]struct{}{}, provider: fp, ds: ds, ctx: ctx}
+	n.provideSt.started = true
+	n.startProviding(gateCid)
+	if len(n.provideSt.pending) != 1 || !n.provideSt.pending[string(gateCid.Hash())].force {
+		t.Fatalf("filed while offline: pending %v — the key must stay ours, marked forced", n.provideSt.pending)
+	}
+	// A new run over the same datastore offers it again, forced.
+	fp2 := &fakeProvider{online: true}
+	n2 := &node{seedDone: map[string]struct{}{}, provider: fp2, ds: ds, ctx: ctx}
+	n2.provideSt.started = true
+	n2.restoreRefiles()
+	if len(fp2.forced) != 1 || !bytes.Equal(fp2.forced[0], gateCid.Hash()) {
+		t.Fatalf("the next run handed over forced: %v", fp2.forced)
+	}
+	if len(n2.provideSt.pending) != 0 {
+		t.Fatalf("announced, still pending: %v", n2.provideSt.pending)
+	}
+	res, err := ds.Query(ctx, dsq.Query{Prefix: refileNS.String(), KeysOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := res.Rest(); len(left) != 0 {
+		t.Fatalf("an announced key is still remembered as filed: %v", left)
 	}
 }

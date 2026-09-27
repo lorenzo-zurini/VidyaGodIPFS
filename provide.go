@@ -23,6 +23,7 @@ import (
 	cid "github.com/ipfs/go-cid"
 	dstore "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/namespace"
+	dsq "github.com/ipfs/go-datastore/query"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 	dhtprov "github.com/libp2p/go-libp2p-kad-dht/provider"
@@ -120,11 +121,20 @@ type keyProvider interface {
 // offline delay), kept and handed over once it is online.
 type provideState struct {
 	mu        sync.Mutex
-	pending   map[string]mh.Multihash
+	pending   map[string]pendingKey
 	started   bool
 	ready     bool      // the provider was online at checkedAt
 	checkedAt time.Time // when ready was last read (Stats counts the keystore: not on every call)
 }
+
+// pendingKey: a key to hand over; force when the provider may have filed it already without announcing it.
+type pendingKey struct {
+	h     mh.Multihash
+	force bool
+}
+
+// refileNS: keys the provider may have filed without announcing, kept across restarts until announced (force).
+var refileNS = dstore.NewKey("/vg/provide-refile")
 
 // providerReadyTTL: how long a readiness reading stands. A var so tests can make every call re-read it.
 var providerReadyTTL = 5 * time.Second
@@ -141,6 +151,11 @@ func (n *node) providerReady(sp keyProvider) bool {
 		return r
 	}
 	n.provideSt.mu.Unlock()
+	return n.providerReadyNow(sp)
+}
+
+// providerReadyNow reads readiness afresh (and stores the reading for providerReady).
+func (n *node) providerReadyNow(sp keyProvider) bool {
 	st, err := sp.Stats(n.ctx)
 	ready := err == nil && !st.Closed && st.Schedule.AvgPrefixLength >= 0
 	n.provideSt.mu.Lock()
@@ -162,12 +177,23 @@ func (n *node) startProviding(cids ...cid.Cid) {
 		}
 	}
 	n.seedMu.Unlock()
+	keys := make([]pendingKey, 0, len(cids))
+	for _, c := range cids {
+		keys = append(keys, pendingKey{h: c.Hash()})
+	}
+	n.offerProvides(keys)
+}
+
+// offerProvides adds keys to the pending set (a force mark sticks), hands them over if it can, and starts the retry
+// loop once.
+func (n *node) offerProvides(keys []pendingKey) {
 	n.provideSt.mu.Lock()
 	if n.provideSt.pending == nil {
-		n.provideSt.pending = map[string]mh.Multihash{}
+		n.provideSt.pending = map[string]pendingKey{}
 	}
-	for _, c := range cids {
-		n.provideSt.pending[string(c.Hash())] = c.Hash()
+	for _, k := range keys {
+		k.force = k.force || n.provideSt.pending[string(k.h)].force
+		n.provideSt.pending[string(k.h)] = k
 	}
 	start := !n.provideSt.started
 	n.provideSt.started = true
@@ -178,6 +204,50 @@ func (n *node) startProviding(cids ...cid.Cid) {
 	}
 }
 
+// restoreRefiles offers again, forced, the keys a previous run's provider may have filed without announcing.
+func (n *node) restoreRefiles() {
+	if n.ds == nil {
+		return
+	}
+	res, err := n.ds.Query(n.ctx, dsq.Query{Prefix: refileNS.String(), KeysOnly: true})
+	if err != nil {
+		return
+	}
+	var keys []pendingKey
+	for r := range res.Next() {
+		if r.Error != nil {
+			break
+		}
+		if h, err := mh.FromB58String(dstore.RawKey(r.Key).BaseNamespace()); err == nil {
+			keys = append(keys, pendingKey{h: h, force: true})
+		}
+	}
+	_ = res.Close()
+	if len(keys) > 0 {
+		n.offerProvides(keys)
+	}
+}
+
+// setRefiled records (or clears) keys the provider may have filed without announcing, across restarts.
+func (n *node) setRefiled(keys []mh.Multihash, filed bool) {
+	if n.ds == nil || len(keys) == 0 {
+		return
+	}
+	b, err := n.ds.Batch(n.ctx)
+	if err != nil {
+		return
+	}
+	for _, h := range keys {
+		k := refileNS.ChildString(h.B58String())
+		if filed {
+			_ = b.Put(n.ctx, k, nil)
+		} else {
+			_ = b.Delete(n.ctx, k)
+		}
+	}
+	_ = b.Commit(n.ctx)
+}
+
 // flushProvides hands the pending keys to the provider once it is online; until then they stay pending.
 func (n *node) flushProvides() {
 	sp := n.provider
@@ -185,22 +255,43 @@ func (n *node) flushProvides() {
 		return
 	}
 	n.provideSt.mu.Lock()
-	keys := make([]mh.Multihash, 0, len(n.provideSt.pending))
+	var fresh, forced []mh.Multihash
 	for _, k := range n.provideSt.pending {
-		keys = append(keys, k)
+		if k.force {
+			forced = append(forced, k.h)
+		} else {
+			fresh = append(fresh, k.h)
+		}
 	}
 	n.provideSt.mu.Unlock()
-	if len(keys) == 0 || !n.providerReady(sp) {
+	if len(fresh)+len(forced) == 0 || !n.providerReady(sp) {
 		return // nothing to hand over, or the provider would only file them — the retry loop offers them again
 	}
-	if err := sp.StartProviding(false, keys...); err != nil {
+	if len(fresh) > 0 && sp.StartProviding(false, fresh...) != nil {
 		return // closed
 	}
+	if len(forced) > 0 && sp.StartProviding(true, forced...) != nil {
+		return
+	}
+	all := append(fresh, forced...)
+	// The readiness reading may be seconds old: a provider that went offline since files the keys WITHOUT announcing
+	// them (and says nothing), and a filed key is "not new" ever after — it waited for its region's reprovide, up to
+	// 22 h. Read it afresh: offline now, they stay ours, to be handed over again FORCED, remembered across restarts.
+	if !n.providerReadyNow(sp) {
+		n.provideSt.mu.Lock()
+		for _, h := range all {
+			n.provideSt.pending[string(h)] = pendingKey{h: h, force: true}
+		}
+		n.provideSt.mu.Unlock()
+		n.setRefiled(all, true)
+		return
+	}
 	n.provideSt.mu.Lock()
-	for _, k := range keys {
-		delete(n.provideSt.pending, string(k))
+	for _, h := range all {
+		delete(n.provideSt.pending, string(h))
 	}
 	n.provideSt.mu.Unlock()
+	n.setRefiled(forced, false)
 }
 
 func (n *node) provideRetryLoop() {
@@ -228,6 +319,7 @@ func (n *node) stopProviding(cids ...cid.Cid) {
 		for _, c := range cids {
 			keys = append(keys, c.Hash())
 		}
+		n.setRefiled(keys, false)
 		if err := sp.StopProviding(keys...); err != nil {
 			fmt.Fprintf(os.Stderr, "[provide] stop providing %d key(s): %v\n", len(keys), err)
 		}
