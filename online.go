@@ -319,6 +319,7 @@ func (n *node) goOnline() error {
 	}
 	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
 	safeGo("node.netStats", func() { n.logNetStats(n.ctx) })
+	startPprof()
 	for _, a := range h.Addrs() {
 		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
 	}

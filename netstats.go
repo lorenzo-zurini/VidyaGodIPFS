@@ -79,6 +79,9 @@ func (n *node) logNetStats(ctx context.Context) {
 			if activeDialTracer != nil {
 				fmt.Fprintln(os.Stderr, "[net] outbound dials by caller:"+activeDialTracer.drain())
 			}
+			if memTrace {
+				fmt.Fprintln(os.Stderr, memLine())
+			}
 			prev = cur
 		}
 	}

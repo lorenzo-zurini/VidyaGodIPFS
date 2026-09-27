@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -485,4 +486,16 @@ func refiles(t *testing.T, ds datastore.Datastore) []dsq.Entry {
 	}
 	left, _ := res.Rest()
 	return left
+}
+
+// The [mem] line names both allocators, and the profiler never listens on a non-loopback address.
+func TestMemLineAndPprofGuard(t *testing.T) {
+	l := memLine()
+	for _, want := range []string{"go: heap in use", "c: in use"} {
+		if !strings.Contains(l, want) {
+			t.Fatalf("[mem] line %q lacks %q", l, want)
+		}
+	}
+	t.Setenv("VG_PPROF", "0.0.0.0:0")
+	startPprof() // must refuse: prints and returns without listening
 }
