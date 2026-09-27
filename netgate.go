@@ -6,14 +6,16 @@ package main
 // node's DHT walks reached ~40 dials/s and two nodes filled that table in seconds — "nf_conntrack: table full,
 // dropping packet", every device in the house offline.
 //
-// So every NEW outbound connection takes a token from one per-node bucket (dialRate/s, dialBurst) before it touches
-// the network, whichever subsystem asks. A friend, a peer found on our LAN, and a provider we are fetching from go
+// So every new outbound PEER DIAL takes a token from one per-node bucket (dialRate/s, dialBurst) before it touches the
+// network, whichever subsystem asks. (One dial may try a few of the peer's addresses and transports, so a token is a
+// few flows at most — the budget is in dials, the table in flows.) A friend, a peer found on our LAN, and a provider we are fetching from go
 // first (they are what the user is waiting on); a dial that cannot get a token within dialMaxWait is refused (the DHT
 // moves on to the next peer). An existing connection costs nothing — the gater is consulted only for a new one.
 //
 // And a remote peer's PRIVATE addresses (10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT, loopback, link-local, ULA) are
 // never dialed across the internet — they can't answer, and each attempt is a dead table entry for 60–120 s (Kubo's
-// "server" profile filters them for the same reason) — unless the peer is a friend or was found on our LAN (mDNS).
+// "server" profile filters them for the same reason) — unless the peer is a friend, was found on our LAN (mDNS), or
+// was named by address in an explicit connect.
 
 import (
 	"net"

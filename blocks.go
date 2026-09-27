@@ -81,10 +81,10 @@ func (n *node) blockGet(c cid.Cid) ([]byte, error) {
 // pins it recursively and announces it now. The children are linked, not copied: a folder of node files costs one
 // directory block. Names are added in sorted order, so the same entries always make the same folder.
 //
-// The pin is RECORDED, not walked (PinWithMode, no graph fetch): every child was checked held above, and a folder over
-// a package's content links gigabytes — pinner.Pin re-reads (and re-hashes, through the filestore) every block below
-// on every publish, even for a folder already pinned, and through a bitswap-backed DAG service it would wait on the
-// network for any block missing from a partly-held child.
+// The pin is RECORDED, not walked (PinWithMode): a folder over a package's content links gigabytes, and pinner.Pin
+// re-reads (and re-hashes, through the filestore) every block below on every publish, even for a folder already
+// pinned. That walk was also the only completeness check, so each child is checked whole first (heldWhole: every
+// block held, every backing file present — without re-reading the bytes); a child that is not is refused.
 func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 	d, err := ufsio.NewDirectory(n.dserv)
 	if err != nil {
@@ -100,8 +100,10 @@ func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 		if err != nil {
 			return cid.Undef, fmt.Errorf("entry %q: %w", name, err)
 		}
-		if !n.hasLocal(c) {
-			return cid.Undef, fmt.Errorf("entry %q: %s is not held locally — put it before linking it", name, c)
+		// The folder is pinned recursively WITHOUT walking it (below), so each entry must be whole here first: a pin
+		// over a partly-held entry is a package "pinned" and published that no one — nor a pinning service — can get.
+		if err := n.heldWhole(c); err != nil {
+			return cid.Undef, fmt.Errorf("entry %q: not held whole — %w", name, err)
 		}
 		var child ipld.Node
 		if child, err = n.dserv.Get(n.ctx, c); err != nil {

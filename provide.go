@@ -26,6 +26,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 	dhtprov "github.com/libp2p/go-libp2p-kad-dht/provider"
+	stats "github.com/libp2p/go-libp2p-kad-dht/provider/stats"
 	network "github.com/libp2p/go-libp2p/core/network"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	mh "github.com/multiformats/go-multihash"
@@ -107,11 +108,45 @@ func newSweepingProvider(ctx context.Context, kad *dht.IpfsDHT, ds dstore.Batchi
 	)
 }
 
-// provideState: keys handed to us before the provider could take them (offline, not yet bootstrapped), retried.
+// keyProvider: what the node uses of the sweeping provider (an interface: a test stands in for the DHT).
+type keyProvider interface {
+	StartProviding(force bool, keys ...mh.Multihash) error
+	StopProviding(keys ...mh.Multihash) error
+	Stats(ctx context.Context) (stats.Stats, error)
+	Close() error
+}
+
+// provideState: keys the provider cannot take yet (it is offline: not yet bootstrapped, or disconnected past its
+// offline delay), kept and handed over once it is online.
 type provideState struct {
-	mu      sync.Mutex
-	pending map[string]mh.Multihash
-	started bool
+	mu        sync.Mutex
+	pending   map[string]mh.Multihash
+	started   bool
+	ready     bool      // the provider was online at checkedAt
+	checkedAt time.Time // when ready was last read (Stats counts the keystore: not on every call)
+}
+
+// providerReadyTTL: how long a readiness reading stands. A var so tests can make every call re-read it.
+var providerReadyTTL = 5 * time.Second
+
+// providerReady reports whether the provider would queue keys now. StartProviding never says: offline it files a key
+// in its keystore and returns nil WITHOUT queueing it — and a later hand-over of that key is a no-op (no longer new),
+// so it waited for its region's next reprovide, up to 22 h (a CLI --publish-cid printed a CID nobody could find).
+// Offline is exactly "no network prefix measured yet", which Stats reports as a negative average prefix length.
+func (n *node) providerReady(sp keyProvider) bool {
+	n.provideSt.mu.Lock()
+	if !n.provideSt.checkedAt.IsZero() && time.Since(n.provideSt.checkedAt) < providerReadyTTL {
+		r := n.provideSt.ready
+		n.provideSt.mu.Unlock()
+		return r
+	}
+	n.provideSt.mu.Unlock()
+	st, err := sp.Stats(n.ctx)
+	ready := err == nil && !st.Closed && st.Schedule.AvgPrefixLength >= 0
+	n.provideSt.mu.Lock()
+	n.provideSt.ready, n.provideSt.checkedAt = ready, time.Now()
+	n.provideSt.mu.Unlock()
+	return ready
 }
 
 // startProviding hands keys to the sweeping provider: announced once if never announced, then reprovided on its
@@ -143,7 +178,7 @@ func (n *node) startProviding(cids ...cid.Cid) {
 	}
 }
 
-// flushProvides offers the pending keys to the provider; they stay pending if it refuses (offline).
+// flushProvides hands the pending keys to the provider once it is online; until then they stay pending.
 func (n *node) flushProvides() {
 	sp := n.provider
 	if sp == nil {
@@ -155,11 +190,11 @@ func (n *node) flushProvides() {
 		keys = append(keys, k)
 	}
 	n.provideSt.mu.Unlock()
-	if len(keys) == 0 {
-		return
+	if len(keys) == 0 || !n.providerReady(sp) {
+		return // nothing to hand over, or the provider would only file them — the retry loop offers them again
 	}
 	if err := sp.StartProviding(false, keys...); err != nil {
-		return // offline / not bootstrapped yet — the retry loop offers them again
+		return // closed
 	}
 	n.provideSt.mu.Lock()
 	for _, k := range keys {
@@ -169,7 +204,7 @@ func (n *node) flushProvides() {
 }
 
 func (n *node) provideRetryLoop() {
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(5 * time.Second) // cheap: nothing happens while nothing is pending
 	defer t.Stop()
 	for {
 		select {

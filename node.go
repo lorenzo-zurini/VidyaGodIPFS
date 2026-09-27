@@ -25,7 +25,6 @@ import (
 	namesys "github.com/ipfs/boxo/namesys"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
-	dhtprov "github.com/libp2p/go-libp2p-kad-dht/provider"
 	cid "github.com/ipfs/go-cid"
 	datastore "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
@@ -67,7 +66,7 @@ type node struct {
 	host     host.Host
 	dht      *dht.IpfsDHT
 	exchange exchange.Interface
-	provider  *dhtprov.SweepingProvider // announces what we hold (provide.go), through netq
+	provider  keyProvider               // announces what we hold (provide.go), through netq
 	provideSt provideState
 	lanPeers   sync.Map // peer.ID → struct{}: found on our LAN (mDNS) — netgate.go
 	wantedProv sync.Map // peer.ID → expiry: providers a fetch found — netgate.go

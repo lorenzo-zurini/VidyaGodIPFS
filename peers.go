@@ -88,6 +88,9 @@ func (n *node) connect(maddr string) error {
 	if err != nil {
 		return err
 	}
+	// Asked for by address: the peer is as close as the user says — a LAN / tunnel / loopback address of a stranger
+	// is not dialed otherwise (netgate.go), and an explicit connect is the direct-peering / benchmark path.
+	n.noteLanPeer(ai.ID)
 	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 	defer cancel()
 	return n.host.Connect(ctx, *ai)

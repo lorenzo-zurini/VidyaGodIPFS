@@ -152,6 +152,43 @@ func (n *node) hasLocal(c cid.Cid) bool {
 	return err == nil && has
 }
 
+// heldWhole: every block of c's DAG is held here and every file a block is referenced into is present — what a
+// recursive pin of c claims, and what serving it needs. hasLocal answers for the top block only: a file whose leaves
+// are partly missing (an interrupted fetch) or whose backing file moved still "has" its root. Reads only the dag-pb
+// interior (small); a leaf is checked by Has, each distinct backing file by one stat (cidMissing) — nothing re-hashed.
+func (n *node) heldWhole(c cid.Cid) error {
+	seen := cid.NewSet()
+	var walk func(c cid.Cid) error
+	walk = func(c cid.Cid) error {
+		if !seen.Visit(c) {
+			return nil
+		}
+		if !n.hasLocal(c) {
+			return fmt.Errorf("%s is not held", c)
+		}
+		if c.Prefix().Codec == cid.Raw {
+			return nil
+		}
+		nd, err := n.localDserv.Get(n.ctx, c)
+		if err != nil {
+			return err
+		}
+		for _, l := range nd.Links() {
+			if err := walk(l.Cid); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(c); err != nil {
+		return err
+	}
+	if n.cidMissing(c) {
+		return fmt.Errorf("%s: a file it is referenced into is gone", c)
+	}
+	return nil
+}
+
 // cidMissing reports whether content the node believes it holds (via filestore references) is actually un-serveable
 // because a backing file is gone. It walks the WHOLE reference chain, not just the first leaf: a file that moved
 // wholesale orphans every leaf together, but a PARTIALLY-broken reference (only some leaves' backing gone) would slip

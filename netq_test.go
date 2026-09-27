@@ -9,7 +9,9 @@ import (
 
 	cid "github.com/ipfs/go-cid"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
+	stats "github.com/libp2p/go-libp2p-kad-dht/provider/stats"
 	peer "github.com/libp2p/go-libp2p/core/peer"
+	mh "github.com/multiformats/go-multihash"
 )
 
 func withQueue(t *testing.T, slots int) {
@@ -246,4 +248,103 @@ func TestNetQueueForegroundIdle(t *testing.T) {
 		t.Fatal("releasing the last fetch must wake a waiter")
 	}
 	_ = fg
+}
+
+// Background work never holds the last slot: a walk keeps its slot for its whole duration, and at a closure's wave
+// boundary (no fetch holding or waiting for an instant) every slot went to walks — the next fetch waited behind them.
+// With one slot only, background may use it (else nothing would ever be announced). Teeth: drop the bgMax bound in
+// acquire or in grantLocked and the third background job gets the slot kept for fetches.
+func TestNetQueueKeepsASlotForFetches(t *testing.T) {
+	withQueue(t, 3)
+	b1, c1 := acquired(false)
+	defer c1()
+	b2, c2 := acquired(false)
+	defer c2()
+	r1, r2 := <-b1, <-b2
+	b3, c3 := acquired(false)
+	defer c3()
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-b3:
+		t.Fatal("a third background job took the slot kept for fetches")
+	default:
+	}
+	f, cf := acquired(true)
+	defer cf()
+	var rf func()
+	select {
+	case rf = <-f:
+	case <-time.After(time.Second):
+		t.Fatal("a fetch did not get the free slot at once")
+	}
+	rf() // the fetch's slot frees while background holds two: it stays free for the next fetch
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-b3:
+		t.Fatal("a released fetch slot went to a third background job")
+	default:
+	}
+	r1() // a background slot frees: the waiting background job may have it (still two background)
+	select {
+	case r3 := <-b3:
+		r3()
+	case <-time.After(time.Second):
+		t.Fatal("a freed background slot did not pass to the waiting background job")
+	}
+	r2()
+
+	withQueue(t, 1)
+	b, cb := acquired(false)
+	defer cb()
+	select {
+	case r := <-b:
+		r()
+	case <-time.After(time.Second):
+		t.Fatal("with a single slot, background must still get it")
+	}
+}
+
+// fakeProvider stands in for the sweeping provider: online or not, and what it was handed.
+type fakeProvider struct {
+	online bool
+	handed []mh.Multihash
+}
+
+func (f *fakeProvider) StartProviding(_ bool, keys ...mh.Multihash) error {
+	f.handed = append(f.handed, keys...)
+	return nil // like the real one offline: no error, whether it queued them or not
+}
+func (f *fakeProvider) StopProviding(...mh.Multihash) error { return nil }
+func (f *fakeProvider) Stats(context.Context) (stats.Stats, error) {
+	var s stats.Stats
+	s.Schedule.AvgPrefixLength = -1
+	if f.online {
+		s.Schedule.AvgPrefixLength = 7
+	}
+	return s, nil
+}
+func (f *fakeProvider) Close() error { return nil }
+
+// An offline provider files a handed key in its keystore WITHOUT queueing it (and says nothing), and a later hand-over
+// of that key is a no-op: it waited up to 22 h for its region's reprovide. So keys stay ours until the provider is
+// online, then go over. Teeth: drop the providerReady gate in flushProvides and the key is handed over while offline.
+func TestProvidingWaitsUntilTheProviderIsOnline(t *testing.T) {
+	saved := providerReadyTTL
+	providerReadyTTL = 0 // every call reads readiness afresh
+	defer func() { providerReadyTTL = saved }()
+	fp := &fakeProvider{}
+	n := &node{seedDone: map[string]struct{}{}, provider: fp}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n.ctx = ctx
+	n.provideSt.started = true // no background retry loop in this test: the flushes below are the loop's
+	n.startProviding(gateCid)
+	if len(fp.handed) != 0 || len(n.provideSt.pending) != 1 {
+		t.Fatalf("offline: handed %d, pending %d — the key must stay ours", len(fp.handed), len(n.provideSt.pending))
+	}
+	fp.online = true
+	n.flushProvides()
+	if len(fp.handed) != 1 || len(n.provideSt.pending) != 0 {
+		t.Fatalf("online: handed %d, pending %d — the key must go over", len(fp.handed), len(n.provideSt.pending))
+	}
 }

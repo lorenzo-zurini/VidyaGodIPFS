@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"errors"
 	"os"
 	"path/filepath"
@@ -113,5 +114,60 @@ func TestLandedFolderRefusesLinksAndSpecialFiles(t *testing.T) {
 	}
 	if err := checkLandedFolder(root); !errors.Is(err, errFolderRefused) {
 		t.Fatalf("fifo landed: %v", err)
+	}
+}
+
+// A package folder is pinned recursively without walking it, so each entry must be whole first: a file whose backing
+// file is gone, or one with a leaf missing, still "has" its root block — linking and pinning it recorded a package as
+// pinned that no one could fetch (a pinning service would wait on it forever). Teeth: check only the top block in
+// makeDir (hasLocal) and both are linked.
+func TestMakeDirRefusesAnEntryThatIsNotWhole(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	distinct := func() []byte { // distinct random files: no leaf shared between them
+		b := make([]byte, 3*chunkSize+1234)
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	gone := filepath.Join(dir, "gone.bin")
+	writeFile(t, gone, distinct())
+	cGone, err := n.addNoCopy(gone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holed := filepath.Join(dir, "holed.bin")
+	writeFile(t, holed, distinct())
+	cHoled, err := n.addNoCopy(holed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole := filepath.Join(dir, "whole.bin")
+	writeFile(t, whole, distinct())
+	cWhole, err := n.addNoCopy(whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	root, err := n.localDserv.Get(n.ctx, cHoled) // drop one leaf of holed.bin
+	if err != nil || len(root.Links()) < 2 {
+		t.Fatalf("fixture: want a multi-leaf file (err=%v)", err)
+	}
+	if err := n.fstore.DeleteBlock(n.ctx, root.Links()[1].Cid); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]cid.Cid{"gone": cGone, "holed": cHoled} {
+		if !n.hasLocal(c) {
+			t.Fatalf("precondition: %s still has its root block", name)
+		}
+		if _, err := n.makeDir(map[string]string{name: c.String()}); err == nil {
+			t.Fatalf("makeDir linked %s, which is not held whole", name)
+		}
+	}
+	if _, err := n.makeDir(map[string]string{"whole": cWhole.String()}); err != nil {
+		t.Fatalf("a whole entry must link: %v", err)
 	}
 }

@@ -10,8 +10,9 @@ package main
 //   - a provider walk or a provider-record send of the sweeping provider (provide.go) — BACKGROUND.
 //
 // The size is the user's "max simultaneous downloads". A slot goes to a waiting foreground job before any background
-// one, so announcing never slows an install; when nothing is fetching, announcing gets every slot. Rolling: a freed
-// slot is handed straight to the next waiter.
+// one, and background work never holds the LAST slot (with more than one): a walk holds its slot for its whole
+// duration, so a slot freed while the downloader sat between jobs — every wave boundary of a closure landing — went to
+// a walk, and the next fetch waited behind it. Rolling: a freed slot is handed straight to the next waiter it may go to.
 
 import (
 	"context"
@@ -35,13 +36,23 @@ func newNetQueue(slots int) *netQueue {
 	return &netQueue{slots: slots, fgIdle: idle}
 }
 
+// bgMax: the slots background work may hold at once — all but one, so a fetch always finds a slot.
+func (q *netQueue) bgMax() int {
+	if q.slots > 1 {
+		return q.slots - 1
+	}
+	return 1
+}
+
 // acquire blocks until a slot is granted (fg first) or ctx ends. release must be called exactly once when ok.
 func (q *netQueue) acquire(ctx context.Context, fg bool) (release func(), ok bool) {
 	q.mu.Lock()
 	if fg {
 		q.markFgBusyLocked()
 	}
-	if q.active < q.slots { // a free slot never coexists with waiters: every release/resize grants them first
+	// A free slot never coexists with a waiter it may go to: every release/resize grants them first. (A background
+	// waiter may wait beside the free slot kept for fetches.)
+	if q.active < q.slots && (fg || (len(q.fg) == 0 && q.active-q.fgActive < q.bgMax())) {
 		q.active++
 		if fg {
 			q.fgActive++
@@ -90,7 +101,7 @@ func (q *netQueue) releaser(fg bool) func() {
 	}
 }
 
-// grantLocked hands free slots to waiters, foreground first.
+// grantLocked hands free slots to waiters, foreground first; background only up to bgMax.
 func (q *netQueue) grantLocked() {
 	for q.active < q.slots {
 		var ch chan struct{}
@@ -98,7 +109,7 @@ func (q *netQueue) grantLocked() {
 		case len(q.fg) > 0:
 			ch, q.fg = q.fg[0], q.fg[1:]
 			q.fgActive++
-		case len(q.bg) > 0:
+		case len(q.bg) > 0 && q.active-q.fgActive < q.bgMax():
 			ch, q.bg = q.bg[0], q.bg[1:]
 		default:
 			return

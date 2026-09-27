@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	libp2p "github.com/libp2p/go-libp2p"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -88,5 +90,29 @@ func TestPrivateAddressesOnlyForClosePeers(t *testing.T) {
 		if !g.InterceptAddrDial("stranger", ma.StringCast(s)) {
 			t.Errorf("public %s refused", s)
 		}
+	}
+}
+
+// An explicit connect names the peer's address: a stranger on the LAN, a tunnel or loopback is reachable that way
+// (direct peering, a controlled benchmark) — the private-address filter refused it with nothing but a counter.
+// Teeth: drop noteLanPeer in connect() and the dial below is refused by our own gater.
+func TestAnExplicitConnectReachesAStrangersPrivateAddress(t *testing.T) {
+	target, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := &node{ctx: ctx}
+	h, err := libp2p.New(libp2p.NoListenAddrs, libp2p.ConnectionGater(&netGate{n: n}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	n.host = h
+	addr := target.Addrs()[0].String() + "/p2p/" + target.ID().String()
+	if err := n.connect(addr); err != nil {
+		t.Fatalf("explicit connect to %s: %v", addr, err)
 	}
 }
