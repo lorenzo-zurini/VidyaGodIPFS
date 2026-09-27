@@ -52,7 +52,8 @@ import (
 
 // Vars so tests can shorten them.
 var (
-	quarantineAfter   = 6 * time.Second  // a want-block held this long, with no block delivered meanwhile
+	quarantineAfter = 3 * time.Second // a want-block held this long, with no block delivered meanwhile (a peer that
+	// keeps delivering is never taken out, however deep its queue: this only bounds how long a silent one holds wants)
 	quarantineCool    = 30 * time.Second // the first cooldown; doubles per offence
 	quarantineMaxCool = 10 * time.Minute
 	quarantineForget  = time.Hour // a peer's offences are forgotten this long after its last

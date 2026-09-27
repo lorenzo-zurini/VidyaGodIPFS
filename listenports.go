@@ -54,8 +54,12 @@ func (p listenPorts) addrs() []string {
 	return out
 }
 
-func (p listenPorts) tcpAddrs(ip string) []string { return []string{fmt.Sprintf("%s/tcp/%d", ip, p.TCP)} }
-func (p listenPorts) wsAddrs(ip string) []string  { return []string{fmt.Sprintf("%s/tcp/%d/ws", ip, p.WS)} }
+func (p listenPorts) tcpAddrs(ip string) []string {
+	return []string{fmt.Sprintf("%s/tcp/%d", ip, p.TCP)}
+}
+func (p listenPorts) wsAddrs(ip string) []string {
+	return []string{fmt.Sprintf("%s/tcp/%d/ws", ip, p.WS)}
+}
 func (p listenPorts) udpAddrs(ip string) []string {
 	return []string{fmt.Sprintf("%s/udp/%d/quic-v1", ip, p.UDP), fmt.Sprintf("%s/udp/%d/quic-v1/webtransport", ip, p.UDP)}
 }
