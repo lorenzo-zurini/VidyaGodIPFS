@@ -1318,23 +1318,35 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			phase(cidStr, fmt.Sprintf("resuming the missing %d block(s) over HTTPS gateway", bits.count-bits.nset))
 			rctx, rstop := userCancelCtx(nctx, cidStr)
 			var gerr error
-			var done int64 // bytes of the ranges already fetched, so progress runs on across them
+			var done int64 // missing bytes of the ranges already fetched, so progress runs on across them
 			for _, r := range ranges {
+				// A merged range re-sends the present leaves between its holes: the bar moves by the missing bytes it
+				// carries, not by every byte read (merged ranges jumped it to 99% at once).
+				var need int64
+				for _, m := range missing {
+					if m.from >= r.from && m.to <= r.to {
+						need += m.to - m.from + 1
+					}
+				}
+				span := float64(r.to - r.from + 1)
 				gerr = n.fetchViaGateway(rctx, root, r.from, r.to, func(read, _ int64) {
 					if total > 0 && onProgress != nil {
-						onProgress(math.Min(99, 100.0*float64(base+done+read)/float64(total)))
+						got := float64(done) + math.Min(1, float64(read)/span)*float64(need)
+						onProgress(math.Min(99, 100.0*(float64(base)+got)/float64(total)))
 					}
 				})
 				if gerr != nil {
 					break
 				}
-				done += r.to - r.from + 1
+				done += need
 			}
 			rstop()
 			if gerr != nil {
 				fdbg("writeThrough: gateway resume failed cid=%s: %v", cidStr, gerr)
-			} else {
-				// The CAR landed in the blockstore; write every still-missing leaf through from there.
+			}
+			// What the CARs landed (every range, or those before one failed) is in the blockstore: write each
+			// still-missing leaf through from there; the rest wait for the next attempt.
+			if !isCancelled(cidStr) {
 				for i, lf := range leaves {
 					if bits.get(i) {
 						continue

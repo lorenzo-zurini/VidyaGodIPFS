@@ -239,11 +239,22 @@ func TestMakeWholeDirLeavesOutWhatIsNotWholeAndWalksOnce(t *testing.T) {
 	if none, nw, err := n.makeWholeDir(map[string]string{"g": gone.String()}, true); err != nil || none.Defined() || len(nw) != 1 {
 		t.Fatalf("nothing whole: folder %s, named %v, err %v — want no folder", none, nw, err)
 	}
+	// Not a CID at all (a typo in a node's SOURCE) is a gap too. Teeth: fail the folder on a decode error again.
+	if c, nw, err := n.makeWholeDir(map[string]string{"w": whole.String(), "typo": "not-a-cid"}, true); err != nil || !c.Defined() || len(nw) != 1 || nw[0] != "typo" {
+		t.Fatalf("a malformed entry: folder %s, named %v, err %v — want the folder, the typo named", c, nw, err)
+	}
 	before := wholeWalks.Load()
 	if _, err := n.makeDir(map[string]string{"content": content.String()}); err != nil {
 		t.Fatal(err)
 	}
 	if walked := wholeWalks.Load() - before; walked != 0 {
 		t.Fatalf("the pin folder walked the content folder it nests again (%d walks)", walked)
+	}
+	// A made folder whose own block is gone is refused: entries are read locally only, never fetched to be linked.
+	if err := n.fstore.DeleteBlock(n.ctx, content); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.makeDir(map[string]string{"content": content.String()}); err == nil {
+		t.Fatal("a made folder whose block is gone was linked")
 	}
 }

@@ -121,13 +121,17 @@ func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, 
 	for _, name := range names {
 		c, err := cid.Decode(entries[name])
 		if err != nil {
+			if leaveOut { // not a CID (a typo in a node's SOURCE): a gap to name, never a reason to publish nothing
+				notWhole = append(notWhole, name)
+				continue
+			}
 			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
 		// The folder is pinned recursively WITHOUT walking it (below), so each entry must be whole here first: a pin
 		// over a partly-held entry is a package "pinned" and published that no one — nor a pinning service — can get.
 		// A folder this node made is whole already (each of its entries was checked as it was made): a pin folder
 		// nesting a package's content folder walked all of that content again.
-		if _, made := n.madeDirs.Load(c.String()); !made || !n.hasLocal(c) {
+		if _, made := n.madeDirs.Load(c.String()); !made {
 			if err := n.heldWhole(c); err != nil {
 				if leaveOut {
 					notWhole = append(notWhole, name)
@@ -137,7 +141,7 @@ func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, 
 			}
 		}
 		var child ipld.Node
-		if child, err = n.dserv.Get(n.ctx, c); err != nil {
+		if child, err = n.localDserv.Get(n.ctx, c); err != nil { // held here or refused: never fetched to be linked
 			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
 		if err := d.AddChild(n.ctx, name, child); err != nil {

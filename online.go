@@ -364,8 +364,7 @@ func (n *node) goOnline() error {
 
 	// Announcing what we hold: the sweeping provider, its walks and sends through netq (provide.go).
 	if prov, perr := newSweepingProvider(n.ctx, kad, n.ds); perr == nil {
-		n.provider = prov
-		n.restoreRefiles()
+		n.useProvider(prov)
 	} else {
 		fmt.Fprintf(os.Stderr, "[provide] sweeping provider not started: %v\n", perr)
 	}

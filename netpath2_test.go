@@ -517,6 +517,57 @@ func TestGatewayLeafResumeAsksForEachHole(t *testing.T) {
 	}
 }
 
+// A range that fails does not throw away what the ranges before it brought: their leaves are written through (here
+// the first CAR carries everything, the second request fails, and the file still completes). Teeth: write the
+// leaves only when every range succeeded and this attempt ends incomplete.
+func TestGatewayLeafResumeKeepsWhatEarlierRangesBrought(t *testing.T) {
+	n := offlineNode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	payload, root, rootNode, carBytes, leaves := scratchLeafDAGWithLeaves(t, ctx, 16*int(chunkSize))
+	var calls atomic.Int32
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) > 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.ipld.car")
+		w.Header().Set("Content-Length", strconv.Itoa(len(carBytes)))
+		_, _ = w.Write(carBytes)
+	}))
+	defer gw.Close()
+	resumeFixture(t, n, ctx, rootNode, gw.URL)
+	dest := t.TempDir() + "/out.bin"
+	tmp, err := os.Create(tmpPath(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Truncate(int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	bits := newPartBits(root.String(), int64(len(payload)), len(leaves))
+	for i := range leaves { // every leaf on disk but 1 and 14: two ranges
+		if i == 1 || i == 14 {
+			continue
+		}
+		off := int64(i) * chunkSize
+		if _, err := tmp.WriteAt(payload[off:off+chunkSize], off); err != nil {
+			t.Fatal(err)
+		}
+		bits.set(i)
+	}
+	_ = tmp.Close()
+	if err := savePart(dest, bits); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.writeThrough(ctx, root, rootNode, dest, root.String(), nil, nil); err != nil {
+		t.Fatalf("the first range brought every leaf; the attempt must complete: %v", err)
+	}
+	if got, rerr := os.ReadFile(dest); rerr != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("materialized bytes differ from the payload (err=%v)", rerr)
+	}
+}
+
 // The resume asks for the runs of missing leaves, not everything from the first one on (545 MB from Pinata for 37
 // leaves on the replication): runs closer than gatewayRunGap merge, and past gatewayMaxRanges the closest ranges merge
 // so scattered holes cost a handful of requests. Teeth: return one range from the first missing byte to the last

@@ -310,10 +310,11 @@ func TestNetQueueKeepsASlotForFetches(t *testing.T) {
 
 // fakeProvider stands in for the sweeping provider: online or not, and what it was handed.
 type fakeProvider struct {
-	online    bool
-	handed    []mh.Multihash
-	forced    []mh.Multihash // … of which handed with force
-	dropsOnce bool           // goes offline during the next hand-over (after the readiness reading)
+	online bool
+	queued int64 // keys waiting in its provide queue
+	handed []mh.Multihash
+	forced []mh.Multihash // … of which handed with force
+	during func()         // runs inside the next Stats call (then cleared)
 }
 
 func (f *fakeProvider) StartProviding(force bool, keys ...mh.Multihash) error {
@@ -321,14 +322,16 @@ func (f *fakeProvider) StartProviding(force bool, keys ...mh.Multihash) error {
 	if force {
 		f.forced = append(f.forced, keys...)
 	}
-	if f.dropsOnce {
-		f.online, f.dropsOnce = false, false
-	}
 	return nil // like the real one offline: no error, whether it queued them or not
 }
 func (f *fakeProvider) StopProviding(...mh.Multihash) error { return nil }
 func (f *fakeProvider) Stats(context.Context) (stats.Stats, error) {
+	if d := f.during; d != nil {
+		f.during = nil
+		d()
+	}
 	var s stats.Stats
+	s.Queues.PendingKeyProvides = f.queued
 	s.Schedule.AvgPrefixLength = -1
 	if f.online {
 		s.Schedule.AvgPrefixLength = 7
@@ -391,40 +394,95 @@ func TestNetQueueGivesBackgroundOneSlotWhileADownloadRuns(t *testing.T) {
 	}
 }
 
-// The provider goes offline between the readiness reading and the hand-over: it files the key without announcing it,
-// silently, and the key is "not new" ever after. The key stays ours, handed over again FORCED once the provider is
-// back — also by the next run, if this one ends first. Teeth: skip the fresh readiness read after the hand-over and
-// the key is dropped as announced; hand it over again without force and the provider ignores it.
-func TestAKeyFiledWhileTheProviderDroppedIsHandedOverAgainForced(t *testing.T) {
+// The provider files a handed-over key at once but announces it only from its queue, and drops the queue whole when it
+// goes offline (or the process ends): the key is "not new" ever after and waited up to 22 h. So a handed-over key
+// stays unconfirmed until the queue drains while online; offline first, it is handed over again FORCED — by the next
+// run too — and once announced it is known: a later re-offer is not tracked. Teeth: confirm without waiting for the
+// queue to drain and the dropped key is taken for announced; drop useProvider's restore and the next run never
+// re-offers it; hand it over again without force and the provider ignores it.
+func TestAKeyDroppedFromTheProvideQueueIsHandedOverAgainForced(t *testing.T) {
 	saved := providerReadyTTL
-	providerReadyTTL = time.Hour // the reading before the hand-over is a cached one, as in production
+	providerReadyTTL = 0
 	defer func() { providerReadyTTL = saved }()
-	fp := &fakeProvider{online: true, dropsOnce: true}
 	ds := dssync.MutexWrap(datastore.NewMapDatastore())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	n := &node{seedDone: map[string]struct{}{}, provider: fp, ds: ds, ctx: ctx}
+	fp := &fakeProvider{online: true, queued: 1}
+	n := &node{seedDone: map[string]struct{}{}, ds: ds, ctx: ctx}
 	n.provideSt.started = true
+	n.useProvider(fp)
 	n.startProviding(gateCid)
-	if len(n.provideSt.pending) != 1 || !n.provideSt.pending[string(gateCid.Hash())].force {
-		t.Fatalf("filed while offline: pending %v — the key must stay ours, marked forced", n.provideSt.pending)
+	if len(fp.handed) != 1 || len(n.provideSt.unconfirmed) != 1 {
+		t.Fatalf("handed %d, unconfirmed %d — handed over, not yet announced", len(fp.handed), len(n.provideSt.unconfirmed))
 	}
-	// A new run over the same datastore offers it again, forced.
-	fp2 := &fakeProvider{online: true}
-	n2 := &node{seedDone: map[string]struct{}{}, provider: fp2, ds: ds, ctx: ctx}
+	n.confirmUnconfirmed() // still queued: nothing settles
+	if len(n.provideSt.unconfirmed) != 1 {
+		t.Fatal("a key still in the provide queue was taken for announced")
+	}
+	fp.online = false // the provider goes offline: its queue, with the key, is gone
+	n.confirmUnconfirmed()
+	if k, ok := n.provideSt.pending[string(gateCid.Hash())]; !ok || !k.force || len(n.provideSt.unconfirmed) != 0 {
+		t.Fatalf("offline: pending %v unconfirmed %v — the key must come back, forced", n.provideSt.pending, n.provideSt.unconfirmed)
+	}
+	// The process ends here. The next run offers it again, forced, and settles it once its queue drains.
+	fp2 := &fakeProvider{online: true, queued: 1}
+	n2 := &node{seedDone: map[string]struct{}{}, ds: ds, ctx: ctx}
 	n2.provideSt.started = true
-	n2.restoreRefiles()
+	n2.useProvider(fp2)
 	if len(fp2.forced) != 1 || !bytes.Equal(fp2.forced[0], gateCid.Hash()) {
 		t.Fatalf("the next run handed over forced: %v", fp2.forced)
 	}
-	if len(n2.provideSt.pending) != 0 {
-		t.Fatalf("announced, still pending: %v", n2.provideSt.pending)
+	fp2.queued = 0
+	n2.confirmUnconfirmed()
+	if len(n2.provideSt.unconfirmed) != 0 || !n2.announced(gateCid.Hash()) {
+		t.Fatal("announced once the queue drained: must be known announced")
 	}
-	res, err := ds.Query(ctx, dsq.Query{Prefix: refileNS.String(), KeysOnly: true})
+	if left := refiles(t, ds); len(left) != 0 {
+		t.Fatalf("an announced key is still remembered as unconfirmed: %v", left)
+	}
+	n2.startProviding(gateCid) // a startup re-offer of an announced key: a no-op, not tracked
+	if len(n2.provideSt.unconfirmed) != 0 {
+		t.Fatal("a re-offer of an announced key was tracked (a blip would force a full re-announce)")
+	}
+}
+
+// A key we stop holding leaves every trace — pending, unconfirmed, both records — even while offline, and an offline
+// reading afterwards does not bring it back. Teeth: re-mark every snapshot key on the offline path (not only those
+// still unconfirmed) and the stopped key is announced again; clear the records only with a provider and the next run
+// re-announces it.
+func TestAStoppedKeyIsNotBroughtBack(t *testing.T) {
+	saved := providerReadyTTL
+	providerReadyTTL = 0
+	defer func() { providerReadyTTL = saved }()
+	ds := dssync.MutexWrap(datastore.NewMapDatastore())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fp := &fakeProvider{online: true, queued: 1}
+	n := &node{seedDone: map[string]struct{}{}, ds: ds, ctx: ctx}
+	n.provideSt.started = true
+	n.useProvider(fp)
+	n.startProviding(gateCid)
+	fp.online = false
+	fp.during = func() { // unpinned while the offline reading is taken, with no provider to tell
+		n.provider = nil
+		n.stopProviding(gateCid)
+		n.provider = fp
+	}
+	n.confirmUnconfirmed()
+	if len(n.provideSt.pending) != 0 || len(n.provideSt.unconfirmed) != 0 {
+		t.Fatalf("a stopped key came back: pending %v unconfirmed %v", n.provideSt.pending, n.provideSt.unconfirmed)
+	}
+	if left := refiles(t, ds); len(left) != 0 {
+		t.Fatalf("a stopped key is still remembered: %v", left)
+	}
+}
+
+func refiles(t *testing.T, ds datastore.Datastore) []dsq.Entry {
+	t.Helper()
+	res, err := ds.Query(context.Background(), dsq.Query{Prefix: refileNS.String(), KeysOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if left, _ := res.Rest(); len(left) != 0 {
-		t.Fatalf("an announced key is still remembered as filed: %v", left)
-	}
+	left, _ := res.Rest()
+	return left
 }

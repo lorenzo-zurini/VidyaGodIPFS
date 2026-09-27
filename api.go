@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -833,6 +834,7 @@ func VgNetRelease(handle C.longlong) {
 //
 //export VgNetHold
 func VgNetHold() C.longlong {
+	netHoldsTaken.Add(1)
 	release := netq.hold()
 	netHeldMu.Lock()
 	netNextID++
@@ -841,6 +843,14 @@ func VgNetHold() C.longlong {
 	netHeldMu.Unlock()
 	return C.longlong(id)
 }
+
+// netHoldsTaken counts VgNetHold calls (tests read it: every multi-wave job takes a hold).
+var netHoldsTaken atomic.Int64
+
+// VgDebugNetHolds: how many foreground holds were taken since start. Tests only.
+//
+//export VgDebugNetHolds
+func VgDebugNetHolds() C.longlong { return C.longlong(netHoldsTaken.Load()) }
 
 // VgDebugNetForegroundIdle: 1 when no fetch holds or waits for a slot and nobody holds the foreground. Tests only.
 //
