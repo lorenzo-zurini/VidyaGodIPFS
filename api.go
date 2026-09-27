@@ -895,3 +895,18 @@ func VgMoveRefs(movesJson *C.char, errOut **C.char) C.longlong {
 	}
 	return C.longlong(moved)
 }
+
+// VgHeldWhole: 1 if every block of the CID's DAG is held and every file it is referenced into is present, else 0.
+//
+//export VgHeldWhole
+func VgHeldWhole(cidStr *C.char) C.int {
+	n := get()
+	if n == nil {
+		return 0
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil || n.heldWhole(c) != nil {
+		return 0
+	}
+	return 1
+}
