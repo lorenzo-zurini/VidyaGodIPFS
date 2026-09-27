@@ -76,7 +76,7 @@ const anyIP4, anyIP6 = "/ip4/0.0.0.0", "/ip6/::"
 
 // listenOn makes a host built with no listen addresses listen on every transport, on the ports of the last run; a
 // transport whose port cannot be had gets a fresh one (on IPv6 its own, if only IPv6 refuses it). The ports in use
-// are saved for the next start. Fails only if nothing at all listens.
+// are saved for the next start. Fails only if no transport listens (the relay's /p2p-circuit always "listens").
 func listenOn(h host.Host, repo string) error {
 	saved := loadListenPorts(repo)
 	for _, t := range transports {
@@ -84,19 +84,34 @@ func listenOn(h host.Host, repo string) error {
 		if port == 0 {
 			port = freePort(t.proto)
 		}
-		if !listen(h, t.addrs(anyIP4, port)) {
-			port = freePort(t.proto)
-			listen(h, t.addrs(anyIP4, port))
+		if port == 0 || !listen(h, t.addrs(anyIP4, port)) {
+			fresh := freePort(t.proto)
+			if s := *t.port(&saved); s != 0 {
+				fmt.Fprintf(os.Stderr, "[net] saved port %d (%s) cannot be had — listening on %d this run\n", s, t.addrs(anyIP4, s)[0], fresh)
+			}
+			port = fresh
+			if !listen(h, t.addrs(anyIP4, port)) {
+				fmt.Fprintf(os.Stderr, "[net] not listening on %s: no port\n", t.addrs(anyIP4, port)[0])
+			}
 		}
-		if !listen(h, t.addrs(anyIP6, port)) {
-			listen(h, t.addrs(anyIP6, 0))
+		if !listen(h, t.addrs(anyIP6, port)) && ipv6Available() {
+			p6 := freePortOn(t.proto + "6")
+			fmt.Fprintf(os.Stderr, "[net] IPv6 refused port %d — %s listens on %d\n", port, t.proto, p6)
+			if p6 == 0 || !listen(h, t.addrs(anyIP6, p6)) {
+				fmt.Fprintf(os.Stderr, "[net] not listening on %s\n", t.addrs(anyIP6, p6)[0])
+			}
 		}
 	}
-	addrs := h.Network().ListenAddresses()
-	if len(addrs) == 0 {
-		return errors.New("listening on no address")
+	var direct []ma.Multiaddr
+	for _, a := range h.Network().ListenAddresses() {
+		if _, err := a.ValueForProtocol(ma.P_CIRCUIT); err != nil {
+			direct = append(direct, a)
+		}
 	}
-	have := portsOf(addrs)
+	if len(direct) == 0 {
+		return errors.New("listening on no transport")
+	}
+	have := portsOf(direct)
 	if have == saved {
 		return nil
 	}
@@ -112,18 +127,42 @@ func listenOn(h host.Host, repo string) error {
 	return nil
 }
 
-// listen: the host listens on all of ss (a family of one transport); false if any refused.
+// listen: the host listens on all of ss (a family of one transport) or on none of them — a QUIC listener left on a
+// port whose WebTransport refused would split the two onto separate UDP ports.
 func listen(h host.Host, ss []string) bool {
+	var done []ma.Multiaddr
 	for _, s := range ss {
 		a, err := ma.NewMultiaddr(s)
+		if err == nil {
+			err = h.Network().Listen(a)
+		}
 		if err != nil {
+			if c, ok := h.Network().(interface{ ListenClose(...ma.Multiaddr) }); ok && len(done) > 0 {
+				c.ListenClose(done...)
+			}
 			return false
 		}
-		if err := h.Network().Listen(a); err != nil {
-			return false
-		}
+		done = append(done, a)
 	}
 	return true
+}
+
+// freePortOn: a port free on one network ("tcp6", "udp6", …) right now (0: none).
+func freePortOn(network string) int {
+	if network == "tcp4" || network == "tcp6" {
+		l, err := net.Listen(network, ":0")
+		if err != nil {
+			return 0
+		}
+		defer l.Close()
+		return l.Addr().(*net.TCPAddr).Port
+	}
+	c, err := net.ListenPacket(network, ":0")
+	if err != nil {
+		return 0
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
 // freePort: a port free on both families right now — or on the one this host has (0: none found; the OS picks).

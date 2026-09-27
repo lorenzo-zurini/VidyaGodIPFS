@@ -396,9 +396,13 @@ func (r *trickleRecv) PeerDisconnected(peer.ID) {}
 // it wants again. Teeth: bring the peer fully back (or clear its record) on any block. (Offences kept per connection
 // instead of per peer are caught by TestQuarantineRemembersAcrossConnections, not reliably here.)
 func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
-	a, c, m, tk := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick
-	quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick = time.Second, 2*time.Second, time.Minute, 100*time.Millisecond
-	defer func() { quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick = a, c, m, tk }()
+	a, c, m, tk, mh := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick, quarantineMaxHold
+	// Production's shape at a third of its scale: floor 3 s → 1 s, maximum hold 10 s → 3 s; the trickler hands over a
+	// block less often than the maximum hold (pinata: ~one per 30 s), so it earns no pace of its own.
+	quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick, quarantineMaxHold = time.Second, 2*time.Second, time.Minute, 100*time.Millisecond, 3*time.Second
+	defer func() {
+		quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick, quarantineMaxHold = a, c, m, tk, mh
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	const promisers = 3
@@ -424,7 +428,7 @@ func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA, bitswapOptions(nil)...)
 	defer bswapA.Close()
 	netT := bsnet.NewFromIpfsHost(hostT)
-	tr := &trickleRecv{net: netT, store: bstoreA, every: 3 * time.Second}
+	tr := &trickleRecv{net: netT, store: bstoreA, every: 5 * time.Second}
 	netT.Start(tr)
 	defer netT.Stop()
 	go tr.run(ctx)

@@ -34,7 +34,9 @@ package main
 // times). The cooldown doubles per offence (quarantineCool, up to quarantineMaxCool); paying in full clears the
 // record, and it is forgotten quarantineForget after the last offence.
 //
-// Progress is a delivered block, not bytes: a promiser's own HAVE replies are bitswap bytes too, and counting them let
+// How long a peer may sit silent on a want-block is its own business up to a point: three of its usual block
+// intervals, between quarantineAfter (3 s — a promiser, which never delivers) and quarantineMaxHold (10 s — a friend
+// on a thin uplink). Progress is a delivered block, not bytes: a promiser's own HAVE replies are bitswap bytes too, and counting them let
 // it hold wants for as long as any other fetch kept it answering (replication 6: three stalls).
 
 import (
@@ -54,8 +56,8 @@ import (
 
 // Vars so tests can shorten them.
 var (
-	quarantineAfter = 3 * time.Second // a want-block held this long, with no block delivered meanwhile (a peer that
-	// keeps delivering is never taken out, however deep its queue: this only bounds how long a silent one holds wants)
+	quarantineAfter   = 3 * time.Second  // a want-block held this long, with no block delivered meanwhile: the floor —
+	quarantineMaxHold = 10 * time.Second // a peer that delivers slowly gets three of its own block intervals, up to this
 	quarantineCool    = 30 * time.Second // the first cooldown; doubles per offence
 	quarantineMaxCool = 10 * time.Minute
 	quarantineForget  = time.Hour // a peer's offences are forgotten this long after its last
@@ -65,8 +67,10 @@ var (
 type peerLedger struct {
 	wanted    map[cid.Cid]time.Time // want-blocks sent and not answered (block, DONT_HAVE) or cancelled
 	asked     map[cid.Cid]struct{}  // every want (have or block) sent and not answered or cancelled: its HAVEs we note
-	owed      map[cid.Cid]struct{}  // the want-blocks it held when it was taken out, not yet answered
-	denied    bool                  // it answered some of what it owed with a DONT_HAVE
+	owed      map[cid.Cid]bool      // the want-blocks it held when taken out, not yet answered (true: it had said HAVE)
+	denied    bool                  // it answered with a DONT_HAVE a block it had said it had
+	lastBlock time.Time             // its last delivery
+	gap       time.Duration         // its usual interval between deliveries (0: none seen)
 	progress  time.Time             // its last block (or its ledger's start)
 	until     time.Time             // out, or on probation, until then (zero: in)
 	probation bool                  // back with the client (it delivered while out), its HAVEs kept from it
@@ -122,10 +126,24 @@ func (q *quarantineNet) run(ctx context.Context) {
 func (q *quarantineNet) ledger(p peer.ID) *peerLedger {
 	l := q.peers[p]
 	if l == nil {
-		l = &peerLedger{wanted: map[cid.Cid]time.Time{}, asked: map[cid.Cid]struct{}{}, owed: map[cid.Cid]struct{}{}, progress: q.now()}
+		l = &peerLedger{wanted: map[cid.Cid]time.Time{}, asked: map[cid.Cid]struct{}{}, owed: map[cid.Cid]bool{}, progress: q.now()}
 		q.peers[p] = l
 	}
 	return l
+}
+
+// hold: how long this peer may hold a want-block with nothing delivered — quarantineAfter, or three of its own block
+// intervals for a peer that delivers slowly (a friend on a thin uplink serving several of us), up to
+// quarantineMaxHold. A peer that never delivered gets the floor.
+func (l *peerLedger) hold() time.Duration {
+	d := 3 * l.gap
+	if d < quarantineAfter {
+		return quarantineAfter
+	}
+	if d > quarantineMaxHold {
+		return quarantineMaxHold
+	}
+	return d
 }
 
 // held: out of the rotation or on probation at t.
@@ -196,12 +214,13 @@ func (q *quarantineNet) scan(apply bool) (outs, backs, ends []peer.ID) {
 			}
 			continue
 		}
-		if l.outAt(now) || len(l.wanted) == 0 || now.Sub(l.progress) < quarantineAfter {
+		hold := l.hold()
+		if l.outAt(now) || len(l.wanted) == 0 || now.Sub(l.progress) < hold {
 			continue
 		}
 		held, offered := 0, false
 		for c, t := range l.wanted {
-			if now.Sub(t) < quarantineAfter {
+			if now.Sub(t) < hold {
 				continue
 			}
 			held++
@@ -229,10 +248,11 @@ func (q *quarantineNet) scan(apply bool) (outs, backs, ends []peer.ID) {
 		}
 		l.until, l.probation, l.denied = now.Add(cool), false, false
 		for c := range l.wanted {
-			l.owed[c] = struct{}{}
+			_, said := q.haves[c][p]
+			l.owed[c] = said
 		}
 		fmt.Fprintf(os.Stderr, "[quarantine] %s held %d want-block(s) for %s+ and delivered nothing, and another peer offers them — out of our download rotation for %s (offence %d)\n",
-			shortPeer(p.String()), held, quarantineAfter, cool, r.strikes)
+			shortPeer(p.String()), held, hold.Round(100*time.Millisecond), cool, r.strikes)
 		clear(l.wanted)
 		q.dropAsked(p, l) // the client stops talking to it: no cancel will follow, and its offers are void
 	}
@@ -322,7 +342,15 @@ func (q *quarantineNet) noteReceived(p peer.ID, l *peerLedger, m bsmsg.BitSwapMe
 		q.haves[c][p] = struct{}{}
 	}
 	if len(blks) > 0 {
-		l.progress = q.now()
+		now := q.now()
+		if d := now.Sub(l.lastBlock); !l.lastBlock.IsZero() && d < quarantineMaxHold { // an idle gap is no pace
+			if l.gap == 0 {
+				l.gap = d
+			} else {
+				l.gap = (3*l.gap + d) / 4
+			}
+		}
+		l.progress, l.lastBlock = now, now
 	}
 }
 
@@ -343,9 +371,9 @@ func (q *quarantineNet) admit(p peer.ID, m bsmsg.BitSwapMessage) (bsmsg.BitSwapM
 		delete(l.owed, b.Cid())
 	}
 	for _, c := range m.DontHaves() {
-		if _, ok := l.owed[c]; ok {
+		if said, ok := l.owed[c]; ok {
 			delete(l.owed, c)
-			l.denied = true
+			l.denied = l.denied || said // an optimistic want-block (sent with no HAVE) it may lack in good faith
 		}
 	}
 	wasOut, delivered := !l.probation, len(m.Blocks()) > 0

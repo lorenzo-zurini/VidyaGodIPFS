@@ -66,7 +66,8 @@ invariants any future change must preserve.*
    boxo's sessions can park want-blocks on a peer forever (a HAVE is never undone by a DONT_HAVE; a re-sent
    want-block is dropped as already sent, so no new timeout starts; bitswap 1.1 peers get no timeout at all).
    `quarantine.go` reports such a peer disconnected to the client — which re-routes every want it held — only when
-   all three hold: it has held a want-block for `quarantineAfter` (3 s), it delivered no block in that time, and
+   all three hold: it has held a want-block for its hold time — `quarantineAfter` (3 s), or three of its own block
+   intervals for a peer that delivers slowly, up to `quarantineMaxHold` (10 s) — delivering no block in that time, and
    another peer in the rotation said HAVE — to a want we sent it — for one of the blocks it holds. A sole provider is
    never taken out: slow must not become stopped. Progress is a block, not bytes: a promiser's HAVE replies are
    bitswap bytes too (counting them caused replication 6's three stalls); an honest peer taken out mid-block is
@@ -76,7 +77,7 @@ invariants any future change must preserve.*
    from the client, until it has paid everything it owed (then its record clears) or its cooldown ends. Offences are
    remembered per peer across connections (public nodes churn theirs), forgotten an hour after the last; cooldown
    30 s, doubling per offence to 10 min. Only paying in blocks clears a record: a DONT_HAVE for a block it said it had
-   settles the debt but not the lie. Moving a peer in or out is exclusive with message
+   settles the debt but not the lie (a DONT_HAVE for an optimistic want-block, never offered, is no lie). Moving a peer in or out is exclusive with message
    delivery (`dmu`), so a HAVE cannot slip it back into a session mid-move — and only a tick that moves someone takes
    that lock.
 
@@ -103,7 +104,7 @@ invariants any future change must preserve.*
 | Panic in any network goroutine | `guard` recover + stack log | that iteration/goroutine dies; node lives |
 | goOnline fails/panics at startup | `guardErr` | offline node + background retry with backoff |
 | A peer restarts under the same identity | its old QUIC connection gets our streams | same ports → stateless reset kills it in a round trip |
-| A provider answers HAVE and never delivers (a public pinning node) | want-blocks held 3 s, no block, another peer offers them | `[quarantine]` line; out of the client's rotation, wants re-routed |
+| A provider answers HAVE and never delivers (a public pinning node) | want-blocks held 3 s (a slow deliverer: 3 of its intervals, ≤10 s), no block, another peer offers them | `[quarantine]` line; out of the client's rotation, wants re-routed |
 
 ## Diagnostics
 

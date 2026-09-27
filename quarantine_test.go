@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -246,6 +247,7 @@ func TestQuarantineRules(t *testing.T) {
 		g.advance(60 * time.Second)
 		g.offer(seeder, y.Cid(), z.Cid())
 		g.want(promiser, y.Cid(), z.Cid())
+		g.have(promiser, y.Cid(), z.Cid()) // it says it has both
 		g.advance(5 * time.Second)
 		if cooldown() != 2*time.Minute {
 			t.Fatalf("third offence: out for %s, want 2m0s", cooldown())
@@ -273,11 +275,74 @@ func TestQuarantineRules(t *testing.T) {
 		}
 		g.offer(seeder, w.Cid())
 		g.want(promiser, w.Cid())
-		g.advance(5 * time.Second)
+		g.advance(quarantineMaxHold) // it has delivered at a pace now: its hold is its own
 		if cooldown() != 30*time.Second {
 			t.Fatalf("after paying in full its next cooldown is %s, want the first (30s)", cooldown())
 		}
 	})
+}
+
+// A DONT_HAVE for a want-block the peer never said HAVE to (boxo sends optimistic want-blocks) is no lie: a friend
+// holding part of a package, silent for a moment, pays in blocks what it has and DONT_HAVEs the rest — its record
+// clears. Teeth: count any DONT_HAVE for an owed block as a lie.
+func TestQuarantineForgivesAnHonestDontHave(t *testing.T) {
+	g := newQuarantineRig(t)
+	p, seeder := peer.ID("partial"), peer.ID("seeder")
+	g.r.PeerConnected(p)
+	g.r.PeerConnected(seeder)
+	x, y := blk("x"), blk("y")
+	g.offer(seeder, x.Cid(), y.Cid())
+	g.want(p, x.Cid(), y.Cid())
+	g.have(p, x.Cid()) // it has x; y was an optimistic want-block
+	g.advance(5 * time.Second)
+	if !g.q.out(p) {
+		t.Fatal("setup: the partial holder is not out")
+	}
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddBlock(x); m.AddDontHave(y.Cid()) })
+	if _, ok := g.q.records[p]; ok {
+		t.Fatal("paid what it had and said DONT_HAVE to what it never offered: its record was kept as if it lied")
+	}
+}
+
+// A peer that delivers slowly may sit silent on a want-block for three of its own block intervals (up to
+// quarantineMaxHold) before it goes out: a friend on a thin uplink, delivering every 2.5 s, is not taken out for a
+// 4 s pause the moment anyone else offers. A promiser, which never delivers, still goes out at quarantineAfter.
+// Teeth: one fixed threshold for every peer; learn the pace from idle gaps (a peer idle for minutes would get the
+// maximum).
+func TestQuarantineGivesASlowPeerItsOwnPace(t *testing.T) {
+	g := newQuarantineRig(t)
+	slow, seeder := peer.ID("slow"), peer.ID("seeder")
+	g.r.PeerConnected(slow)
+	g.r.PeerConnected(seeder)
+	for i := 0; i < 6; i++ { // blocks every 2.5 s: its pace
+		b := blk(fmt.Sprintf("paced%d", i))
+		g.want(slow, b.Cid())
+		g.now = g.now.Add(2500 * time.Millisecond)
+		g.recv(slow, func(m bsmsg.BitSwapMessage) { m.AddBlock(b) })
+	}
+	x := blk("x")
+	g.offer(seeder, x.Cid())
+	g.want(slow, x.Cid())
+	g.advance(5 * time.Second) // a 5 s pause: past quarantineAfter, within three of its intervals
+	if g.q.out(slow) {
+		t.Fatal("a peer delivering every 2.5 s was taken out for a 5 s pause")
+	}
+	g.advance(3 * time.Second) // 8 s: past three of its intervals (7.5 s)
+	if !g.q.out(slow) {
+		t.Fatal("silent for three of its own intervals, with the seeder offering, it stayed in")
+	}
+
+	idler := peer.ID("idler") // delivered once, then idle for a minute: no pace learned from the idle gap
+	g.r.PeerConnected(idler)
+	a, b := blk("a"), blk("b")
+	g.want(idler, a.Cid())
+	g.recv(idler, func(m bsmsg.BitSwapMessage) { m.AddBlock(a) })
+	g.advance(time.Minute)
+	g.want(idler, b.Cid())
+	g.recv(idler, func(m bsmsg.BitSwapMessage) { m.AddBlock(b) })
+	if h := g.q.peers[idler].hold(); h != quarantineAfter {
+		t.Fatalf("a peer idle for a minute between two blocks may hold wants for %s, want the floor %s", h, quarantineAfter)
+	}
 }
 
 // A peer that delivers while out is back with the client — told first, so the sessions its block reaches find it
