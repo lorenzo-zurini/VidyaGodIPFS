@@ -204,8 +204,10 @@ func (n *node) goOnline() error {
 		libp2p.BandwidthReporter(bwc),
 		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
 		// WebSocket, WebTransport). More transports = more usable providers when content has many hosts.
-		// On the ports of the last run (listenports.go): a restart must reset its predecessor's connections at once.
-		libp2p.ListenAddrStrings(listenAddrs(n.repoPath)...),
+		// No listen addresses here: listenOn (below) listens on the ports of the last run, per transport, with a fresh
+		// port for any it cannot have — a restart must reset its predecessor's connections at once (listenports.go).
+		libp2p.NoListenAddrs,
+		libp2p.EnableRelay(), // NoListenAddrs switches the relay transport off unless it is asked for (AutoRelay needs it)
 		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rm),
 		libp2p.NATPortMap(),
@@ -238,7 +240,6 @@ func (n *node) goOnline() error {
 	if err != nil {
 		return err
 	}
-	keepListenPorts(h, n.repoPath)
 	// A panic between here and publication (n.host = h) is recovered by the caller's guardErr and RETRIED —
 	// without this, every failed attempt leaked a whole libp2p host (bound ports, goroutines) per backoff
 	// interval, forever (adversarial M3). Errors after this point must also close h before returning.
@@ -273,6 +274,9 @@ func (n *node) goOnline() error {
 			_ = h.Close()
 		}
 	}()
+	if err := listenOn(h, n.repoPath); err != nil {
+		return err
+	}
 
 	kad, err := dht.New(n.ctx, h, dht.Mode(dht.ModeAuto),
 		dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))

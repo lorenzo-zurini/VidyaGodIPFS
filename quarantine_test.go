@@ -254,12 +254,25 @@ func TestQuarantineRules(t *testing.T) {
 		if g.q.records[promiser] == nil || g.q.records[promiser].strikes != 3 {
 			t.Fatal("one block of two owed cleared the record: a trickle must not")
 		}
-		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddDontHave(z.Cid()) }) // the rest: paid in full
-		if _, ok := g.q.records[promiser]; ok {
-			t.Fatal("paid in full, its record is still held against it")
+		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddDontHave(z.Cid()) }) // the rest: a DONT_HAVE
+		if g.q.peers[promiser].held(g.now) {
+			t.Fatal("everything it owed answered, it is still held")
+		}
+		if g.q.records[promiser] == nil || g.q.records[promiser].strikes != 3 {
+			t.Fatal("settled with a DONT_HAVE for a block it had said it had, its record was cleared: it lied")
 		}
 		g.offer(seeder, u.Cid())
 		g.want(promiser, u.Cid())
+		g.advance(5 * time.Second)
+		if cooldown() != 4*time.Minute {
+			t.Fatalf("fourth offence: out for %s, want 4m0s", cooldown())
+		}
+		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddBlock(u) }) // paid in blocks: an honest hiccup
+		if _, ok := g.q.records[promiser]; ok {
+			t.Fatal("paid in full in blocks, its record is still held against it")
+		}
+		g.offer(seeder, w.Cid())
+		g.want(promiser, w.Cid())
 		g.advance(5 * time.Second)
 		if cooldown() != 30*time.Second {
 			t.Fatalf("after paying in full its next cooldown is %s, want the first (30s)", cooldown())
@@ -269,8 +282,8 @@ func TestQuarantineRules(t *testing.T) {
 
 // A peer that delivers while out is back with the client — told first, so the sessions its block reaches find it
 // registered — but on probation: its blocks and DONT_HAVEs reach the client, its HAVEs neither reach it nor count as
-// offers, so no session picks it for a want-block on the strength of a trickle. A want-block it is still given (a
-// bitswap 1.1 peer gets want-blocks for want-haves) is held against it again, and so is its record. Its probation ends
+// offers, so a session prefers any peer that says HAVE over it. A want-block it is still given (a session may pick it
+// where no peer says HAVE) is held against it again, and so is its record. Its probation ends
 // with its cooldown, its record kept. Teeth: forward a probation peer's HAVEs; note them as offers; forward its block
 // before telling the client it is back; tell the client twice; clear its record on a trickle; keep it on probation past
 // its cooldown.
@@ -340,6 +353,29 @@ func TestQuarantineProbation(t *testing.T) {
 	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddHave(u.Cid()) })
 	if last := g.all.msgs[len(g.all.msgs)-1]; len(last.Haves()) != 1 {
 		t.Fatal("back in, its HAVEs are still kept from the client")
+	}
+}
+
+// Probation outlives the connection, as a quarantine does: a trickler that drops and redials still owes what it
+// owed, and its HAVEs are still kept from the client. Teeth: drop a probation peer's ledger with its connection.
+func TestQuarantineProbationSurvivesAReconnect(t *testing.T) {
+	g := newQuarantineRig(t)
+	p, seeder := peer.ID("trickler"), peer.ID("seeder")
+	g.r.PeerConnected(p)
+	g.r.PeerConnected(seeder)
+	x, y, u := blk("x"), blk("y"), blk("u")
+	g.offer(seeder, x.Cid(), y.Cid())
+	g.want(p, x.Cid(), y.Cid())
+	g.advance(5 * time.Second)
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddBlock(x) }) // on probation, still owing y
+	g.r.PeerDisconnected(p)
+	g.advance(time.Second)
+	g.r.PeerConnected(p)
+	g.send(p, pb.Message_Wantlist_Have, u.Cid())
+	before := len(g.all.msgs)
+	g.recv(p, func(m bsmsg.BitSwapMessage) { m.AddHave(u.Cid()) })
+	if len(g.all.msgs) != before {
+		t.Fatal("a trickler that redialed came back off probation: its HAVE reached bitswap")
 	}
 }
 

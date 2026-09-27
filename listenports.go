@@ -9,15 +9,23 @@ package main
 // went nowhere (replication 7: the seeder's HAVEs and blocks for the first 38 s after the receiver restarted; two
 // Silent Hill 2 root fetches timed out into a 14-minute gateway crawl). On the SAME port the restarted process gets
 // the peer's next packet on that dead connection and answers it with a QUIC stateless reset — valid, because
-// go-libp2p derives the reset key from the identity — and the peer drops the connection within a round trip.
+// go-libp2p derives the reset key from the identity — and the peer drops the connection within a round trip. That
+// one packet is still lost (replication 8: the seeder heard again 2 s after the first fetch).
 //
 // So: ONE UDP port for QUIC and WebTransport (quicreuse dials out from any wildcard listener; with two UDP ports a
 // dead connection could sit on either), and each port the same on IPv4 and IPv6 (port 0 gives the two families
-// different ones, and the one saved need not be the one a connection used). Stable ports also keep the addresses
-// friends and the DHT hold for us valid across restarts, and our UPnP mappings.
+// different ones, and the one saved need not be the one a connection used). A saved port that cannot be had — taken,
+// excluded (Windows reshuffles its excluded ranges at boot), a damaged file — is replaced by a fresh one for that
+// run: the node always listens. Stable ports also keep the addresses friends and the DHT hold for us valid across
+// restarts, and our UPnP mappings.
+//
+// Known limit: TCP listens with SO_REUSEPORT (libp2p's default), so a saved TCP port still held by a live process —
+// the previous run not yet exited — is shared with it, not replaced; the kernel splits new TCP connections between
+// the two until it exits.
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -35,7 +43,8 @@ type listenPorts struct {
 
 const listenPortsFile = "listen-ports.json"
 
-// loadListenPorts: the ports the last run listened on (zero: none yet).
+// loadListenPorts: the ports the last run listened on (zero: none yet). A value that is no port fails to listen and
+// is replaced like a taken one.
 func loadListenPorts(repo string) listenPorts {
 	var p listenPorts
 	if b, err := os.ReadFile(filepath.Join(repo, listenPortsFile)); err == nil {
@@ -44,67 +53,106 @@ func loadListenPorts(repo string) listenPorts {
 	return p
 }
 
-func (p listenPorts) addrs() []string {
-	var out []string
-	for _, ip := range []string{"/ip4/0.0.0.0", "/ip6/::"} {
-		out = append(out, p.tcpAddrs(ip)...)
-		out = append(out, p.udpAddrs(ip)...)
-		out = append(out, p.wsAddrs(ip)...)
-	}
-	return out
+// transport: one kind of listener, on both families.
+type transport struct {
+	proto string // what freePort probes: "tcp" or "udp"
+	port  func(*listenPorts) *int
+	addrs func(ip string, port int) []string
 }
 
-func (p listenPorts) tcpAddrs(ip string) []string {
-	return []string{fmt.Sprintf("%s/tcp/%d", ip, p.TCP)}
-}
-func (p listenPorts) wsAddrs(ip string) []string {
-	return []string{fmt.Sprintf("%s/tcp/%d/ws", ip, p.WS)}
-}
-func (p listenPorts) udpAddrs(ip string) []string {
-	return []string{fmt.Sprintf("%s/udp/%d/quic-v1", ip, p.UDP), fmt.Sprintf("%s/udp/%d/quic-v1/webtransport", ip, p.UDP)}
-}
-
-// listenAddrs: what the node listens on — every transport, on the ports it used last time (fresh ones the first
-// time).
-func listenAddrs(repo string) []string {
-	p := loadListenPorts(repo)
-	if p.TCP == 0 {
-		p.TCP = freePort("tcp")
-	}
-	if p.UDP == 0 {
-		p.UDP = freePort("udp")
-	}
-	if p.WS == 0 {
-		p.WS = freePort("tcp")
-	}
-	return p.addrs()
+var transports = []transport{
+	{"tcp", func(p *listenPorts) *int { return &p.TCP }, func(ip string, port int) []string {
+		return []string{fmt.Sprintf("%s/tcp/%d", ip, port)}
+	}},
+	{"udp", func(p *listenPorts) *int { return &p.UDP }, func(ip string, port int) []string {
+		return []string{fmt.Sprintf("%s/udp/%d/quic-v1", ip, port), fmt.Sprintf("%s/udp/%d/quic-v1/webtransport", ip, port)}
+	}},
+	{"tcp", func(p *listenPorts) *int { return &p.WS }, func(ip string, port int) []string {
+		return []string{fmt.Sprintf("%s/tcp/%d/ws", ip, port)}
+	}},
 }
 
-// freePort: a port free on both IPv4 and IPv6 right now (0: none found — the OS then picks, per family).
+const anyIP4, anyIP6 = "/ip4/0.0.0.0", "/ip6/::"
+
+// listenOn makes a host built with no listen addresses listen on every transport, on the ports of the last run; a
+// transport whose port cannot be had gets a fresh one (on IPv6 its own, if only IPv6 refuses it). The ports in use
+// are saved for the next start. Fails only if nothing at all listens.
+func listenOn(h host.Host, repo string) error {
+	saved := loadListenPorts(repo)
+	for _, t := range transports {
+		port := *t.port(&saved)
+		if port == 0 {
+			port = freePort(t.proto)
+		}
+		if !listen(h, t.addrs(anyIP4, port)) {
+			port = freePort(t.proto)
+			listen(h, t.addrs(anyIP4, port))
+		}
+		if !listen(h, t.addrs(anyIP6, port)) {
+			listen(h, t.addrs(anyIP6, 0))
+		}
+	}
+	addrs := h.Network().ListenAddresses()
+	if len(addrs) == 0 {
+		return errors.New("listening on no address")
+	}
+	have := portsOf(addrs)
+	if have == saved {
+		return nil
+	}
+	b, _ := json.Marshal(have)
+	tmp := filepath.Join(repo, listenPortsFile+".tmp")
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "[net] saving listen ports: %v\n", err)
+		return nil
+	}
+	if err := os.Rename(tmp, filepath.Join(repo, listenPortsFile)); err != nil {
+		fmt.Fprintf(os.Stderr, "[net] saving listen ports: %v\n", err)
+	}
+	return nil
+}
+
+// listen: the host listens on all of ss (a family of one transport); false if any refused.
+func listen(h host.Host, ss []string) bool {
+	for _, s := range ss {
+		a, err := ma.NewMultiaddr(s)
+		if err != nil {
+			return false
+		}
+		if err := h.Network().Listen(a); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// freePort: a port free on both families right now — or on the one this host has (0: none found; the OS picks).
 func freePort(proto string) int {
+	v6 := ipv6Available()
 	for i := 0; i < 16; i++ {
-		var port int
-		var closers []func() error
+		port, closers := 0, []func() error{}
 		if proto == "tcp" {
-			l, err := net.Listen("tcp4", "0.0.0.0:0")
-			if err != nil {
-				return 0
+			if l, err := net.Listen("tcp4", "0.0.0.0:0"); err == nil {
+				port, closers = l.Addr().(*net.TCPAddr).Port, append(closers, l.Close)
 			}
-			port, closers = l.Addr().(*net.TCPAddr).Port, append(closers, l.Close)
 			if l6, err := net.Listen("tcp6", fmt.Sprintf("[::]:%d", port)); err == nil {
+				if port == 0 {
+					port = l6.Addr().(*net.TCPAddr).Port
+				}
 				closers = append(closers, l6.Close)
-			} else {
-				port = 0
+			} else if v6 {
+				port = 0 // free on IPv4 only: try another
 			}
 		} else {
-			c, err := net.ListenPacket("udp4", "0.0.0.0:0")
-			if err != nil {
-				return 0
+			if c, err := net.ListenPacket("udp4", "0.0.0.0:0"); err == nil {
+				port, closers = c.LocalAddr().(*net.UDPAddr).Port, append(closers, c.Close)
 			}
-			port, closers = c.LocalAddr().(*net.UDPAddr).Port, append(closers, c.Close)
 			if c6, err := net.ListenPacket("udp6", fmt.Sprintf("[::]:%d", port)); err == nil {
+				if port == 0 {
+					port = c6.LocalAddr().(*net.UDPAddr).Port
+				}
 				closers = append(closers, c6.Close)
-			} else {
+			} else if v6 {
 				port = 0
 			}
 		}
@@ -118,12 +166,23 @@ func freePort(proto string) int {
 	return 0
 }
 
-// portsOf: the port each transport listens on over IPv4 in addrs (zero: not listening).
+// ipv6Available: this host can bind IPv6 at all.
+func ipv6Available() bool {
+	c, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// portsOf: the port each transport listens on in addrs — its IPv4 one, else its IPv6 one (zero: not listening).
 func portsOf(addrs []ma.Multiaddr) listenPorts {
-	var p listenPorts
+	var v4, v6 listenPorts
 	for _, a := range addrs {
-		if _, err := a.ValueForProtocol(ma.P_IP4); err != nil {
-			continue
+		p := &v6
+		if _, err := a.ValueForProtocol(ma.P_IP4); err == nil {
+			p = &v4
 		}
 		var port int
 		if v, err := a.ValueForProtocol(ma.P_TCP); err == nil {
@@ -138,63 +197,16 @@ func portsOf(addrs []ma.Multiaddr) listenPorts {
 		if v, err := a.ValueForProtocol(ma.P_UDP); err == nil {
 			if _, q := a.ValueForProtocol(ma.P_QUIC_V1); q == nil {
 				if _, wt := a.ValueForProtocol(ma.P_WEBTRANSPORT); wt != nil { // the QUIC listener names the UDP port
-					fmt.Sscan(v, &p.UDP)
+					fmt.Sscan(v, &port)
+					p.UDP = port
 				}
 			}
 		}
 	}
-	return p
-}
-
-// keepListenPorts, once the host listens: a transport whose saved port was taken (another program took it since the
-// last run) listens on a fresh one, and the ports in use are saved for the next start.
-func keepListenPorts(h host.Host, repo string) {
-	have := portsOf(h.Network().ListenAddresses())
-	var fresh []ma.Multiaddr
-	add := func(ss []string) {
-		for _, s := range ss {
-			if a, err := ma.NewMultiaddr(s); err == nil {
-				fresh = append(fresh, a)
-			}
+	for _, t := range transports {
+		if *t.port(&v4) == 0 {
+			*t.port(&v4) = *t.port(&v6)
 		}
 	}
-	var p listenPorts // one fresh port per missing transport, the same on both families
-	if have.TCP == 0 {
-		p.TCP = freePort("tcp")
-	}
-	if have.UDP == 0 {
-		p.UDP = freePort("udp")
-	}
-	if have.WS == 0 {
-		p.WS = freePort("tcp")
-	}
-	for _, ip := range []string{"/ip4/0.0.0.0", "/ip6/::"} {
-		if have.TCP == 0 {
-			add(p.tcpAddrs(ip))
-		}
-		if have.UDP == 0 {
-			add(p.udpAddrs(ip))
-		}
-		if have.WS == 0 {
-			add(p.wsAddrs(ip))
-		}
-	}
-	if len(fresh) > 0 {
-		if err := h.Network().Listen(fresh...); err != nil {
-			fmt.Fprintf(os.Stderr, "[net] listen on fresh ports: %v\n", err)
-		}
-		have = portsOf(h.Network().ListenAddresses())
-	}
-	if have == loadListenPorts(repo) {
-		return
-	}
-	b, _ := json.Marshal(have)
-	tmp := filepath.Join(repo, listenPortsFile+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "[net] saving listen ports: %v\n", err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(repo, listenPortsFile)); err != nil {
-		fmt.Fprintf(os.Stderr, "[net] saving listen ports: %v\n", err)
-	}
+	return v4
 }

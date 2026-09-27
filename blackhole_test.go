@@ -393,8 +393,8 @@ func (r *trickleRecv) PeerDisconnected(peer.ID) {}
 // and a trickler that hands over a block now and then. Each is taken out for sitting on want-blocks — and must STAY
 // out longer each time: its record survives its connection, and a trickle neither clears it nor wins it new wants.
 // Before, every redial and every trickled block reset it to the first cooldown, and each new file's session handed
-// it wants again. Teeth: keep offences on the per-connection ledger; clear the record (or bring the peer fully back)
-// on any block.
+// it wants again. Teeth: bring the peer fully back (or clear its record) on any block. (Offences kept per connection
+// instead of per peer are caught by TestQuarantineRemembersAcrossConnections, not reliably here.)
 func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	a, c, m, tk := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick
 	quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick = time.Second, 2*time.Second, time.Minute, 100*time.Millisecond

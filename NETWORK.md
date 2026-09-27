@@ -75,7 +75,8 @@ invariants any future change must preserve.*
    the client (told first — a session registers any peer a block comes from) but on PROBATION, its HAVEs still kept
    from the client, until it has paid everything it owed (then its record clears) or its cooldown ends. Offences are
    remembered per peer across connections (public nodes churn theirs), forgotten an hour after the last; cooldown
-   30 s, doubling per offence to 10 min. Moving a peer in or out is exclusive with message
+   30 s, doubling per offence to 10 min. Only paying in blocks clears a record: a DONT_HAVE for a block it said it had
+   settles the debt but not the lie. Moving a peer in or out is exclusive with message
    delivery (`dmu`), so a HAVE cannot slip it back into a session mid-move — and only a tick that moves someone takes
    that lock.
 
@@ -84,7 +85,10 @@ invariants any future change must preserve.*
    connection with the most streams — the dead one. Every reply we were owed vanished for ~30 s after a restart
    (replication 7: 38 s; two root fetches fell to a 14-minute gateway crawl). On the same UDP port the new process
    answers the dead connection's next packet with a QUIC stateless reset (the key derives from the identity) and the
-   peer drops it in a round trip. One UDP port for QUIC and WebTransport, each port the same on IPv4 and IPv6.
+   peer drops it in a round trip — that one packet is lost (replication 8: heard again 2 s after the first fetch).
+   One UDP port for QUIC and WebTransport, each port the same on IPv4 and IPv6; a saved port that cannot be had is
+   replaced for the run, so the node always listens. Limit: TCP's SO_REUSEPORT shares a port still held by a live
+   process instead of replacing it.
 
 ## Known failure modes and where they're handled
 

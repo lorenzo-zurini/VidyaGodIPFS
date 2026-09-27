@@ -23,9 +23,11 @@ package main
 // Nothing it sends is thrown away: a block it delivers while out reaches the client — after the client is told it is
 // back (a session registers any peer a block comes from; one the client thinks gone would have no queue for the
 // wants it is then given). Back, but on PROBATION until it has paid what it owed or its cooldown ends: its blocks
-// and DONT_HAVEs reach the client, its HAVEs do not, so no session picks it for a want-block. An honest peer that
-// hiccuped pays everything at once (its server sends what it had queued) and is fully back; a peer that trickles a
-// block now and then never pays, and never wins wants on the strength of that trickle.
+// and DONT_HAVEs reach the client, its HAVEs do not, so a session prefers any peer that does say HAVE (it can still
+// pick it where nobody has: the sole-provider case). An honest peer that hiccuped pays everything at once (its server
+// sends what it had queued) and is fully back, its record cleared; a peer that trickles a block now and then never
+// pays, and never wins wants on the strength of that trickle. DONT_HAVEs settle what it owes but clear nothing: a
+// peer that said HAVE, sat on the want-block and then said DONT_HAVE lied.
 //
 // Offences are remembered per peer, not per connection (public nodes churn their connections; a record lost with the
 // connection gave the same promiser the first cooldown over and over — replication 7: one peer taken out twelve
@@ -64,6 +66,7 @@ type peerLedger struct {
 	wanted    map[cid.Cid]time.Time // want-blocks sent and not answered (block, DONT_HAVE) or cancelled
 	asked     map[cid.Cid]struct{}  // every want (have or block) sent and not answered or cancelled: its HAVEs we note
 	owed      map[cid.Cid]struct{}  // the want-blocks it held when it was taken out, not yet answered
+	denied    bool                  // it answered some of what it owed with a DONT_HAVE
 	progress  time.Time             // its last block (or its ledger's start)
 	until     time.Time             // out, or on probation, until then (zero: in)
 	probation bool                  // back with the client (it delivered while out), its HAVEs kept from it
@@ -177,7 +180,7 @@ func (q *quarantineNet) scan(apply bool) (outs, backs, ends []peer.ID) {
 		}
 	}
 	for p, l := range q.peers {
-		if !l.linked && !l.outAt(now) {
+		if !l.linked && !l.held(now) { // gone, and neither out nor on probation: nothing to keep
 			delete(q.peers, p)
 			continue
 		}
@@ -224,7 +227,7 @@ func (q *quarantineNet) scan(apply bool) (outs, backs, ends []peer.ID) {
 		if cool > quarantineMaxCool || cool <= 0 {
 			cool = quarantineMaxCool
 		}
-		l.until, l.probation = now.Add(cool), false
+		l.until, l.probation, l.denied = now.Add(cool), false, false
 		for c := range l.wanted {
 			l.owed[c] = struct{}{}
 		}
@@ -340,12 +343,17 @@ func (q *quarantineNet) admit(p peer.ID, m bsmsg.BitSwapMessage) (bsmsg.BitSwapM
 		delete(l.owed, b.Cid())
 	}
 	for _, c := range m.DontHaves() {
-		delete(l.owed, c)
+		if _, ok := l.owed[c]; ok {
+			delete(l.owed, c)
+			l.denied = true
+		}
 	}
 	wasOut, delivered := !l.probation, len(m.Blocks()) > 0
-	if len(l.owed) == 0 { // paid in full: an honest peer that hiccuped
+	if len(l.owed) == 0 { // settled: back in — and, paid in blocks (an honest peer that hiccuped), its record cleared
 		l.until, l.probation = time.Time{}, false
-		delete(q.records, p)
+		if !l.denied {
+			delete(q.records, p)
+		}
 		q.noteReceived(p, l, m)
 		return m, wasOut && l.linked
 	}
@@ -473,8 +481,8 @@ func (r quarantineReceiver) PeerConnected(p peer.ID) {
 	r.q.recv.PeerConnected(p)
 }
 
-// PeerDisconnected: what it held and offered goes with it; its ledger goes at the next check unless it is out (its
-// record, and so its strikes, stay regardless).
+// PeerDisconnected: what it held and offered goes with it; its ledger goes at the next check unless it is out or on
+// probation (its record, and so its strikes, stay regardless).
 func (r quarantineReceiver) PeerDisconnected(p peer.ID) {
 	r.q.dmu.RLock()
 	defer r.q.dmu.RUnlock()
