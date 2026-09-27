@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"syscall"
 	"testing"
 
@@ -256,5 +258,29 @@ func TestMakeWholeDirLeavesOutWhatIsNotWholeAndWalksOnce(t *testing.T) {
 	}
 	if _, err := n.makeDir(map[string]string{"content": content.String()}); err == nil {
 		t.Fatal("a made folder whose block is gone was linked")
+	}
+}
+
+// Checking a file's CID keeps no block: memory stays flat however large the file (it held the whole file). Teeth: back
+// computeCid with an in-memory datastore again and the heap grows by the file's size.
+func TestComputeCidHoldsNoBlocks(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "big.bin")
+	b := make([]byte, 64<<20)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, p, b)
+	b = nil
+	defer debug.SetGCPercent(debug.SetGCPercent(10)) // the heap tracks what is live, not the chunks already dropped
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	c, err := computeCid(p)
+	if err != nil || !c.Defined() {
+		t.Fatalf("computeCid: %s %v", c, err)
+	}
+	runtime.ReadMemStats(&after) // no GC in between: what it still holds is live
+	if grew := int64(after.HeapInuse) - int64(before.HeapInuse); grew > 16<<20 {
+		t.Fatalf("checking a 64 MiB file left %d MiB on the heap", grew>>20)
 	}
 }

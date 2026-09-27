@@ -15,7 +15,6 @@ import (
 	blockstore "github.com/ipfs/boxo/blockstore"
 	offline "github.com/ipfs/boxo/exchange/offline"
 	datastore "github.com/ipfs/go-datastore"
-	dssync "github.com/ipfs/go-datastore/sync"
 
 	chunker "github.com/ipfs/boxo/chunker"
 	files "github.com/ipfs/boxo/files"
@@ -85,7 +84,9 @@ func computeCid(path string) (cid.Cid, error) {
 	if err != nil {
 		return cid.Undef, err
 	}
-	mem := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	// The blocks are discarded as they are built: only the root is wanted, and the layout never reads a block back. An
+	// in-memory store held the whole file — a multi-GB zip checked before seeding cost its size in RAM.
+	mem := blockstore.NewBlockstore(datastore.NewNullDatastore())
 	dserv := merkledag.NewDAGService(blockservice.New(mem, offline.Exchange(mem)))
 	dbp := uih.DagBuilderParams{
 		Maxlinks:   uih.DefaultLinksPerBlock,

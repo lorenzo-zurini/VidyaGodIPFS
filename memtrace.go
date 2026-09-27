@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux, served only by startPprof
+	"net/http/pprof"
 	"os"
 	"runtime"
+	"sync"
 )
 
 var memTrace = os.Getenv("VG_MEM_TRACE") != ""
@@ -27,21 +28,53 @@ func memLine() string {
 		mb(m.HeapInuse), mb(m.HeapIdle-m.HeapReleased), mb(m.HeapReleased), mb(m.Sys), m.HeapObjects, m.NumGC, mb(cInUse), mb(cFree))
 }
 
-// startPprof serves Go's profiles at VG_PPROF when it names a loopback address.
-func startPprof() {
-	addr := os.Getenv("VG_PPROF")
+// startPprof serves Go's profiles at VG_PPROF when it names a loopback address, once per process, on a mux of its own
+// (never http.DefaultServeMux: whatever registers there — expvar's /debug/vars — would be served too), answering only
+// requests addressed to a loopback host (a web page cannot reach it through DNS rebinding). Returns the address it
+// listens on, "" when it does not.
+func startPprof() string {
+	pprofOnce.Do(func() { pprofAddr = servePprof(os.Getenv("VG_PPROF")) })
+	return pprofAddr
+}
+
+var (
+	pprofOnce sync.Once
+	pprofAddr string
+)
+
+func servePprof(addr string) string {
 	if addr == "" {
-		return
+		return ""
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
-		fmt.Fprintf(os.Stderr, "[mem] VG_PPROF=%q is not a loopback host:port — profiles not served\n", addr)
-		return
+		fmt.Fprintf(os.Stderr, "[mem] VG_PPROF=%q is not a loopback ip:port — profiles not served\n", addr)
+		return ""
 	}
-	safeGo("node.pprof", func() {
-		fmt.Fprintf(os.Stderr, "[mem] Go profiles at http://%s/debug/pprof/\n", addr)
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "[mem] pprof: %v\n", err)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[mem] pprof: %v\n", err)
+		return ""
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	loopbackOnly := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			h = r.Host
 		}
+		if ip := net.ParseIP(h); h != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			http.Error(w, "loopback only", http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
 	})
+	real := ln.Addr().String()
+	fmt.Fprintf(os.Stderr, "[mem] Go profiles at http://%s/debug/pprof/\n", real)
+	safeGo("node.pprof", func() { _ = http.Serve(ln, loopbackOnly) })
+	return real
 }

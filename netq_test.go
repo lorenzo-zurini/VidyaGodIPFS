@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"strings"
+	"fmt"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -488,14 +489,43 @@ func refiles(t *testing.T, ds datastore.Datastore) []dsq.Entry {
 	return left
 }
 
-// The [mem] line names both allocators, and the profiler never listens on a non-loopback address.
+// The [mem] line carries real numbers (a Go heap in use, the C allocator's bytes in use), and the profiler serves only
+// loopback: a public address is refused, /debug/vars is not served, a request addressed to another host is refused.
+// Teeth: accept any address in servePprof, serve on http.DefaultServeMux, or drop the Host check — each fails below.
 func TestMemLineAndPprofGuard(t *testing.T) {
-	l := memLine()
-	for _, want := range []string{"go: heap in use", "c: in use"} {
-		if !strings.Contains(l, want) {
-			t.Fatalf("[mem] line %q lacks %q", l, want)
-		}
+	var goInUse int
+	if _, err := fmt.Sscanf(memLine(), "[mem] go: heap in use %d", &goInUse); err != nil || goInUse <= 0 {
+		t.Fatalf("[mem] line %q: go heap in use %d (%v)", memLine(), goInUse, err)
 	}
-	t.Setenv("VG_PPROF", "0.0.0.0:0")
-	startPprof() // must refuse: prints and returns without listening
+	if in, _ := cAllocator(); in == 0 {
+		t.Fatal("the C allocator reads as empty")
+	}
+	if a := servePprof("0.0.0.0:0"); a != "" {
+		t.Fatalf("profiles served on a public address %s", a)
+	}
+	a := servePprof("127.0.0.1:0")
+	if a == "" {
+		t.Fatal("profiles not served on loopback")
+	}
+	get := func(path, host string) int {
+		req, _ := http.NewRequest("GET", "http://"+a+path, nil)
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if c := get("/debug/pprof/", ""); c != 200 {
+		t.Fatalf("/debug/pprof/: %d", c)
+	}
+	if c := get("/debug/vars", ""); c == 200 {
+		t.Fatal("/debug/vars is served")
+	}
+	if c := get("/debug/pprof/", "evil.example:80"); c != http.StatusForbidden {
+		t.Fatalf("a request for another host was answered: %d", c)
+	}
 }
