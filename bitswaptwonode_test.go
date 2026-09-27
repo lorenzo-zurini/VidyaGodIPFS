@@ -11,11 +11,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	bitswap "github.com/ipfs/boxo/bitswap"
+	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -93,12 +94,58 @@ func buildLeafDAG(t *testing.T, dserv ipld.DAGService, b []byte) (cid.Cid, []cid
 type twoNode struct {
 	bswapA  *bitswap.Bitswap
 	bstoreA blockstore.Blockstore
+	wire    *wireLedger // what the seeder holds as wanted by B
 	hostB   peerIDer
 	bswapB  *bitswap.Bitswap
 	bstoreB blockstore.Blockstore
 	sess    *blockservice.Session
 	leaves  []cid.Cid
 }
+
+// wireLedger is what the SEEDER holds as wanted by B, exactly: a want entry adds its CID, a cancel removes it, and so
+// does the seeder answering it (the block, or a HAVE / DONT_HAVE). It is recorded by a tracer on the seeder's
+// bitswap, message by message — no sampling, so a short-lived window cannot slip between two looks.
+type wireLedger struct {
+	mu   sync.Mutex
+	open map[cid.Cid]struct{}
+	max  int
+}
+
+func newWireLedger() *wireLedger { return &wireLedger{open: map[cid.Cid]struct{}{}} }
+
+func (w *wireLedger) MessageReceived(_ peer.ID, m bsmsg.BitSwapMessage) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if m.Full() {
+		clear(w.open)
+	}
+	for _, e := range m.Wantlist() {
+		if e.Cancel {
+			delete(w.open, e.Cid)
+		} else {
+			w.open[e.Cid] = struct{}{}
+		}
+	}
+	if len(w.open) > w.max {
+		w.max = len(w.open)
+	}
+}
+
+func (w *wireLedger) MessageSent(_ peer.ID, m bsmsg.BitSwapMessage) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, b := range m.Blocks() {
+		delete(w.open, b.Cid())
+	}
+	for _, c := range m.Haves() {
+		delete(w.open, c)
+	}
+	for _, c := range m.DontHaves() {
+		delete(w.open, c)
+	}
+}
+
+func (w *wireLedger) peak() int { w.mu.Lock(); defer w.mu.Unlock(); return w.max }
 
 // peerIDer is the tiny slice of host.Host the tests use (ID()), kept local to avoid importing host just for a type.
 type peerIDer interface{ ID() peer.ID }
@@ -124,7 +171,8 @@ func setupTwoNode(t *testing.T, ctx context.Context, payloadSize int) twoNode {
 	if len(leaves) < 20 {
 		t.Fatalf("fixture only produced %d leaves — too few to exercise a rolling window", len(leaves))
 	}
-	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA)
+	wire := newWireLedger()
+	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA, bitswap.WithTracer(wire))
 	t.Cleanup(func() { bswapA.Close() })
 
 	bstoreB := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
@@ -134,7 +182,7 @@ func setupTwoNode(t *testing.T, ctx context.Context, payloadSize int) twoNode {
 		t.Fatal(err)
 	}
 	sess := blockservice.NewSession(ctx, blockservice.New(bstoreB, bswapB))
-	return twoNode{bswapA: bswapA, bstoreA: bstoreA, hostB: hostB, bswapB: bswapB, bstoreB: bstoreB, sess: sess, leaves: leaves}
+	return twoNode{bswapA: bswapA, bstoreA: bstoreA, wire: wire, hostB: hostB, bswapB: bswapB, bstoreB: bstoreB, sess: sess, leaves: leaves}
 }
 
 // Cancelling a two-node transfer mid-flight must return EVERY want-token (the delivered ones per block, and the
@@ -169,7 +217,7 @@ func TestTwoNodeRollingGetBlocksOverTheWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h := setupTwoNode(t, ctx, 8<<20) // 8 MiB → ~32 random (non-dedup) leaves
-	bswapA, hostB, sess, leaves, bstoreA := h.bswapA, h.hostB, h.sess, h.leaves, h.bstoreA
+	sess, leaves, bstoreA := h.sess, h.leaves, h.bstoreA
 
 	// TIGHT global budget, far below the leaf count: proves the window RECYCLES tokens over the wire (a broken
 	// per-block release would leave the producer stuck at the budget and the fetch would wedge → timeout).
@@ -177,26 +225,9 @@ func TestTwoNodeRollingGetBlocksOverTheWire(t *testing.T) {
 	globalWantPool = newWantPool(8)
 	defer func() { globalWantPool = saved }()
 
-	// WIRE-CAP SAMPLER: watch what the SEEDER sees B want at once. The whole point of the token pool is that the
-	// combined outstanding wants to a peer stay under the budget; assert it on the actual wire, not just in our
-	// own accounting. Max should never exceed budget + one refill batch (8 + 4).
-	var maxWire int32
-	stopSampler := make(chan struct{})
-	go func() {
-		t := time.NewTicker(2 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-stopSampler:
-				return
-			case <-t.C:
-				if w := int32(len(bswapA.WantlistForPeer(hostB.ID()))); w > atomic.LoadInt32(&maxWire) {
-					atomic.StoreInt32(&maxWire, w)
-				}
-			}
-		}
-	}()
-
+	// WIRE CAP: what the SEEDER holds as wanted by B at once (h.wire, exact). The whole point of the token pool is
+	// that the combined outstanding wants to a peer stay under the budget; assert it on the actual wire, not just in
+	// our own accounting. The seeder must never hold more than the budget.
 	got := map[cid.Cid][]byte{}
 	done := make(chan struct{})
 	go func() {
@@ -210,10 +241,9 @@ func TestTwoNodeRollingGetBlocksOverTheWire(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		t.Fatalf("two-node fetch wedged: got %d/%d leaves under an 8-token budget (rolling window not recycling)", len(got), len(leaves))
 	}
-	close(stopSampler)
-	mw := atomic.LoadInt32(&maxWire)
+	mw := h.wire.peak()
 	t.Logf("max outstanding wants the seeder saw from B: %d (budget 8, refill 4)", mw)
-	if mw > 8+4 {
+	if mw > 8 {
 		t.Errorf("seeder saw %d outstanding wants from B — the token budget is not what the wire sees (cap breached)", mw)
 	}
 	if mw < 2 {
@@ -241,7 +271,7 @@ func TestTwoNodeRollingGetBlocksOverTheWire(t *testing.T) {
 
 // The per-fetch cap must bound ONE fetch's outstanding wants even when the global budget is large — so a single
 // download (especially a trickling one holding stragglers) can't monopolise the whole budget. Give the pool
-// plenty (100) but cap a fetch at 4: the seeder must never see more than 4(+refill) wants from B. Teeth: make
+// plenty (100) but cap a fetch at 4: the seeder must never hold more than 4 wants from B. Teeth: make
 // maxPerFetch huge and the wire shows the full ~pool window instead.
 func TestPerFetchCapBoundsASingleFetch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -254,33 +284,16 @@ func TestPerFetchCapBoundsASingleFetch(t *testing.T) {
 	maxPerFetch = 4 // but this one fetch may hold at most 4
 	defer func() { globalWantPool = savedPool; maxPerFetch = savedCap }()
 
-	var maxWire int32
-	stop := make(chan struct{})
-	go func() {
-		tk := time.NewTicker(2 * time.Millisecond)
-		defer tk.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-tk.C:
-				if w := int32(len(h.bswapA.WantlistForPeer(h.hostB.ID()))); w > atomic.LoadInt32(&maxWire) {
-					atomic.StoreInt32(&maxWire, w)
-				}
-			}
-		}
-	}()
 	n := 0
 	for range rollingGetBlocks(ctx, h.sess, h.leaves, 4) {
 		n++
 	}
-	close(stop)
 	if n != len(h.leaves) {
 		t.Fatalf("received %d/%d leaves", n, len(h.leaves))
 	}
-	mw := atomic.LoadInt32(&maxWire)
+	mw := h.wire.peak()
 	t.Logf("max outstanding with maxPerFetch=4: %d", mw)
-	if mw > 4+4 { // cap + one refill batch
+	if mw > 4 {
 		t.Errorf("per-fetch cap breached: seeder saw %d wants from B with maxPerFetch=4", mw)
 	}
 }

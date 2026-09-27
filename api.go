@@ -801,3 +801,21 @@ func VgNetRelease(handle C.longlong) {
 //
 //export VgSetNetSlots
 func VgSetNetSlots(n C.int) { netq.setSlots(int(n)) }
+
+// VgMoveRefs re-points the filestore references of every file under oldDir to newDir (the folder was moved on disk).
+// Returns the number of references moved, -1 on error.
+//
+//export VgMoveRefs
+func VgMoveRefs(oldDir, newDir *C.char, errOut **C.char) C.longlong {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	moved, err := n.moveRefs(n.ctx, C.GoString(oldDir), C.GoString(newDir))
+	if err != nil {
+		setStr(errOut, err.Error())
+		return -1
+	}
+	return C.longlong(moved)
+}

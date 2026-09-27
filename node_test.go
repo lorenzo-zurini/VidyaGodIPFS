@@ -17,10 +17,12 @@ import (
 	"time"
 
 	chunker "github.com/ipfs/boxo/chunker"
+	filestore "github.com/ipfs/boxo/filestore"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	balanced "github.com/ipfs/boxo/ipld/unixfs/importer/balanced"
 	uih "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 )
 
@@ -730,5 +732,68 @@ func TestSlowFinalizeIsNotReportedAsAStall(t *testing.T) {
 		if strings.Contains(p, "stalled") {
 			t.Fatalf("a complete download was reported as %q during finalize", p)
 		}
+	}
+}
+
+// Moving a folder moves its references: installing a received package renames its folder, and every file under it
+// must still read (and be servable) from the new place — nothing re-read or re-hashed. A sibling folder whose name
+// merely starts the same ("pkg2" beside "pkg") keeps its references. Teeth: leave moveRefs' "is it under oldDir"
+// check out (or make it a plain string prefix) and the sibling is re-pointed into nowhere; skip the PutMany and the
+// moved content reads as missing.
+func TestMoveRefsFollowsAMovedFolder(t *testing.T) {
+	n := offlineNode(t)
+	root := t.TempDir()
+	oldDir, newDir, sib := filepath.Join(root, "pkg"), filepath.Join(root, "lib", "pkg"), filepath.Join(root, "pkg2")
+	big := sampleBytes()
+	writeFile(t, filepath.Join(oldDir, "sub", "big.bin"), big)
+	writeFile(t, filepath.Join(oldDir, "node.json"), []byte(`{"LABEL":"n"}`))
+	writeFile(t, filepath.Join(sib, "other.bin"), []byte("sibling bytes"))
+	cBig, err := n.addNoCopy(filepath.Join(oldDir, "sub", "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cNode, err := n.addNoCopy(filepath.Join(oldDir, "node.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cSib, err := n.addNoCopy(filepath.Join(sib, "other.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
+	if !n.cidMissing(cBig) {
+		t.Fatal("precondition: after the move the old references must read as missing")
+	}
+	moved, err := n.moveRefs(n.ctx, oldDir, newDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved < 3 { // big.bin is several leaves, node.json one
+		t.Fatalf("moved %d references, want every leaf of both files", moved)
+	}
+	for _, c := range []cid.Cid{cBig, cNode, cSib} {
+		if n.cidMissing(c) {
+			t.Fatalf("%s reads as missing after moveRefs", c)
+		}
+	}
+	nd, err := n.localDserv.Get(n.ctx, cBig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := ufsio.NewDagReader(n.ctx, nd, n.localDserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil || !bytes.Equal(got, big) {
+		t.Fatalf("content read back through the moved references differs (err=%v)", err)
+	}
+	if res := filestore.List(n.ctx, n.fstore, cSib); res == nil || filepath.Join("/", res.FilePath) != filepath.Join(sib, "other.bin") {
+		t.Fatalf("the sibling folder's reference was re-pointed: %+v", res)
 	}
 }
