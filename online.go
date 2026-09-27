@@ -199,10 +199,9 @@ func (n *node) goOnline() error {
 		return rmErr
 	}
 	bwc := metrics.NewBandwidthCounter() // global up/down byte counters + rolling rates for every stream
-	bsBytes := newBitswapBytes(bwc)      // + per peer, the bytes of its bitswap streams (quarantine.go)
 	libp2pOpts := []libp2p.Option{
 		libp2p.Identity(priv),
-		libp2p.BandwidthReporter(bsBytes),
+		libp2p.BandwidthReporter(bwc),
 		// Listen on every default transport so we can dial — and be reached by — the widest set of peers (TCP, QUIC,
 		// WebSocket, WebTransport). More transports = more usable providers when content has many hosts.
 		libp2p.ListenAddrStrings(
@@ -314,7 +313,6 @@ func (n *node) goOnline() error {
 	// A peer sitting on our want-blocks while another offers them is taken out of the download rotation
 	// (quarantine.go) — and our finder does not hand it back to the sessions meanwhile.
 	qnet := newQuarantineNet(bsn)
-	qnet.bytes, qnet.forget = bsBytes.of, bsBytes.drop
 	qctx, qstop := context.WithCancel(n.ctx)
 	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider, skip: qnet.out}
 	n.upSeen = make(map[string]int64)

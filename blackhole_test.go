@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"crypto/rand"
+	"sync/atomic"
 	bitswap "github.com/ipfs/boxo/bitswap"
+	bsmsg "github.com/ipfs/boxo/bitswap/message"
+	pb "github.com/ipfs/boxo/bitswap/message/pb"
 	bsnetwork "github.com/ipfs/boxo/bitswap/network"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	blockservice "github.com/ipfs/boxo/blockservice"
@@ -194,10 +197,9 @@ func TestAProviderThatPromisesAndNeverDeliversIsQuarantined(t *testing.T) {
 }
 
 // An honest seeder that hiccups — nothing for longer than quarantineAfter — while the promiser offers everything too
-// is taken out, and must not be starved for it: the blocks it then delivers bring it back and reach the client, and
-// the promiser, holding wants the seeder offers, goes out in turn. The whole file lands well inside the stall
-// watchdog. Teeth: drop an out peer's blocks (they are lost, and the promiser — offered only by a peer that is out —
-// holds the rest until the seeder's cooldown ends, past the watchdog).
+// is taken out, and must not be starved for it: the blocks it then delivers bring it back and reach the client. The
+// whole file lands well inside the stall watchdog. Teeth: drop an out peer's blocks (they are lost, and the promiser —
+// offered only by a peer that is out — holds the rest until the seeder's cooldown ends, past the watchdog).
 func TestAnHonestSeederThatHiccupsIsNotStarved(t *testing.T) {
 	a, c, tk := quarantineAfter, quarantineCool, quarantineTick
 	quarantineAfter, quarantineCool, quarantineTick = 2*time.Second, time.Minute, 200*time.Millisecond
@@ -216,5 +218,109 @@ func TestAnHonestSeederThatHiccupsIsNotStarved(t *testing.T) {
 	t.Logf("%d of %d leaves in %s", len(got), len(rig.leaves), time.Since(start).Round(100*time.Millisecond))
 	if len(got) != len(rig.leaves) {
 		t.Fatalf("%d of %d leaves arrived within %s (the seeder was starved after its hiccup)", len(got), len(rig.leaves), stallTimeout)
+	}
+}
+
+// pinataRecv answers HAVE to every want-have at once and never a want-block (bitswap.pinata.cloud, as seen).
+type pinataRecv struct {
+	net bsnetwork.BitSwapNetwork
+	wb  atomic.Int64
+}
+
+func (r *pinataRecv) ReceiveMessage(_ context.Context, p peer.ID, m bsmsg.BitSwapMessage) {
+	out := bsmsg.New(false)
+	for _, e := range m.Wantlist() {
+		switch {
+		case e.Cancel:
+		case e.WantType == pb.Message_Wantlist_Have:
+			out.AddHave(e.Cid)
+		default:
+			r.wb.Add(1)
+		}
+	}
+	if len(out.Haves()) > 0 {
+		go func() { _ = r.net.SendMessage(context.Background(), p, out) }()
+	}
+}
+func (r *pinataRecv) ReceiveError(error)       {}
+func (r *pinataRecv) PeerConnected(peer.ID)    {}
+func (r *pinataRecv) PeerDisconnected(peer.ID) {}
+
+// Replication 6's stalls: a promiser that answers every want-have with a HAVE at once, while a big fetch keeps it
+// answering, must still go out for the want-blocks it sits on — a small fetch started beside the big one lands long
+// before the big one does, not after it (its want-blocks parked on the promiser for as long as the big fetch ran, and
+// in production the stall watchdog tore it down). Teeth: count a message without a block as progress.
+func TestAPromiserKeptBusyAnsweringStillGoesOut(t *testing.T) {
+	a, c, tk := quarantineAfter, quarantineCool, quarantineTick
+	quarantineAfter, quarantineCool, quarantineTick = 2*time.Second, time.Minute, 200*time.Millisecond
+	defer func() { quarantineAfter, quarantineCool, quarantineTick = a, c, tk }()
+	defer func(m int) { maxPerFetch = m }(maxPerFetch)
+	maxPerFetch = 32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mn, err := mocknet.FullMeshLinked(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mn.Close()
+	mn.SetLinkDefaults(mocknet.LinkOptions{Latency: 5 * time.Millisecond})
+	hosts := mn.Hosts()
+	hostA, hostH, hostB := hosts[0], hosts[1], hosts[2]
+	bstoreA := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	dservA := merkledag.NewDAGService(blockservice.New(bstoreA, offline.Exchange(bstoreA)))
+	leaves := func(n int) []cid.Cid {
+		b := make([]byte, n)
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+		_, l := buildLeafDAG(t, dservA, b)
+		return l
+	}
+	small, big := leaves(8<<20), leaves(64<<20)
+	bswapA := bitswap.New(ctx, bsnet.NewFromIpfsHost(hostA), nilFinder{}, bstoreA, bitswapOptions(nil)...)
+	defer bswapA.Close()
+	netH := bsnet.NewFromIpfsHost(hostH)
+	pinata := &pinataRecv{net: netH}
+	netH.Start(pinata)
+	defer netH.Stop()
+	bstoreB := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	q := newQuarantineNet(bsnet.NewFromIpfsHost(hostB))
+	go q.run(ctx)
+	bswapB := bitswap.New(ctx, q, fixedFinder{{ID: hostH.ID()}, {ID: hostA.ID()}}, bstoreB, bitswapOptions(nil)...)
+	defer bswapB.Close()
+	if err := mn.ConnectAllButSelf(); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range mn.LinksBetweenPeers(hostA.ID(), hostB.ID()) {
+		l.SetOptions(mocknet.LinkOptions{Latency: 5 * time.Millisecond, Bandwidth: 4 << 20}) // the big fetch takes ~16 s
+	}
+	bsvc := blockservice.New(bstoreB, bswapB)
+	start := time.Now()
+	type result struct {
+		name string
+		got  int
+		at   time.Duration
+	}
+	done := make(chan result, 2)
+	fetch := func(name string, l []cid.Cid) {
+		fctx, fc := context.WithTimeout(ctx, 60*time.Second)
+		defer fc()
+		n := 0
+		for range rollingGetBlocks(fctx, blockservice.NewSession(ctx, bsvc), l, 32) {
+			n++
+		}
+		done <- result{name, n, time.Since(start)}
+	}
+	go fetch("big", big)
+	time.Sleep(300 * time.Millisecond)
+	go fetch("small", small)
+	first, second := <-done, <-done
+	t.Logf("%s %d in %s, %s %d in %s; the promiser was sent %d want-block(s)", first.name, first.got, first.at.Round(100*time.Millisecond),
+		second.name, second.got, second.at.Round(100*time.Millisecond), pinata.wb.Load())
+	if first.name != "small" || first.got != len(small) {
+		t.Fatalf("the small fetch was not the first to land whole (%s first, %d leaves): its want-blocks sat on the promiser while the big fetch ran", first.name, first.got)
+	}
+	if second.got != len(big) {
+		t.Fatalf("the big fetch got %d of %d leaves", second.got, len(big))
 	}
 }

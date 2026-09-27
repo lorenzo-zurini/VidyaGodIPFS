@@ -9,9 +9,7 @@ import (
 	pb "github.com/ipfs/boxo/bitswap/message/pb"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/metrics"
 	peer "github.com/libp2p/go-libp2p/core/peer"
-	protocol "github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 )
 
@@ -36,7 +34,6 @@ type quarantineRig struct {
 	r                   quarantineReceiver
 	now                 time.Time
 	client, server, all *fakeSide
-	forgot              []peer.ID
 }
 
 func newQuarantineRig(t *testing.T) *quarantineRig {
@@ -47,18 +44,19 @@ func newQuarantineRig(t *testing.T) *quarantineRig {
 	g.q = newQuarantineNet(nil)
 	g.q.now = func() time.Time { return g.now }
 	g.q.client, g.q.server, g.q.recv = g.client, g.server, g.all
-	g.q.forget = func(p peer.ID) { g.forgot = append(g.forgot, p) }
 	g.r = quarantineReceiver{g.q}
 	return g
 }
 
-func (g *quarantineRig) want(p peer.ID, cs ...cid.Cid) {
+func (g *quarantineRig) send(p peer.ID, wt pb.Message_Wantlist_WantType, cs ...cid.Cid) {
 	m := bsmsg.New(false)
 	for _, c := range cs {
-		m.AddEntry(c, 1, pb.Message_Wantlist_Block, true)
+		m.AddEntry(c, 1, wt, true)
 	}
 	g.q.noteSent(p, m)
 }
+
+func (g *quarantineRig) want(p peer.ID, cs ...cid.Cid) { g.send(p, pb.Message_Wantlist_Block, cs...) }
 
 func (g *quarantineRig) cancel(p peer.ID, c cid.Cid) {
 	m := bsmsg.New(false)
@@ -80,6 +78,12 @@ func (g *quarantineRig) have(p peer.ID, cs ...cid.Cid) {
 	})
 }
 
+// offer: we ask p whether it has cs (want-have), and it says HAVE.
+func (g *quarantineRig) offer(p peer.ID, cs ...cid.Cid) {
+	g.send(p, pb.Message_Wantlist_Have, cs...)
+	g.have(p, cs...)
+}
+
 func (g *quarantineRig) advance(d time.Duration) {
 	for end := g.now.Add(d); g.now.Before(end); {
 		g.now = g.now.Add(time.Second)
@@ -87,25 +91,34 @@ func (g *quarantineRig) advance(d time.Duration) {
 	}
 }
 
+func (g *quarantineRig) toldGone(p peer.ID) bool {
+	for _, d := range g.client.disconns {
+		if d == p {
+			return true
+		}
+	}
+	return false
+}
+
 func blk(s string) blocks.Block { return blocks.NewBlock([]byte(s)) }
 
 // Who is taken out, and when. Teeth, each caught below: count a HAVE as a delivery; quarantine a sole provider (no
-// other peer offers what it holds); count an offer from a peer that is itself out; ignore bitswap bytes as progress;
-// quarantine a peer that keeps delivering; keep a cancelled or answered want on the ledger; record wants sent to a
-// peer while it is out (it would be put out again the moment it is back); stop doubling the cooldown; keep the
-// strikes after a delivery.
+// other peer offers what it holds); count an offer from a peer that is itself out; count an unsolicited HAVE as an
+// offer; keep an offer past a Full wantlist, or past its peer going out; quarantine a peer that keeps delivering;
+// keep a cancelled or answered want (or its offers) on the ledger; record wants sent to a peer while it is out (it
+// would be put out again the moment it is back); stop doubling the cooldown; keep the strikes after a delivery.
 func TestQuarantineRules(t *testing.T) {
-	promiser, seeder, sole, slow := peer.ID("promiser"), peer.ID("seeder"), peer.ID("sole"), peer.ID("slow")
+	promiser, seeder, sole, other := peer.ID("promiser"), peer.ID("seeder"), peer.ID("sole"), peer.ID("other")
 	x, y, z, u, w := blk("x"), blk("y"), blk("z"), blk("u"), blk("w")
 	// rig: every peer connected; the promiser out at t+5s (it held x, which the seeder offers).
 	rig := func(t *testing.T) *quarantineRig {
 		g := newQuarantineRig(t)
-		for _, p := range []peer.ID{promiser, seeder, sole, slow} {
+		for _, p := range []peer.ID{promiser, seeder, sole, other} {
 			g.r.PeerConnected(p)
 		}
-		g.have(promiser, x.Cid(), u.Cid())
-		g.have(seeder, x.Cid())
+		g.offer(seeder, x.Cid())
 		g.want(promiser, x.Cid())
+		g.have(promiser, x.Cid())
 		g.advance(4 * time.Second)
 		if g.q.out(promiser) {
 			t.Fatal("quarantined before quarantineAfter")
@@ -122,55 +135,74 @@ func TestQuarantineRules(t *testing.T) {
 	}
 
 	t.Run("a sole provider stays", func(t *testing.T) {
-		// Taking it out would turn slow into stopped. An offer from a peer that is itself out (the promiser HAVE'd u
-		// before it went out) is no alternative.
+		// Taking it out would turn slow into stopped. No alternative: an unsolicited HAVE (other never was asked for
+		// w), nor an offer from a peer that is out (the promiser's HAVE for u, sent as it went out, is kept from us).
 		g := rig(t)
-		g.have(sole, w.Cid(), u.Cid())
+		g.have(other, w.Cid())
+		g.offer(promiser, u.Cid())
+		g.offer(sole, w.Cid(), u.Cid())
 		g.want(sole, w.Cid(), u.Cid())
 		g.advance(20 * time.Second) // the promiser stays out throughout
-		if g.q.out(sole) {
+		if g.toldGone(sole) {
 			t.Fatal("a sole provider was taken out: nobody in the rotation offers what it holds")
+		}
+		if _, ok := g.q.haves[w.Cid()][other]; ok {
+			t.Fatal("an unsolicited HAVE was noted as an offer")
 		}
 	})
 
-	t.Run("bytes are progress", func(t *testing.T) {
-		// Bytes arriving on bitswap: a block still crossing a slow link.
+	t.Run("an offer ends with the peer going out", func(t *testing.T) {
+		// The promiser offered u before it went out; once back, that stale offer must not take a peer out.
+		g := newQuarantineRig(t)
+		for _, p := range []peer.ID{promiser, seeder, sole} {
+			g.r.PeerConnected(p)
+		}
+		g.offer(promiser, u.Cid())
+		g.offer(seeder, x.Cid())
+		g.want(promiser, x.Cid())
+		g.advance(5 * time.Second)
+		if !g.q.out(promiser) {
+			t.Fatal("setup: the promiser is not out")
+		}
+		g.advance(30 * time.Second) // back
+		g.offer(sole, u.Cid())
+		g.want(sole, u.Cid())
+		g.advance(10 * time.Second)
+		if g.toldGone(sole) {
+			t.Fatal("a peer was taken out on an offer made before the offerer went out")
+		}
+	})
+
+	t.Run("a full wantlist ends the offers", func(t *testing.T) {
 		g := rig(t)
-		bytes := map[peer.ID]int64{}
-		g.q.bytes = func(p peer.ID) int64 { return bytes[p] }
-		g.have(seeder, y.Cid())
-		g.want(slow, y.Cid())
-		for i := 0; i < 6; i++ {
-			bytes[slow] += 64 << 10
-			g.advance(2 * time.Second)
-		}
-		if g.q.out(slow) {
-			t.Fatal("a peer whose block is still arriving was taken out")
-		}
-		g.advance(5 * time.Second) // nothing more arrives
-		if !g.q.out(slow) {
-			t.Fatal("no bytes for quarantineAfter while the seeder offers the block: the slow peer must be out")
+		g.offer(other, w.Cid())
+		full := bsmsg.New(true)
+		full.AddEntry(y.Cid(), 1, pb.Message_Wantlist_Have, true)
+		g.q.noteSent(other, full)
+		if _, ok := g.q.haves[w.Cid()]; ok {
+			t.Fatal("an offer outlived the want a Full wantlist replaced")
 		}
 	})
 
 	t.Run("a delivering peer stays; answers leave the ledger", func(t *testing.T) {
 		g := rig(t)
-		g.have(sole, y.Cid(), z.Cid())
+		g.offer(sole, y.Cid(), z.Cid())
 		g.want(seeder, y.Cid(), z.Cid())
 		for i := 0; i < 5; i++ {
 			g.advance(2 * time.Second)
 			g.recv(seeder, func(m bsmsg.BitSwapMessage) { m.AddBlock(blk("other" + string(rune('a'+i)))) })
 		}
-		for _, p := range g.client.disconns {
-			if p == seeder { // (a delivery brings it straight back: ask the client, not out())
-				t.Fatal("a peer that keeps delivering was quarantined")
-			}
+		if g.toldGone(seeder) { // (a delivery brings it straight back: ask the client, not out())
+			t.Fatal("a peer that keeps delivering was quarantined")
 		}
 		g.recv(seeder, func(m bsmsg.BitSwapMessage) { m.AddBlock(y); m.AddDontHave(z.Cid()) })
 		g.want(seeder, x.Cid())
 		g.cancel(seeder, x.Cid())
 		if n := len(g.q.peers[seeder].wanted); n != 0 {
 			t.Fatalf("%d want(s) still held after a block, a DONT_HAVE and a cancel", n)
+		}
+		if n := len(g.q.peers[seeder].asked); n != 0 {
+			t.Fatalf("%d ask(s) still open after a block, a DONT_HAVE and a cancel", n)
 		}
 		if _, ok := g.q.haves[y.Cid()]; ok {
 			t.Fatal("a delivered block's offers are still remembered")
@@ -187,10 +219,13 @@ func TestQuarantineRules(t *testing.T) {
 	t.Run("a want sent while out is not held against it", func(t *testing.T) {
 		g := rig(t)
 		g.want(promiser, z.Cid()) // queued before it went out
-		g.have(seeder, z.Cid())
+		g.offer(seeder, z.Cid())
 		g.advance(30 * time.Second) // its first cooldown (30 s) is over
 		if g.q.out(promiser) {
 			t.Fatal("still out after its cooldown")
+		}
+		if len(g.client.conns) != 1 || g.client.conns[0] != promiser {
+			t.Fatalf("its cooldown over, the client was told %v connected, want [promiser]", g.client.conns)
 		}
 		g.advance(time.Second)
 		if g.q.out(promiser) {
@@ -201,6 +236,7 @@ func TestQuarantineRules(t *testing.T) {
 	t.Run("the cooldown doubles, and starts over after a delivery", func(t *testing.T) {
 		g := rig(t)
 		g.advance(30 * time.Second)
+		g.offer(seeder, x.Cid())
 		g.want(promiser, x.Cid())
 		g.advance(5 * time.Second)
 		if l := g.q.peers[promiser]; !g.q.out(promiser) || l.until.Sub(g.now) != 60*time.Second {
@@ -208,8 +244,8 @@ func TestQuarantineRules(t *testing.T) {
 		}
 		g.advance(60 * time.Second)
 		g.recv(promiser, func(m bsmsg.BitSwapMessage) { m.AddBlock(x) })
+		g.offer(seeder, y.Cid())
 		g.want(promiser, y.Cid())
-		g.have(seeder, y.Cid())
 		g.advance(5 * time.Second)
 		if l := g.q.peers[promiser]; l.until.Sub(g.now) != 30*time.Second {
 			t.Fatalf("after a delivery its next cooldown is %s, want the first (30s)", l.until.Sub(g.now))
@@ -219,16 +255,17 @@ func TestQuarantineRules(t *testing.T) {
 
 // What a quarantined peer says, and where it goes. Out, its HAVEs never reach the client (they would make it the
 // session's best peer again), its wants still reach our server, and a block it delivers brings it back and reaches
-// the client: nothing it sends is thrown away. A peer that left while out is not announced back; a peer with nothing
-// to remember is forgotten when it leaves. Teeth: forward an out peer's HAVEs; drop its wants; drop (or hold back)
-// its blocks; release it without telling the client; announce a departed peer; keep a clean ledger; skip forget.
+// the client: nothing it sends is thrown away. A peer that left while out is not announced back, and its ledger goes
+// once its cooldown ends; a peer with nothing to remember is dropped at the next check. Teeth: forward an out peer's
+// HAVEs; drop its wants; drop (or hold back) its blocks; release it without telling the client; announce a departed
+// peer; drop an out peer's ledger when it leaves; keep a departed peer's ledger; keep its offers.
 func TestQuarantineKeepsWhatThePeerSays(t *testing.T) {
 	g := newQuarantineRig(t)
 	p, seeder, passer := peer.ID("promiser"), peer.ID("seeder"), peer.ID("passer")
 	g.r.PeerConnected(p)
 	g.r.PeerConnected(seeder)
 	x, y := blk("x"), blk("y")
-	g.have(seeder, x.Cid())
+	g.offer(seeder, x.Cid())
 	g.want(p, x.Cid())
 	g.advance(5 * time.Second)
 	if !g.q.out(p) {
@@ -274,65 +311,72 @@ func TestQuarantineKeepsWhatThePeerSays(t *testing.T) {
 		t.Fatal("the block an out peer delivered (with the rest of its message) did not reach bitswap")
 	}
 
-	// Out again; it leaves; its cooldown ends: nobody to announce, but its strikes are remembered.
-	g.have(seeder, y.Cid())
+	// Out again; it leaves; its strikes last until its cooldown ends, and nobody is announced.
+	g.offer(seeder, y.Cid())
 	g.want(p, y.Cid())
 	g.advance(5 * time.Second)
 	if !g.q.out(p) {
 		t.Fatal("setup: the promiser is not out again")
 	}
 	g.r.PeerDisconnected(p)
+	g.advance(time.Second)
 	if _, ok := g.q.peers[p]; !ok {
 		t.Fatal("a quarantined peer's ledger was dropped when it left: it would come back with a clean record")
 	}
-	g.advance(31 * time.Second)
+	g.advance(30 * time.Second)
 	if len(g.client.conns) != 1 {
 		t.Fatal("a peer that left while out was announced back to the client")
 	}
+	if _, ok := g.q.peers[p]; ok {
+		t.Fatal("a departed peer's ledger outlived its cooldown")
+	}
 
-	// A peer with nothing to remember is forgotten when it leaves, and so are its offers.
+	// A peer with nothing to remember is dropped at the next check, and its offers at once.
 	g.r.PeerConnected(passer)
-	g.have(passer, x.Cid())
+	g.offer(passer, x.Cid())
 	g.r.PeerDisconnected(passer)
-	if _, ok := g.q.peers[passer]; ok {
-		t.Fatal("a clean peer's ledger outlived its connection")
-	}
-	if len(g.forgot) != 1 || g.forgot[0] != passer {
-		t.Fatalf("forgot %v, want [passer] (its byte count would outlive it)", g.forgot)
-	}
 	if _, ok := g.q.haves[x.Cid()]; ok {
 		t.Fatal("a departed peer's offers are still remembered")
 	}
-}
-
-type recordingReporter struct {
-	*metrics.BandwidthCounter
-	in int64
-}
-
-func (r *recordingReporter) LogRecvMessageStream(size int64, proto protocol.ID, p peer.ID) {
-	r.in += size
-	r.BandwidthCounter.LogRecvMessageStream(size, proto, p)
-}
-
-// Only bitswap streams count: a peer's DHT chatter is not progress on our want-blocks. Teeth: count every protocol;
-// forget nothing on drop; stop passing the counts on to the node's bandwidth counter.
-func TestBitswapBytesCountsOnlyBitswapStreams(t *testing.T) {
-	inner := &recordingReporter{BandwidthCounter: metrics.NewBandwidthCounter()}
-	b := newBitswapBytes(inner)
-	p := peer.ID("p")
-	b.LogRecvMessageStream(1000, "/ipfs/bitswap/1.2.0", p)
-	b.LogRecvMessageStream(24, "/ipfs/bitswap", p)
-	b.LogRecvMessageStream(5000, "/ipfs/kad/1.0.0", p)
-	if got := b.of(p); got != 1024 {
-		t.Fatalf("counted %d bitswap bytes, want 1024", got)
+	g.advance(time.Second)
+	if _, ok := g.q.peers[passer]; ok {
+		t.Fatal("a departed peer's ledger outlived its connection")
 	}
-	if inner.in != 6024 {
-		t.Fatalf("the node's bandwidth counter saw %d bytes, want all 6024", inner.in)
+}
+
+// A tick that moves nobody takes no exclusive lock: it would wait out the slowest delivery in flight and hold every
+// other peer's messages behind it, once a second. A tick that moves someone does. Teeth: take dmu exclusively on every
+// tick; move a peer without it.
+func TestQuarantineCheckLocksOnlyToMove(t *testing.T) {
+	g := newQuarantineRig(t)
+	p, seeder := peer.ID("promiser"), peer.ID("seeder")
+	g.r.PeerConnected(p)
+	g.r.PeerConnected(seeder)
+	x := blk("x")
+	g.offer(seeder, x.Cid())
+	g.want(p, x.Cid())
+	g.q.dmu.RLock() // a delivery in flight
+	done := make(chan struct{})
+	go func() { g.q.check(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		g.q.dmu.RUnlock()
+		t.Fatal("a tick with nobody to move waited on a delivery in flight")
 	}
-	b.drop(p)
-	if got := b.of(p); got != 0 {
-		t.Fatalf("%d bytes still counted after drop", got)
+	g.now = g.now.Add(5 * time.Second)
+	done = make(chan struct{})
+	go func() { g.q.check(); close(done) }()
+	select {
+	case <-done:
+		g.q.dmu.RUnlock()
+		t.Fatal("a peer was moved while a delivery was in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	g.q.dmu.RUnlock()
+	<-done
+	if !g.q.out(p) {
+		t.Fatal("the promiser was not moved once the delivery finished")
 	}
 }
 

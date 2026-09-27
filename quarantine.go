@@ -14,20 +14,23 @@ package main
 // boxo re-routes every want a peer held the moment that peer disconnects. So a peer is reported DISCONNECTED to our
 // client (not closed: the connection stays, our server keeps serving it) when, all three:
 //   - it has held a want-block for quarantineAfter,
-//   - nothing arrived from it on bitswap in that time — BYTES, not whole blocks: a block still crossing a slow link is
-//     progress (bitswapBytes),
+//   - it delivered no block in that time,
 //   - another peer, in the rotation, has said HAVE for a block it holds: there is somewhere better to ask. A sole
 //     provider, however slow, is never taken out — that would turn slow into stopped.
 // While out, its HAVEs and DONT_HAVEs are kept from the client (they would make it the session's best peer again) and
 // our finder does not offer it; its own wants still reach our server. The moment it delivers a block it is back, and
 // the block reaches the client — nothing it sends is thrown away. The cooldown doubles per offence (quarantineCool,
 // up to quarantineMaxCool) and starts over once it delivers.
+//
+// Progress is a delivered block, not bytes: a promiser's own HAVE replies are bitswap bytes too, and counting them let
+// it hold wants for as long as any other fetch kept it answering (replication 6: three stalls). An honest peer taken
+// out while a slow block is still crossing loses nothing: the block brings it back, and whoever then holds its wants
+// without delivering is offered around and goes out in turn.
 
 import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,14 +39,12 @@ import (
 	pb "github.com/ipfs/boxo/bitswap/message/pb"
 	bsnetwork "github.com/ipfs/boxo/bitswap/network"
 	cid "github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/metrics"
 	peer "github.com/libp2p/go-libp2p/core/peer"
-	protocol "github.com/libp2p/go-libp2p/core/protocol"
 )
 
 // Vars so tests can shorten them.
 var (
-	quarantineAfter   = 6 * time.Second  // a want-block held this long, with nothing arriving from the peer meanwhile
+	quarantineAfter   = 6 * time.Second  // a want-block held this long, with no block delivered meanwhile
 	quarantineCool    = 30 * time.Second // the first cooldown; doubles per offence
 	quarantineMaxCool = 10 * time.Minute
 	quarantineTick    = time.Second
@@ -51,8 +52,8 @@ var (
 
 type peerLedger struct {
 	wanted   map[cid.Cid]time.Time // want-blocks sent and not answered (block, DONT_HAVE) or cancelled
-	bytesIn  int64                 // its bitswap bytes at the last check
-	progress time.Time             // the last time anything arrived from it on bitswap
+	asked    map[cid.Cid]struct{}  // every want (have or block) sent and not answered or cancelled: its HAVEs we note
+	progress time.Time             // its last block (or its ledger's start)
 	until    time.Time             // out of the rotation until then (zero: in it)
 	strikes  int
 	linked   bool // connected, as the network last told bitswap
@@ -71,13 +72,11 @@ type quarantineNet struct {
 	dmu    sync.RWMutex // held shared while a message or connect event reaches bitswap, exclusively to move a peer
 	mu     sync.Mutex   // peers, haves
 	peers  map[peer.ID]*peerLedger
-	haves  map[cid.Cid]map[peer.ID]struct{} // who said HAVE for a block we want
+	haves  map[cid.Cid]map[peer.ID]struct{} // who said HAVE for a block we asked them for
 	client peerReceiver                     // told a quarantined peer left
 	server peerReceiver                     // never told: it keeps serving the peer (nil: no server)
 	recv   bsnetwork.Receiver               // the Bitswap both sit behind
 	now    func() time.Time
-	bytes  func(peer.ID) int64 // its bitswap bytes so far (nil: only a block is progress)
-	forget func(peer.ID)       // drops that count
 }
 
 func newQuarantineNet(inner bsnetwork.BitSwapNetwork) *quarantineNet {
@@ -101,7 +100,7 @@ func (q *quarantineNet) run(ctx context.Context) {
 func (q *quarantineNet) ledger(p peer.ID) *peerLedger {
 	l := q.peers[p]
 	if l == nil {
-		l = &peerLedger{wanted: map[cid.Cid]time.Time{}, progress: q.now()}
+		l = &peerLedger{wanted: map[cid.Cid]time.Time{}, asked: map[cid.Cid]struct{}{}, progress: q.now()}
 		q.peers[p] = l
 	}
 	return l
@@ -118,56 +117,17 @@ func (q *quarantineNet) out(p peer.ID) bool {
 }
 
 // check puts out the peers sitting on want-blocks another peer offers, and brings back those whose cooldown ended.
-// Exclusive over delivery: no message or connect event reaches bitswap while a peer moves in or out under it.
+// Moving a peer is exclusive with delivery (no message or connect event reaches bitswap while it moves under it) —
+// but only a tick that moves someone takes that lock: an exclusive lock waits out the slowest delivery in flight and
+// holds every new one behind it.
 func (q *quarantineNet) check() {
+	if outs, backs := q.scan(false); len(outs)+len(backs) == 0 {
+		return
+	}
 	q.dmu.Lock()
 	defer q.dmu.Unlock()
-	now := q.now()
-	var outs, backs []peer.ID
+	outs, backs := q.scan(true)
 	q.mu.Lock()
-	for p, l := range q.peers {
-		if q.bytes != nil {
-			if b := q.bytes(p); b != l.bytesIn {
-				l.bytesIn, l.progress = b, now
-			}
-		}
-		if !l.until.IsZero() {
-			if l.outAt(now) {
-				continue
-			}
-			l.until = time.Time{} // wanted is empty: cleared going out, and nothing is recorded while out
-			if l.linked {
-				backs = append(backs, p)
-			}
-			continue
-		}
-		if len(l.wanted) == 0 || now.Sub(l.progress) < quarantineAfter {
-			continue
-		}
-		held, offered := 0, false
-		for c, t := range l.wanted {
-			if now.Sub(t) < quarantineAfter {
-				continue
-			}
-			held++
-			if !offered {
-				offered = q.offeredElsewhere(c, p, now)
-			}
-		}
-		if held == 0 || !offered {
-			continue
-		}
-		l.strikes++
-		cool := quarantineCool << (l.strikes - 1)
-		if cool > quarantineMaxCool || cool <= 0 {
-			cool = quarantineMaxCool
-		}
-		l.until = now.Add(cool)
-		fmt.Fprintf(os.Stderr, "[quarantine] %s held %d want-block(s) for %s+ with nothing arriving, and another peer offers them — out of our download rotation for %s\n",
-			shortPeer(p.String()), held, quarantineAfter, cool)
-		clear(l.wanted)
-		outs = append(outs, p)
-	}
 	client := q.client
 	q.mu.Unlock()
 	if client == nil {
@@ -181,18 +141,90 @@ func (q *quarantineNet) check() {
 	}
 }
 
-// offeredElsewhere: a peer other than p, in the rotation, said HAVE for c (a peer's HAVEs go with its connection).
-// Under mu.
-func (q *quarantineNet) offeredElsewhere(c cid.Cid, p peer.ID, now time.Time) bool {
+// scan: who goes out, who comes back — moved only when apply. A ledger whose peer is gone, and not out, is dropped
+// either way (nobody to tell).
+func (q *quarantineNet) scan(apply bool) (outs, backs []peer.ID) {
+	now := q.now()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for p, l := range q.peers {
+		if !l.linked && !l.outAt(now) {
+			delete(q.peers, p)
+			continue
+		}
+		if !l.until.IsZero() {
+			if !l.outAt(now) {
+				backs = append(backs, p)
+				if apply {
+					l.until = time.Time{} // wanted is empty: cleared going out, and nothing is recorded while out
+				}
+			}
+			continue
+		}
+		if len(l.wanted) == 0 || now.Sub(l.progress) < quarantineAfter {
+			continue
+		}
+		held, offered := 0, false
+		for c, t := range l.wanted {
+			if now.Sub(t) < quarantineAfter {
+				continue
+			}
+			held++
+			if !offered {
+				offered = q.offeredElsewhere(c, p)
+			}
+		}
+		if held == 0 || !offered {
+			continue
+		}
+		outs = append(outs, p)
+		if !apply {
+			continue
+		}
+		l.strikes++
+		cool := quarantineCool << (l.strikes - 1)
+		if cool > quarantineMaxCool || cool <= 0 {
+			cool = quarantineMaxCool
+		}
+		l.until = now.Add(cool)
+		fmt.Fprintf(os.Stderr, "[quarantine] %s held %d want-block(s) for %s+ and delivered nothing, and another peer offers them — out of our download rotation for %s\n",
+			shortPeer(p.String()), held, quarantineAfter, cool)
+		clear(l.wanted)
+		q.dropAsked(p, l) // the client stops talking to it: no cancel will follow, and its offers are void
+	}
+	return outs, backs
+}
+
+// offeredElsewhere: a peer other than p said HAVE for c. It is in the rotation: a peer's offers go when it goes out
+// or away, and are not noted while it is out. Under mu.
+func (q *quarantineNet) offeredElsewhere(c cid.Cid, p peer.ID) bool {
 	for o := range q.haves[c] {
-		if ol := q.peers[o]; o != p && ol != nil && !ol.outAt(now) {
+		if o != p {
 			return true
 		}
 	}
 	return false
 }
 
-// noteSent records the want-blocks (and cancels) a message to p carries. A want that reaches a peer while it is out
+// forgetHave: p no longer offers c. Under mu.
+func (q *quarantineNet) forgetHave(c cid.Cid, p peer.ID) {
+	if who := q.haves[c]; who != nil {
+		delete(who, p)
+		if len(who) == 0 {
+			delete(q.haves, c)
+		}
+	}
+}
+
+// dropAsked: every want to p is over, and so is every offer it made (it only offers what it was asked). Under mu.
+func (q *quarantineNet) dropAsked(p peer.ID, l *peerLedger) {
+	for c := range l.asked {
+		q.forgetHave(c, p)
+	}
+	clear(l.asked)
+}
+
+// noteSent records the wants (and cancels) a message to p carries. A want-block that reaches a peer while it is out
 // (queued before it went out) is not held against it.
 func (q *quarantineNet) noteSent(p peer.ID, m bsmsg.BitSwapMessage) {
 	wl := m.Wantlist()
@@ -206,22 +238,24 @@ func (q *quarantineNet) noteSent(p peer.ID, m bsmsg.BitSwapMessage) {
 	out := l.outAt(now)
 	if m.Full() {
 		clear(l.wanted)
+		q.dropAsked(p, l)
 	}
 	for _, e := range wl {
-		switch {
-		case e.Cancel:
+		if e.Cancel {
 			delete(l.wanted, e.Cid)
+			delete(l.asked, e.Cid)
 			delete(q.haves, e.Cid) // the want is over: who offered it no longer matters
-		case e.WantType == pb.Message_Wantlist_Block && !out:
-			if _, ok := l.wanted[e.Cid]; !ok {
-				l.wanted[e.Cid] = now // a re-sent want keeps its first time
-			}
+			continue
+		}
+		l.asked[e.Cid] = struct{}{}
+		if _, ok := l.wanted[e.Cid]; !ok && e.WantType == pb.Message_Wantlist_Block && !out {
+			l.wanted[e.Cid] = now // a re-sent want keeps its first time
 		}
 	}
 }
 
 // noteReceived records what a message from p answers and offers: its blocks (progress; the want is over), its
-// DONT_HAVEs, its HAVEs.
+// DONT_HAVEs, and its HAVEs for what we asked it (an unsolicited HAVE is no offer, and would never be cleared).
 func (q *quarantineNet) noteReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 	blks, have, dh := m.Blocks(), m.Haves(), m.DontHaves()
 	if len(blks) == 0 && len(have) == 0 && len(dh) == 0 {
@@ -233,18 +267,18 @@ func (q *quarantineNet) noteReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 	l := q.ledger(p)
 	for _, b := range blks {
 		delete(l.wanted, b.Cid())
+		delete(l.asked, b.Cid())
 		delete(q.haves, b.Cid())
 	}
 	for _, c := range dh {
 		delete(l.wanted, c)
-		if who := q.haves[c]; who != nil {
-			delete(who, p)
-			if len(who) == 0 {
-				delete(q.haves, c)
-			}
-		}
+		delete(l.asked, c)
+		q.forgetHave(c, p)
 	}
 	for _, c := range have {
+		if _, ok := l.asked[c]; !ok {
+			continue
+		}
 		if q.haves[c] == nil {
 			q.haves[c] = map[peer.ID]struct{}{}
 		}
@@ -369,59 +403,17 @@ func (r quarantineReceiver) PeerConnected(p peer.ID) {
 	r.q.recv.PeerConnected(p)
 }
 
+// PeerDisconnected: what it held and offered goes with it; its ledger goes at the next check unless it is out (its
+// strikes then last until its cooldown ends).
 func (r quarantineReceiver) PeerDisconnected(p peer.ID) {
 	r.q.dmu.RLock()
 	defer r.q.dmu.RUnlock()
 	r.q.mu.Lock()
-	for c, who := range r.q.haves {
-		delete(who, p)
-		if len(who) == 0 {
-			delete(r.q.haves, c)
-		}
-	}
 	if l := r.q.peers[p]; l != nil {
 		l.linked = false
 		clear(l.wanted)
-		if l.until.IsZero() && l.strikes == 0 { // nothing to remember: a peer that comes and goes costs nothing
-			delete(r.q.peers, p)
-			if r.q.forget != nil {
-				r.q.forget(p)
-			}
-		}
+		r.q.dropAsked(p, l)
 	}
 	r.q.mu.Unlock()
 	r.q.recv.PeerDisconnected(p)
-}
-
-// bitswapBytes counts, per peer, the bytes read from its bitswap streams — progress a block still crossing a slow link
-// already shows (the bandwidth counter's per-peer totals cover every protocol: a peer's DHT chatter is not progress).
-type bitswapBytes struct {
-	metrics.Reporter
-	mu sync.Mutex
-	in map[peer.ID]int64
-}
-
-func newBitswapBytes(inner metrics.Reporter) *bitswapBytes {
-	return &bitswapBytes{Reporter: inner, in: map[peer.ID]int64{}}
-}
-
-func (b *bitswapBytes) LogRecvMessageStream(size int64, proto protocol.ID, p peer.ID) {
-	if strings.HasPrefix(string(proto), "/ipfs/bitswap") {
-		b.mu.Lock()
-		b.in[p] += size
-		b.mu.Unlock()
-	}
-	b.Reporter.LogRecvMessageStream(size, proto, p)
-}
-
-func (b *bitswapBytes) of(p peer.ID) int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.in[p]
-}
-
-func (b *bitswapBytes) drop(p peer.ID) {
-	b.mu.Lock()
-	delete(b.in, p)
-	b.mu.Unlock()
 }
