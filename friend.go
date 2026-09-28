@@ -36,6 +36,8 @@ const (
 	evFriendProfile  = 4 // a friend updated their nickname / picture
 	evFriendRemoved  = 5 // local removal (echoed for UI symmetry)
 	evFriendLibrary  = 6 // a friend sent their COMPLETE shared set (snapshot): payload {peer, libs:{name:[shareItem]}, seq}
+	evFriendSent     = 7 // WE asked a peer to be our friend (state=pending) — never evFriendRequest: an auto-accepting
+	// app took its own outgoing request for an incoming one, accepted it, and the request retry (pending only) stopped
 )
 
 // shareItem is one shared node in a library snapshot: the node-block CID plus the metadata the RECEIVER needs to
@@ -473,7 +475,7 @@ func (f *friendService) addFriend(pidStr, note string) error {
 			c.State = stPending
 		}
 	})
-	f.emitContact(evFriendRequest, c)
+	f.emitContact(evFriendSent, c)
 	m := f.helloMsg("request")
 	m.Note = note
 	safeGo("friend.request", func() { _ = f.send(pidStr, m) })

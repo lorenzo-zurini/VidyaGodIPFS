@@ -324,6 +324,28 @@ func TestFriendRequestIsAsyncAndRetries(t *testing.T) {
 	_ = hB // reachability/retry is exercised by TestFriendRequestRetryDeliversPersistedPending below
 }
 
+// Our own request is announced as SENT, never as an incoming request: an app that auto-accepts incoming requests
+// accepted its own outgoing one — the contact flipped to accepted, the retry loop (pending only) stopped, and a
+// request whose first send missed (a new peer not yet findable) never reached the peer at all (laptop replication:
+// the seeder "accepted" a friend who never heard of it). Teeth: emit evFriendRequest from addFriend.
+func TestOurOwnRequestIsNotAnIncomingOne(t *testing.T) {
+	var mu sync.Mutex
+	var kinds []int
+	f := newFriendService(context.Background(), testHost(t), nil, newSocialState(t.TempDir()), func(k int, _ string) {
+		mu.Lock()
+		kinds = append(kinds, k)
+		mu.Unlock()
+	})
+	if err := f.addFriend(testHost(t).ID().String(), ""); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(kinds) != 1 || kinds[0] != evFriendSent {
+		t.Fatalf("addFriend emitted %v, want only evFriendSent (%d) — never evFriendRequest (%d)", kinds, evFriendSent, evFriendRequest)
+	}
+}
+
 // The request-retry loop delivers a PERSISTED pending request with NO addFriend call this session — the app-restart
 // case (a pending contact loaded from social.json, or a peer that was offline past the one-shot send's window). ONLY
 // the retry loop can deliver here: nothing fires a send at start. Teeth: drop the pendingPeers re-send in the
