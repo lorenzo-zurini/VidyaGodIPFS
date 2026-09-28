@@ -14,9 +14,6 @@ import (
 	"sort"
 	"time"
 
-	blockservice "github.com/ipfs/boxo/blockservice"
-	offline "github.com/ipfs/boxo/exchange/offline"
-	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	blocks "github.com/ipfs/go-block-format"
@@ -102,13 +99,18 @@ func (n *node) blockGet(c cid.Cid) ([]byte, error) {
 // re-reads (and re-hashes, through the filestore) every block below on every publish, even for a folder already
 // pinned. That walk was also the only completeness check, so each child is checked whole first (heldWhole: every
 // block held, every backing file present — without re-reading the bytes); a child that is not is refused.
+func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
+	c, _, err := n.makeWholeDir(entries, false)
+	return c, err
+}
+
 // maxDirEntries bounds a folder listing: a friend's package folder is untrusted.
-const maxDirEntries = 100000
+var maxDirEntries = 100000 // var: tests shrink it
 
 // dirEntries lists a UnixFS folder — entry name → CID — from blocks this node holds, never the network: a received
 // package's node list is its own folder's listing (the share entry names the folder; nothing inside repeats it).
 func (n *node) dirEntries(c cid.Cid) (map[string]string, error) {
-	local := merkledag.NewDAGService(blockservice.New(n.fstore, offline.Exchange(n.fstore)))
+	local := n.localDserv // always offline: a folder not held is an error at once, never a fetch
 	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
 	defer cancel()
 	nd, err := local.Get(ctx, c)
@@ -128,11 +130,6 @@ func (n *node) dirEntries(c cid.Cid) (map[string]string, error) {
 		return nil
 	})
 	return out, err
-}
-
-func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
-	c, _, err := n.makeWholeDir(entries, false)
-	return c, err
 }
 
 // makeWholeDir is makeDir that, with leaveOut, builds the folder of the entries held whole and names the rest instead

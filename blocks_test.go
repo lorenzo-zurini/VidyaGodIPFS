@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	unixfs "github.com/ipfs/boxo/ipld/unixfs"
+	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	ipld "github.com/ipfs/go-ipld-format"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -316,5 +321,58 @@ func TestDirEntriesListsAHeldFolder(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("an unheld folder took %s to refuse: it must not wait", time.Since(start))
+	}
+}
+
+// tripwireDAG fails the test the moment anything uses it.
+type tripwireDAG struct {
+	ipld.DAGService
+	t *testing.T
+}
+
+func (d tripwireDAG) Get(context.Context, cid.Cid) (ipld.Node, error) {
+	d.t.Fatal("dirEntries used the online DAG service: an unheld folder would wait on the network")
+	return nil, nil
+}
+
+// Listing reads local blocks only — never the node's online DAG service (which, online, would wait on the network
+// for a folder not held); a HAMT-sharded folder lists whole; a folder past maxDirEntries is refused. Teeth: list
+// through n.dserv; list only a shard's first level; drop the cap.
+func TestDirEntriesIsLocalShardedAndBounded(t *testing.T) {
+	n := offlineNode(t)
+	saved := n.dserv
+	n.dserv = tripwireDAG{t: t}
+	defer func() { n.dserv = saved }()
+
+	sz := ufsio.HAMTShardingSize
+	ufsio.HAMTShardingSize = 512 // a few dozen entries shard
+	defer func() { ufsio.HAMTShardingSize = sz }()
+	want := map[string]string{}
+	for i := 0; i < 60; i++ {
+		c := mustRaw(t, n, []byte(fmt.Sprintf(`{"LABEL":"n%d","LAYERS":[]}`, i)))
+		want[c.String()+".json"] = c.String()
+	}
+	n.dserv = saved // makeDir builds through it
+	d, err := n.makeDir(want)
+	n.dserv = tripwireDAG{t: t}
+	if err != nil {
+		t.Fatalf("makeDir: %v", err)
+	}
+	root, err := n.localDserv.Get(context.Background(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs, err := unixfs.ExtractFSNode(root); err != nil || fs.Type() != unixfs.THAMTShard {
+		t.Fatalf("setup: the folder is not HAMT-sharded (%v)", err)
+	}
+	got, err := n.dirEntries(d)
+	if err != nil || len(got) != len(want) {
+		t.Fatalf("a sharded folder listed %d of %d entries (%v)", len(got), len(want), err)
+	}
+	m := maxDirEntries
+	maxDirEntries = 10
+	defer func() { maxDirEntries = m }()
+	if l, err := n.dirEntries(d); err == nil {
+		t.Fatalf("a folder of %d entries past a cap of 10 listed %d", len(want), len(l))
 	}
 }
