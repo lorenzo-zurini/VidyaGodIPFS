@@ -271,6 +271,28 @@ func VgBlockGet(cidStr *C.char, outBytes **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgDirEntries lists a UnixFS folder this node holds as a JSON object {name: CID} — local blocks only.
+//
+//export VgDirEntries
+func VgDirEntries(cidStr *C.char, outJson **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	entries, err := n.dirEntries(c)
+	if err != nil {
+		return fail(errOut, err)
+	}
+	b, _ := json.Marshal(entries)
+	setStr(outJson, string(b))
+	return 0
+}
+
 // VgMakeDir builds the UnixFS folder of a JSON object {name: CID} over blocks the node already holds, pins it
 // recursively, announces it now, and returns the folder CID.
 //

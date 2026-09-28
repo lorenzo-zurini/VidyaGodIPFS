@@ -14,6 +14,9 @@ import (
 	"sort"
 	"time"
 
+	blockservice "github.com/ipfs/boxo/blockservice"
+	offline "github.com/ipfs/boxo/exchange/offline"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	blocks "github.com/ipfs/go-block-format"
@@ -99,6 +102,34 @@ func (n *node) blockGet(c cid.Cid) ([]byte, error) {
 // re-reads (and re-hashes, through the filestore) every block below on every publish, even for a folder already
 // pinned. That walk was also the only completeness check, so each child is checked whole first (heldWhole: every
 // block held, every backing file present — without re-reading the bytes); a child that is not is refused.
+// maxDirEntries bounds a folder listing: a friend's package folder is untrusted.
+const maxDirEntries = 100000
+
+// dirEntries lists a UnixFS folder — entry name → CID — from blocks this node holds, never the network: a received
+// package's node list is its own folder's listing (the share entry names the folder; nothing inside repeats it).
+func (n *node) dirEntries(c cid.Cid) (map[string]string, error) {
+	local := merkledag.NewDAGService(blockservice.New(n.fstore, offline.Exchange(n.fstore)))
+	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+	defer cancel()
+	nd, err := local.Get(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	d, err := ufsio.NewDirectoryFromNode(local, nd)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	err = d.ForEachLink(ctx, func(l *ipld.Link) error {
+		if len(out) >= maxDirEntries {
+			return fmt.Errorf("folder %s has more than %d entries", c, maxDirEntries)
+		}
+		out[l.Name] = l.Cid.String()
+		return nil
+	})
+	return out, err
+}
+
 func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 	c, _, err := n.makeWholeDir(entries, false)
 	return c, err

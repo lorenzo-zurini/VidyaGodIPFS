@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"syscall"
 	"testing"
+	"time"
 
 	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	cid "github.com/ipfs/go-cid"
@@ -282,5 +283,38 @@ func TestComputeCidHoldsNoBlocks(t *testing.T) {
 	runtime.ReadMemStats(&after) // no GC in between: what it still holds is live
 	if grew := int64(after.HeapInuse) - int64(before.HeapInuse); grew > 16<<20 {
 		t.Fatalf("checking a 64 MiB file left %d MiB on the heap", grew>>20)
+	}
+}
+
+// A held folder lists exactly its entries (name → CID) — a received package's node list; a folder not held is an
+// error at once, never a wait. Teeth: list only some links; answer an unheld folder with an empty listing.
+func TestDirEntriesListsAHeldFolder(t *testing.T) {
+	n := offlineNode(t)
+	a := mustRaw(t, n, []byte(`{"LABEL":"a","LAYERS":[]}`))
+	b := mustRaw(t, n, []byte(`{"LABEL":"b","LAYERS":[]}`))
+	want := map[string]string{a.String() + ".json": a.String(), b.String() + ".json": b.String()}
+	d, err := n.makeDir(want)
+	if err != nil {
+		t.Fatalf("makeDir: %v", err)
+	}
+	got, err := n.dirEntries(d)
+	if err != nil {
+		t.Fatalf("dirEntries: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listed %d entries, want %d: %v", len(got), len(want), got)
+	}
+	for name, c := range want {
+		if got[name] != c {
+			t.Fatalf("entry %s → %q, want %s", name, got[name], c)
+		}
+	}
+	ghost, _ := rawCid([]byte("a folder nobody made"))
+	start := time.Now()
+	if l, err := n.dirEntries(ghost); err == nil {
+		t.Fatalf("a folder not held listed as %v", l)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("an unheld folder took %s to refuse: it must not wait", time.Since(start))
 	}
 }
