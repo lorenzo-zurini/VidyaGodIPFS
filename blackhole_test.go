@@ -448,7 +448,8 @@ func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	finder = append(finder, peer.AddrInfo{ID: hostA.ID()})
 	bstoreB := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
 	q := newQuarantineNet(bsnet.NewFromIpfsHost(hostB))
-	go q.run(ctx)
+	qDone := make(chan struct{})
+	go func() { q.run(ctx); close(qDone) }()
 	bswapB := bitswap.New(ctx, q, finder, bstoreB, bitswapOptions(nil)...)
 	defer bswapB.Close()
 	if err := mn.ConnectAllButSelf(); err != nil {
@@ -502,6 +503,9 @@ func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	firstHalf, secondHalf := half, given()-half
 	t.Logf("per file: %v; total %s; want-blocks to the promisers and the trickler: %d in the first half, %d in the second",
 		took, time.Since(start).Round(100*time.Millisecond), firstHalf, secondHalf)
+	// The quarantine loop stops before the records are read, and before the deferred restore of its timing globals.
+	cancel()
+	<-qDone
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	never := []peer.ID{hostT.ID()}
