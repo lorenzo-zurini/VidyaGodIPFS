@@ -393,8 +393,11 @@ func (r *trickleRecv) PeerDisconnected(peer.ID) {}
 // and a trickler that hands over a block now and then. Each is taken out for sitting on want-blocks — and must STAY
 // out longer each time: its record survives its connection, and a trickle neither clears it nor wins it new wants.
 // Before, every redial and every trickled block reset it to the first cooldown, and each new file's session handed
-// it wants again. Teeth: bring the peer fully back (or clear its record) on any block. (Offences kept per connection
-// instead of per peer are caught by TestQuarantineRemembersAcrossConnections, not reliably here.)
+// it wants again. Judged by each peer's record, not by want-block counts (those scale with the machine's speed: a slow
+// CI runner handed out more in the second half and failed a ratio that held locally): over a run of 30 s+ (16 files at
+// the seeder's 300 ms latency), a cooldown that keeps doubling reaches a 4th offence (2+4+8 s out, plus the holds); one
+// reset by a redial or a trickled block stays at 1-2. Teeth: bring the peer fully back (or clear its record) on any
+// block. (Offences kept per connection instead of per peer are caught by TestQuarantineRemembersAcrossConnections.)
 func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	a, c, m, tk, mh := quarantineAfter, quarantineCool, quarantineMaxCool, quarantineTick, quarantineMaxHold
 	// Production's shape at a third of its scale: floor 3 s → 1 s, maximum hold 10 s → 3 s; the trickler hands over a
@@ -499,7 +502,23 @@ func TestPromisersThatChurnAndTrickleAreKeptOut(t *testing.T) {
 	firstHalf, secondHalf := half, given()-half
 	t.Logf("per file: %v; total %s; want-blocks to the promisers and the trickler: %d in the first half, %d in the second",
 		took, time.Since(start).Round(100*time.Millisecond), firstHalf, secondHalf)
-	if secondHalf > firstHalf/2 {
-		t.Fatalf("the promisers and the trickler were given %d want-block(s) in the second half (%d in the first): they keep winning wants", secondHalf, firstHalf)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	never := []peer.ID{hostT.ID()}
+	for _, h := range hostP {
+		never = append(never, h.ID())
+	}
+	for i, id := range never {
+		strikes := 0
+		if r := q.records[id]; r != nil {
+			strikes = r.strikes
+		}
+		if strikes < 4 {
+			who := "the trickler"
+			if i > 0 {
+				who = "promiser " + string(rune('0'+i))
+			}
+			t.Errorf("%s ended on offence %d, want 4 or more: its cooldown stopped doubling (its record was reset)", who, strikes)
+		}
 	}
 }
