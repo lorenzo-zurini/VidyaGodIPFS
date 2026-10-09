@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,8 +142,9 @@ func openNode(repoPath string) error {
 	ds := dssync.MutexWrap(ldb)
 
 	bstore := blockstore.NewBlockstore(ds)
-	// FileManager references on-disk files; its "root" is "/" so absolute paths recorded at add time resolve.
-	fm := filestore.NewFileManager(ds, "/")
+	// FileManager references on-disk files, recorded relative to its root ("/"; a volume on Windows, filestoreroot.go).
+	fileRoot = filestoreRoot(runtime.GOOS, repoPath)
+	fm := filestore.NewFileManager(ds, fileRoot)
 	fm.AllowFiles = true
 	// nil MultihashProvider: M1 is offline, and the filestore Put paths guard provider use with a nil check.
 	// M3 wires the real DHT reprovider here.

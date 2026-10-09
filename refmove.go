@@ -38,7 +38,7 @@ func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
 		if r.FilePath == "" {
 			continue // a plain block, not a reference
 		}
-		p := filepath.Join("/", r.FilePath)
+		p := filepath.Join(fileRoot, r.FilePath)
 		best, bestRel := -1, ""
 		for i, m := range moves {
 			rel, err := filepath.Rel(m.from, p)

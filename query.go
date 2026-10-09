@@ -175,7 +175,7 @@ func (n *node) heldWhole(c cid.Cid) error {
 		}
 		if c.Prefix().Codec == cid.Raw {
 			if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
-				p := filepath.Join("/", res.FilePath) // relative to the FileManager root ("/", see node.go)
+				p := filepath.Join(fileRoot, res.FilePath) // relative to the FileManager root (filestoreroot.go)
 				ok, done := present[p]
 				if !done {
 					_, err := os.Stat(p)
@@ -226,8 +226,8 @@ func (n *node) orphanedRefPaths() []string {
 		if r == nil {
 			break
 		}
-		p := filepath.Join("/", r.FilePath)
-		if p == "/" {
+		p := filepath.Join(fileRoot, r.FilePath)
+		if r.FilePath == "" {
 			continue
 		}
 		if _, done := seen[p]; done {
