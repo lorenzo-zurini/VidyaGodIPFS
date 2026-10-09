@@ -73,6 +73,40 @@ func TestWantPoolFollowsTheLink(t *testing.T) {
 	}
 }
 
+// The pool is process-global and every node open starts an adapt on it, so a closing node's controller (its final
+// setLimit gives every token back) runs beside the next node's. Under -race that must not race, and when both end
+// every token is back. Teeth (go test -race): drop wantPool.mu.
+func TestTwoControllersShareThePool(t *testing.T) {
+	p := newWantPool(768)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.delivered.Add(50)
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
+	}()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	doneA, doneB := make(chan struct{}), make(chan struct{})
+	go func() { p.adapt(ctxA, time.Millisecond); close(doneA) }()
+	go func() { p.adapt(ctxB, time.Millisecond); close(doneB) }()
+	time.Sleep(50 * time.Millisecond)
+	cancelA() // the closing node's controller gives its tokens back while the other keeps sizing the pool
+	<-doneA
+	time.Sleep(20 * time.Millisecond)
+	cancelB()
+	<-doneB
+	close(stop)
+	if p.available() != 768 {
+		t.Fatalf("both controllers ended with %d of 768 tokens available", p.available())
+	}
+}
+
 // The laptop replication's stalls, on a 4 MB/s link: a small fetch started beside a big one must not queue behind the
 // big one's whole budget at the provider. With the pool fixed at 768 (384 for one fetch) the big fetch had ~96 MB
 // queued there — ~24 s at 4 MB/s — and the small fetch got no block for 20 s and was torn down; with the pool sized

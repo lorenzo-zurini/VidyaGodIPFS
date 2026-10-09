@@ -74,8 +74,11 @@ type wantPool struct {
 	size      int
 	limit     atomic.Int64 // tokens in circulation: size minus the parked
 	delivered atomic.Int64 // tokens returned by a block landing (not by a fetch ending)
-	parked    int          // tokens the controller holds back (adapt's goroutine only)
-	rate      float64      // blocks landing per second, smoothed (adapt's goroutine only)
+	// mu guards parked and rate: the pool is process-global and every node open starts an adapt on it, so a closing
+	// node's final setLimit can run beside the next node's controller.
+	mu     sync.Mutex
+	parked int     // tokens the controller holds back
+	rate   float64 // blocks landing per second, smoothed
 }
 
 func newWantPool(n int) *wantPool {
@@ -117,13 +120,21 @@ func (p *wantPool) step(dt float64) {
 	if dt <= 0 {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.rate = 0.5*p.rate + 0.5*float64(p.delivered.Swap(0))/dt
-	p.setLimit(int(math.Ceil(p.rate * wantLatency.Seconds())))
+	p.setLimitLocked(int(math.Ceil(p.rate * wantLatency.Seconds())))
 }
 
 // setLimit parks or returns tokens toward n circulating (at least wantFloor; never more than the pool has); a token
 // in use is parked when it comes back, at a later step.
 func (p *wantPool) setLimit(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setLimitLocked(n)
+}
+
+func (p *wantPool) setLimitLocked(n int) {
 	if n < wantFloor {
 		n = wantFloor
 	}
