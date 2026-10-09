@@ -1504,7 +1504,9 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 	for _, lf := range leaves {
 		fsns = append(fsns, &posinfo.FilestoreNode{
 			Node:    &refLeaf{c: lf.c, size: lf.sz},
-			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: dest, Stat: st},
+			// Cleaned: the filestore checks the path against its root as a plain prefix, and on Windows a caller's
+			// "D:/a/x" is not under the root "D:\\" until its separators are native.
+			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: filepath.Clean(dest), Stat: st},
 		})
 	}
 	fdbg("finalize %s: dest size=%d, referencing %d leaves via PutMany (validates each leaf hash vs on-disk bytes)", root, st.Size(), len(fsns))
