@@ -97,7 +97,6 @@ func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]boo
 		selfName = "Player-" + shortPeer(self)
 	}
 	return map[string]string{
-		"VIDYAGOD_SANDBOX":     "on",
 		"VIDYAGOD_SANDBOX_NET": "isolated", // the LAN lives ONLY in the game's netns — the host stack is never touched
 		"VIDYAGOD_SELF_VIP":    myVIP,
 		"VIDYAGOD_SELF_NAME":   selfName,

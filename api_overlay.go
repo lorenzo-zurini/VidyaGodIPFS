@@ -113,7 +113,7 @@ func VgOverlayActive() C.int {
 }
 
 // The custom variables a sandboxed game launch consumes to join the friend LAN + configure its LAN emulator
-// (VIDYAGOD_SANDBOX / SANDBOX_NET=isolated / SELF_VIP / SUBNET / PEER_VIPS / PEER_NAMES). Returns a JSON object through
+// (VIDYAGOD_SANDBOX_NET=isolated / SELF_VIP / SUBNET / PEER_VIPS / PEER_NAMES). Returns a JSON object through
 // outJson; -1 if the friend LAN is unavailable.
 //
 //export VgLanLaunchVars
