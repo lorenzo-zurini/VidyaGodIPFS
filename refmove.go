@@ -18,7 +18,8 @@ import (
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
 )
 
-// refMove: the files under from now live at the same relative paths under to.
+// refMove: the files under from now live at the same relative paths under to — or, when from is a file, that one
+// file now lives at to (a content file renamed in place: two versions of one name kept side by side).
 type refMove struct{ from, to string }
 
 // moveRefs re-points every filestore reference whose file lies under a move's from to the same relative path under
@@ -42,8 +43,11 @@ func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
 		best, bestRel := -1, ""
 		for i, m := range moves {
 			rel, err := filepath.Rel(m.from, p)
-			if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				continue // not under this move's folder
+			}
+			if rel == "." {
+				rel = "" // the file itself moved
 			}
 			if best < 0 || len(m.from) > len(moves[best].from) {
 				best, bestRel = i, rel

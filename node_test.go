@@ -838,3 +838,37 @@ func TestMoveRefsNestedMovesInOneScan(t *testing.T) {
 		}
 	}
 }
+
+// A content file renamed in place (two versions of one name kept side by side in a package) takes its references with
+// it: a move whose from is the file itself. Teeth: skip a path equal to from (the folder-only rule) and the renamed
+// file reads as missing.
+func TestMoveRefsFollowsARenamedFile(t *testing.T) {
+	n := offlineNode(t)
+	root := t.TempDir()
+	oldPath, newPath, other := filepath.Join(root, "DxWnd.zip"), filepath.Join(root, "DxWnd [abcd1234].zip"), filepath.Join(root, "DxWnd.zip.bak")
+	writeFile(t, oldPath, sampleBytes())
+	writeFile(t, other, []byte("a file whose name starts the same"))
+	c, err := n.addNoCopy(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cOther, err := n.addNoCopy(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	if !n.cidMissing(c) {
+		t.Fatal("precondition: after the rename the old reference must read as missing")
+	}
+	if _, err := n.moveRefs(n.ctx, refMove{oldPath, newPath}); err != nil {
+		t.Fatal(err)
+	}
+	if n.cidMissing(c) {
+		t.Fatal("the renamed file reads as missing after moveRefs")
+	}
+	if res := filestore.List(n.ctx, n.fstore, cOther); res == nil || filepath.Join("/", res.FilePath) != other {
+		t.Fatalf("a sibling whose name starts the same was re-pointed: %+v", res)
+	}
+}
