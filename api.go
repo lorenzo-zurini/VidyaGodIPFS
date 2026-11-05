@@ -747,25 +747,6 @@ func VgSetExpectedSize(cidStr *C.char, size C.longlong) {
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
 
-// VgIpnsPublish signs + publishes an IPNS record for OUR name (the identity key = friend code) pointing at cidStr,
-// with a long EOL; ttlSeconds is the resolver-cache hint (<=0 → default). The record is re-published before EOL by
-// the node's republish loop for as long as it stays online. Blocks on the DHT put; call off the UI thread.
-//
-//export VgIpnsPublish
-func VgIpnsPublish(cidStr *C.char, ttlSeconds C.int, errOut **C.char) C.int {
-	n := get()
-	if n == nil {
-		setStr(errOut, "node not started")
-		return -1
-	}
-	ctx, cancel := context.WithTimeout(n.ctx, 90*time.Second)
-	defer cancel()
-	if err := n.ipnsPublish(ctx, C.GoString(cidStr), time.Duration(ttlSeconds)*time.Second); err != nil {
-		return fail(errOut, err)
-	}
-	return 0
-}
-
 // VgIpnsResolve resolves /ipns/<name> (a peer ID / friend code, with or without the /ipns/ prefix) to its current
 // /ipfs/<cid> path string. DHT first, then the HTTPS-gateway fallback; the signature is verified against the name, so
 // a forged record is rejected. Returns the resolved path (e.g. "/ipfs/Qm…") via out.
