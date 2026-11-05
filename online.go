@@ -330,11 +330,13 @@ func (n *node) goOnline() error {
 	} else {
 		fmt.Fprintf(os.Stderr, "[node] IPNS namesys init failed: %v\n", nsErr)
 	}
-	fmt.Fprintf(os.Stderr, "[node] peerID=%s\n", h.ID())
+	vlog("node", "peerID=%s", h.ID())
 	safeGo("node.netStats", func() { n.logNetStats(n.ctx) })
 	startPprof()
-	for _, a := range h.Addrs() {
-		fmt.Fprintf(os.Stderr, "[node] listen=%s/p2p/%s\n", a, h.ID())
+	if logOn() {
+		for _, a := range h.Addrs() {
+			vlog("node", "listen=%s/p2p/%s", a, h.ID())
+		}
 	}
 
 	// Connection-event trace (verbose only): the single most useful signal for diagnosing NAT traversal in the
