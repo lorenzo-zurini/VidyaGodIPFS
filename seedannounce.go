@@ -47,6 +47,15 @@ func (n *node) runSeedAnnounce() {
 	n.startProviding(pkgs...)
 	n.startProviding(content...)
 	fmt.Fprintf(os.Stderr, "[seed] %d root + %d library node + %d content CID(s) handed to the provider\n", len(colls), len(pkgs), len(content))
+	// The keystore outlives the process: what an earlier run announced and this one no longer holds (unpinned while
+	// we were down, a superseded node block) is dropped — but only from a complete list: a failed pinLs lists no
+	// content, and would drop all of it.
+	if err == nil {
+		n.provideSt.mu.Lock()
+		n.provideSt.seeded = true
+		n.provideSt.mu.Unlock()
+		n.dropLeftovers()
+	}
 }
 
 // unlisted is the pinned set minus what the app listed, in pin order.

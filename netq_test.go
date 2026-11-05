@@ -318,9 +318,14 @@ type fakeProvider struct {
 	handed []mh.Multihash
 	forced []mh.Multihash // … of which handed with force
 	during func()         // runs inside the next Stats call (then cleared)
+	onHand func()         // runs at the start of every StartProviding
+	unconn bool           // online once, not connected now: its measured prefix stands, it cannot send
 }
 
 func (f *fakeProvider) StartProviding(force bool, keys ...mh.Multihash) error {
+	if f.onHand != nil {
+		f.onHand()
+	}
 	f.handed = append(f.handed, keys...)
 	if force {
 		f.forced = append(f.forced, keys...)
@@ -336,8 +341,13 @@ func (f *fakeProvider) Stats(context.Context) (stats.Stats, error) {
 	var s stats.Stats
 	s.Queues.PendingKeyProvides = f.queued
 	s.Schedule.AvgPrefixLength = -1
+	s.Connectivity.Status = "offline"
 	if f.online {
 		s.Schedule.AvgPrefixLength = 7
+		s.Connectivity.Status = "online"
+		if f.unconn {
+			s.Connectivity.Status = "disconnected"
+		}
 	}
 	return s, nil
 }
@@ -345,7 +355,9 @@ func (f *fakeProvider) Close() error { return nil }
 
 // An offline provider files a handed key in its keystore WITHOUT queueing it (and says nothing), and a later hand-over
 // of that key is a no-op: it waited up to 22 h for its region's reprovide. So keys stay ours until the provider is
-// online, then go over. Teeth: drop the providerReady gate in flushProvides and the key is handed over while offline.
+// online — connected, not only measured (a disconnected provider kept its prefix, and would queue a key it cannot send
+// until a change of connectivity sends it back) — then go over. Teeth: drop the providerReady gate in flushProvides
+// and the key is handed over while offline; read readiness off the prefix alone and it goes while disconnected.
 func TestProvidingWaitsUntilTheProviderIsOnline(t *testing.T) {
 	saved := providerReadyTTL
 	providerReadyTTL = 0 // every call reads readiness afresh
@@ -360,7 +372,12 @@ func TestProvidingWaitsUntilTheProviderIsOnline(t *testing.T) {
 	if len(fp.handed) != 0 || len(n.provideSt.pending) != 1 {
 		t.Fatalf("offline: handed %d, pending %d — the key must stay ours", len(fp.handed), len(n.provideSt.pending))
 	}
-	fp.online = true
+	fp.online, fp.unconn = true, true
+	n.flushProvides()
+	if len(fp.handed) != 0 {
+		t.Fatal("disconnected: the key was handed over")
+	}
+	fp.unconn = false
 	n.flushProvides()
 	if len(fp.handed) != 1 || len(n.provideSt.pending) != 0 {
 		t.Fatalf("online: handed %d, pending %d — the key must go over", len(fp.handed), len(n.provideSt.pending))

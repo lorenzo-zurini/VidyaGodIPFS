@@ -261,6 +261,7 @@ func (n *node) goOnline() error {
 			if n.provider != nil {
 				_ = n.provider.Close()
 				n.provider = nil
+				n.dropProvider()
 			}
 			if cleanupBswap != nil {
 				_ = cleanupBswap.Close()
@@ -376,7 +377,7 @@ func (n *node) goOnline() error {
 	n.dserv = merkledag.NewDAGService(n.bserv)
 
 	// Announcing what we hold: the sweeping provider, its walks and sends through netq (provide.go).
-	if prov, perr := newSweepingProvider(n.ctx, kad, n.ds); perr == nil {
+	if prov, perr := newSweepingProvider(n.ctx, kad, n.ds, n.noteOnline, n.noteOffline); perr == nil {
 		n.useProvider(prov)
 	} else {
 		fmt.Fprintf(os.Stderr, "[provide] sweeping provider not started: %v\n", perr)
