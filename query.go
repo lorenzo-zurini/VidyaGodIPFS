@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -159,34 +160,47 @@ var wholeWalks atomic.Int64
 // heldWhole: every block of c's DAG is held here and every file a block is referenced into is present — what a
 // recursive pin of c claims, and what serving it needs. hasLocal answers for the top block only: a file whose leaves
 // are partly missing (an interrupted fetch) or whose backing file moved still "has" its root. ONE walk: reads only the
-// dag-pb interior (small); a leaf is checked by Has, and, referenced into a file, that file by one stat per distinct
-// path — nothing re-hashed.
+// dag-pb interior (small); a leaf is checked by one lookup of its reference (or its stored bytes), and, referenced into
+// a file, that file by one stat per distinct path (gone, or ending before the leaf) — nothing re-hashed.
 func (n *node) heldWhole(c cid.Cid) error {
 	wholeWalks.Add(1)
 	seen := cid.NewSet()
-	present := map[string]bool{} // backing path → exists (a large file's thousands of leaves share one path)
+	sizes := map[string]int64{} // backing path → its size, -1 gone (a large file's thousands of leaves share one path)
 	var walk func(c cid.Cid) error
 	walk = func(c cid.Cid) error {
 		if !seen.Visit(c) {
 			return nil
 		}
-		if !n.hasLocal(c) {
-			return fmt.Errorf("%s is not held", c)
-		}
 		if c.Prefix().Codec == cid.Raw {
+			// A leaf is held as a reference into a file — one lookup answers both "held?" and "where?" — or as stored
+			// bytes. Asking hasLocal first cost three lookups a leaf: ~11 M for a library of 3.6 M leaves, a minute of
+			// reads at every start.
 			if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
 				p := filepath.Join(fileRoot, res.FilePath) // relative to the FileManager root (filestoreroot.go)
-				ok, done := present[p]
+				size, done := sizes[p]
 				if !done {
-					_, err := os.Stat(p)
-					ok = err == nil
-					present[p] = ok
+					size = -1
+					if st, err := os.Stat(p); err == nil {
+						size = st.Size()
+					}
+					sizes[p] = size
 				}
-				if !ok {
+				if size < 0 {
 					return fmt.Errorf("%s: the file it is referenced into (%s) is gone", c, p)
 				}
+				// A file cut short no longer holds the bytes its references name past its end (a file that grew still does).
+				if uint64(size) < res.Offset+res.Size {
+					return fmt.Errorf("%s: the file it is referenced into (%s) ends before it (%d < %d)", c, p, size, res.Offset+res.Size)
+				}
+				return nil
+			}
+			if has, err := n.plain.Has(n.ctx, c); err != nil || !has {
+				return fmt.Errorf("%s is not held", c)
 			}
 			return nil
+		}
+		if !n.hasLocal(c) {
+			return fmt.Errorf("%s is not held", c)
 		}
 		nd, err := n.localDserv.Get(n.ctx, c)
 		if err != nil {
@@ -210,35 +224,53 @@ func (n *node) heldWhole(c cid.Cid) error {
 // path, so the walk is cheap) and the CID is "missing" if ANY backing is gone. Uses the LOCAL-only DAG service so an
 // absent block never triggers a network fetch. A CID with no filestore references at all (we simply don't host it) is
 // NOT missing — matches the previous firstRefPath=="" semantics.
-// orphanedRefPaths scans the filestore's references and returns the DISTINCT backing paths whose file is gone. Cheap
-// relative to per-CID cidMissing: one datastore scan + one stat per distinct file (fileOrder groups a file's leaves so
-// each path is met contiguously). This is the SERVE-reliability probe — every path returned is content some pinned CID
-// references but the node can no longer read for a requesting peer, i.e. an orphan the heal should re-point.
+// orphanedRefPaths returns the DISTINCT backing paths of the filestore's references whose file is gone — the
+// SERVE-reliability probe: every path returned is content some pinned CID references but the node can no longer read
+// for a requesting peer, i.e. an orphan the heal should re-point. The distinct paths come from one scan of the
+// references, kept until a reference is written or dropped (refwatch.go): asked again with none changed, it costs
+// one stat per file, not a read of the whole index.
 func (n *node) orphanedRefPaths() []string {
-	next, err := filestore.ListAll(n.ctx, n.fstore, true) // fileOrder: a file's leaves are contiguous → 1 stat/file
-	if err != nil || next == nil {
-		return nil
+	n.refPathsMu.Lock()
+	defer n.refPathsMu.Unlock()
+	if gen := n.refGen.Load(); !n.refPathsValid || gen != n.refPathsGen {
+		paths, ok := n.refFilePaths()
+		if !ok {
+			return nil
+		}
+		n.refPaths, n.refPathsGen, n.refPathsValid = paths, gen, true
 	}
 	var gone []string
-	seen := map[string]struct{}{}
-	for {
-		r := next(n.ctx)
-		if r == nil {
-			break
-		}
-		p := filepath.Join(fileRoot, r.FilePath)
-		if r.FilePath == "" {
-			continue
-		}
-		if _, done := seen[p]; done {
-			continue
-		}
-		seen[p] = struct{}{}
+	for _, p := range n.refPaths {
 		if _, statErr := os.Stat(p); statErr != nil {
 			gone = append(gone, p)
 		}
 	}
 	return gone
+}
+
+// refScans counts full scans of the references (a test reads it: an unchanged index is not read again).
+var refScans atomic.Int64
+
+// refFilePaths: every distinct file a filestore reference names, sorted — one read of the whole index.
+func (n *node) refFilePaths() ([]string, bool) {
+	refScans.Add(1)
+	next, err := filestore.ListAll(n.ctx, n.fstore, false) // unsorted: fileOrder sorted all 3.6 M entries in memory
+	if err != nil || next == nil {
+		return nil, false
+	}
+	seen := map[string]struct{}{}
+	for r := next(n.ctx); r != nil; r = next(n.ctx) {
+		if r.FilePath == "" {
+			continue
+		}
+		seen[filepath.Join(fileRoot, r.FilePath)] = struct{}{}
+	}
+	paths := make([]string, 0, len(seen))
+	for p := range seen {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths, true
 }
 
 // cidUnservable READS every block of c out of the local blockstore and returns the first read error, or "" if the

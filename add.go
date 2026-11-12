@@ -7,9 +7,11 @@ package main
 // root, sha2-256. Verified empirically against a recorded CID (the M1 parity gate).
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	blockservice "github.com/ipfs/boxo/blockservice"
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -18,10 +20,13 @@ import (
 
 	chunker "github.com/ipfs/boxo/chunker"
 	files "github.com/ipfs/boxo/files"
+	posinfo "github.com/ipfs/boxo/filestore/posinfo"
 	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	balanced "github.com/ipfs/boxo/ipld/unixfs/importer/balanced"
 	uih "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
+	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
+	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 )
@@ -29,9 +34,9 @@ import (
 // Kubo's default add chunk size.
 const chunkSize int64 = 262144
 
-// buildFileNode imports a single regular file into n.dserv BY REFERENCE (filestore --nocopy: leaves reference the file
+// buildFileNode imports a single regular file into dserv BY REFERENCE (filestore --nocopy: leaves reference the file
 // in place) and returns its root node — Kubo `ipfs add --nocopy` parity (256 KiB chunker, raw leaves, dag-pb v0, sha2).
-func (n *node) buildFileNode(abs string, st os.FileInfo) (ipld.Node, error) {
+func buildFileNode(dserv ipld.DAGService, abs string, st os.FileInfo) (ipld.Node, error) {
 	f, err := os.Open(abs)
 	if err != nil {
 		return nil, err
@@ -50,7 +55,7 @@ func (n *node) buildFileNode(abs string, st os.FileInfo) (ipld.Node, error) {
 		RawLeaves:  true,                     // forced by --nocopy
 		NoCopy:     true,
 		CidBuilder: merkledag.V0CidPrefix(), // dag-pb v0 root; raw leaves carry the raw codec
-		Dagserv:    n.dserv,
+		Dagserv:    dserv,
 	}
 	db, err := dbp.New(spl)
 	if err != nil {
@@ -75,31 +80,10 @@ func computeCid(path string) (cid.Cid, error) {
 	if st.IsDir() {
 		return cid.Undef, fmt.Errorf("%s is a directory (use --publish-meta for a tree)", abs)
 	}
-	f, err := os.Open(abs)
-	if err != nil {
-		return cid.Undef, err
-	}
-	defer f.Close()
-	rpf, err := files.NewReaderPathFile(abs, f, st)
-	if err != nil {
-		return cid.Undef, err
-	}
 	// The blocks are discarded as they are built: only the root is wanted, and the layout never reads a block back. An
 	// in-memory store held the whole file — a multi-GB zip checked before seeding cost its size in RAM.
 	mem := blockstore.NewBlockstore(datastore.NewNullDatastore())
-	dserv := merkledag.NewDAGService(blockservice.New(mem, offline.Exchange(mem)))
-	dbp := uih.DagBuilderParams{
-		Maxlinks:   uih.DefaultLinksPerBlock,
-		RawLeaves:  true,
-		NoCopy:     true, // keep NoCopy so leaf CIDs match a seeded file exactly
-		CidBuilder: merkledag.V0CidPrefix(),
-		Dagserv:    dserv,
-	}
-	db, err := dbp.New(chunker.NewSizeSplitter(rpf, chunkSize))
-	if err != nil {
-		return cid.Undef, err
-	}
-	nd, err := balanced.Layout(db)
+	nd, err := buildFileNode(merkledag.NewDAGService(blockservice.New(mem, offline.Exchange(mem))), abs, st)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -108,6 +92,25 @@ func computeCid(path string) (cid.Cid, error) {
 
 // addNoCopy adds a single regular file by reference and pins it recursively. Returns the root CID.
 func (n *node) addNoCopy(path string) (cid.Cid, error) {
+	return n.addNoCopyIf(path, cid.Undef, false)
+}
+
+// addNoCopyIf adds a single regular file by reference — only when it is want (cid.Undef: whatever it is) — reading it
+// ONCE, and returns the CID it is. The DAG is built into a scratch (scratchDag): each leaf kept as its reference (where
+// in the file, how long — never its bytes), each interior node whole. Only a root that is want reaches the node: a file
+// that is not what its node records is never referenced, pinned or announced. The pin is recorded, not walked
+// (PinWithMode). Before, a seed read the file three times — computeCid to check it, the build, and the recursive Pin's
+// FetchGraph reading every leaf back — so an 8.5 GB disc image cost ~25 GB of reads, and the app was closed before a
+// start's seed pass ever got past it. background: its reads yield to everyone else's (backgroundIO).
+//
+// Every leaf is referenced HERE, over any reference it already had: these bytes were just hashed at these offsets, so
+// the reference is proven, while one already held may name a file since deleted or changed in place (a leaf shared with
+// another file: a run of zeros, a common header). The walking pin read such a leaf back and failed; a recorded pin over
+// a kept stale reference would announce content nobody can be served. A leaf held as stored bytes keeps them.
+func (n *node) addNoCopyIf(path string, want cid.Cid, background bool) (cid.Cid, error) {
+	if background {
+		defer backgroundIO()()
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return cid.Undef, err
@@ -117,23 +120,40 @@ func (n *node) addNoCopy(path string) (cid.Cid, error) {
 		return cid.Undef, err
 	}
 	if st.IsDir() {
+		if want.Defined() {
+			return cid.Undef, fmt.Errorf("%s is a directory, not one file", abs)
+		}
 		return n.addDirNoCopy(abs)
 	}
-	root, err := n.buildFileNode(abs, st)
+	scratch := &scratchDag{}
+	root, err := buildFileNode(scratch, abs, st)
 	if err != nil {
 		return cid.Undef, err
 	}
-	// Re-point across a MOVE: identical content already seeded at a different (now moved/deleted) backing path leaves a
-	// stale filestore reference, and Filestore.Put skips a block it already has — so the leaves just "built" still point
-	// at the OLD path and the recursive Pin (and any later serve) would read a gone file. If the reference is stale, drop
-	// the closure and rebuild once so the leaves re-point at `abs`. Mirrors fetchToPath's drop-and-retry (fetch.go).
-	if n.cidMissing(root.Cid()) {
-		n.dropRef(root.Cid())
-		if root, err = n.buildFileNode(abs, st); err != nil {
+	if want.Defined() && !root.Cid().Equals(want) {
+		return root.Cid(), nil // not the content asked for: nothing of it was kept
+	}
+	var refs []*posinfo.FilestoreNode
+	var stored []blocks.Block
+	for _, b := range scratch.blocks {
+		fn, isRef := b.(*posinfo.FilestoreNode)
+		if !isRef {
+			stored = append(stored, b) // interior nodes: small, stored whole
+			continue
+		}
+		if held, err := n.plain.Has(n.ctx, fn.Cid()); err != nil {
 			return cid.Undef, err
+		} else if !held {
+			refs = append(refs, fn)
 		}
 	}
-	if err := n.pinner.Pin(n.ctx, root, true, abs); err != nil {
+	if err := n.plain.PutMany(n.ctx, stored); err != nil {
+		return cid.Undef, err
+	}
+	if err := n.fstore.FileManager().PutMany(n.ctx, refs); err != nil { // overwrites a held leaf's reference
+		return cid.Undef, err
+	}
+	if err := n.pinner.PinWithMode(n.ctx, root.Cid(), ipfspinner.Recursive, abs); err != nil {
 		return cid.Undef, err
 	}
 	if err := n.pinner.Flush(n.ctx); err != nil {
@@ -142,6 +162,51 @@ func (n *node) addNoCopy(path string) (cid.Cid, error) {
 	n.announce(root.Cid()) // publish to the DHT now so it's discoverable without waiting for the 22h reprovide
 	return root.Cid(), nil
 }
+
+// scratchDag keeps what a build adds, for the node to take whole or not at all: a leaf as its reference
+// (refLeaf: CID and size; where it lies in the file), never its bytes — an 8.5 GB file is ~33 000 of them, a few MB —
+// and an interior node whole (a few KiB each). Nothing is read back while a file is built. A block met twice (a file
+// repeating a 256 KiB run: zeros, padding) is kept once, at its first place, as one Put at a time kept it.
+type scratchDag struct {
+	mu     sync.Mutex
+	blocks []blocks.Block
+	seen   map[cid.Cid]struct{}
+}
+
+func (s *scratchDag) Add(_ context.Context, nd ipld.Node) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, dup := s.seen[nd.Cid()]; dup {
+		return nil
+	}
+	if s.seen == nil {
+		s.seen = map[cid.Cid]struct{}{}
+	}
+	s.seen[nd.Cid()] = struct{}{}
+	if fn, ok := nd.(*posinfo.FilestoreNode); ok {
+		nd = &posinfo.FilestoreNode{Node: &refLeaf{c: fn.Cid(), size: len(fn.RawData())}, PosInfo: fn.PosInfo}
+	}
+	s.blocks = append(s.blocks, nd)
+	return nil
+}
+
+func (s *scratchDag) AddMany(ctx context.Context, nds []ipld.Node) error {
+	for _, nd := range nds {
+		if err := s.Add(ctx, nd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *scratchDag) Get(context.Context, cid.Cid) (ipld.Node, error) { return nil, ipld.ErrNotFound{} }
+func (s *scratchDag) GetMany(context.Context, []cid.Cid) <-chan *ipld.NodeOption {
+	ch := make(chan *ipld.NodeOption)
+	close(ch)
+	return ch
+}
+func (s *scratchDag) Remove(context.Context, cid.Cid) error       { return nil }
+func (s *scratchDag) RemoveMany(context.Context, []cid.Cid) error { return nil }
 
 // buildDirNode recursively assembles a UnixFS directory node for dir: every regular file is referenced in place
 // (buildFileNode), subdirectories recurse, and the directory node is added to n.dserv. Symlinks/irregular entries are
@@ -166,7 +231,7 @@ func (n *node) buildDirNode(dir string) (ipld.Node, error) {
 		case info.IsDir():
 			child, err = n.buildDirNode(p)
 		case info.Mode().IsRegular():
-			child, err = n.buildFileNode(p, info)
+			child, err = buildFileNode(n.dserv, p, info)
 		default:
 			continue // skip symlinks / devices / etc.
 		}
@@ -246,7 +311,7 @@ func (n *node) buildMetaDirNode(dir string) (ipld.Node, error) {
 			if filepath.Ext(name) != ".json" {
 				continue // manifests only: covers/zips/deltas travel as content CIDs referenced from the JSON
 			}
-			if child, err = n.buildFileNode(p, info); err != nil {
+			if child, err = buildFileNode(n.dserv, p, info); err != nil {
 				return nil, err
 			}
 		default:

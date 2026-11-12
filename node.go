@@ -54,6 +54,11 @@ type node struct {
 	compactClosed bool
 	compactWG     sync.WaitGroup
 	ds            datastore.Batching
+	refGen        *atomic.Uint64 // writes to the filestore's references so far (refwatch.go)
+	refPathsMu    sync.Mutex
+	refPaths      []string // the distinct files the references name, listed at refPathsGen (orphanedRefPaths)
+	refPathsGen   uint64
+	refPathsValid bool
 	fstore        *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
 	bstore        blockstore.Blockstore
 	plain         blockstore.Blockstore // the blockstore under the filestore: stored bytes, never a reference
@@ -139,7 +144,8 @@ func openNode(repoPath string) error {
 		cancel()
 		return err
 	}
-	ds := dssync.MutexWrap(ldb)
+	refGen := &atomic.Uint64{}
+	ds := refWatch{Batching: dssync.MutexWrap(ldb), gen: refGen}
 
 	bstore := blockstore.NewBlockstore(ds)
 	// FileManager references on-disk files, recorded relative to its root ("/"; a volume on Windows, filestoreroot.go).
@@ -150,9 +156,9 @@ func openNode(repoPath string) error {
 	// M3 wires the real DHT reprovider here.
 	fstore := filestore.NewFilestore(bstore, fm, nil)
 
-	// WriteThrough so an Add always Puts (no Has-skip) — a safety invariant ensuring addNoCopy creates the filestore
-	// reference even if a block already happens to sit in the blockstore. (The online fetch path clears bitswap's
-	// cached blocks via dropClosure before re-adding, which is the primary guard against duplication.)
+	// WriteThrough so an Add through the block service always reaches the filestore's Put (which still skips a block it
+	// holds). addNoCopy does not add through it: it puts its file's references itself, over any held (add.go). (The
+	// online fetch path clears bitswap's cached blocks via dropClosure before re-adding, the guard against duplication.)
 	// Wrap the filestore so a FAILED serve read is captured, not just logged. This is the moment a leecher asks
 	// for a block whose backing bytes changed — the one instant we can be certain the content is undeliverable.
 	failLog := newFailureLog()
@@ -170,7 +176,7 @@ func openNode(repoPath string) error {
 	gNode = &node{
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
 		ldb: ldb,
-		ds:  ds, fstore: fstore, bstore: served, plain: bstore, bserv: bserv, dserv: dserv, pinner: pnr, serveFails: failLog,
+		ds:  ds, refGen: refGen, fstore: fstore, bstore: served, plain: bstore, bserv: bserv, dserv: dserv, pinner: pnr, serveFails: failLog,
 		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,

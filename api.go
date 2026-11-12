@@ -116,6 +116,28 @@ func VgAddNoCopy(path *C.char, outCid **C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgAddNoCopyIf: seed a file by reference only when it is want — read once — and answer the CID it is (outCid). A file
+// that is not want is answered, and nothing of it is kept. background != 0: its reads yield to everyone else's.
+//
+//export VgAddNoCopyIf
+func VgAddNoCopyIf(path *C.char, want *C.char, background C.int, outCid **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	w, err := cid.Decode(C.GoString(want))
+	if err != nil {
+		return fail(errOut, err)
+	}
+	c, err := n.addNoCopyIf(C.GoString(path), w, background != 0)
+	if err != nil {
+		return fail(errOut, err)
+	}
+	setStr(outCid, c.String())
+	return 0
+}
+
 // Seed a TEXT-ONLY Meta-CID for a package dir/collection: references the *.json manifests IN PLACE (no staging copy),
 // skipping content files + DEFPREFIX/USERDATA runtime subtrees. Same CID as adding a JSON-only mirror of the tree.
 //
