@@ -62,7 +62,10 @@ func (n *node) blockPut(b []byte) (cid.Cid, error) {
 		}
 	}
 	// Kept already (a node file landed in place is pinned recursively): pinning it Direct again is an error, not a no-op.
-	if _, pinned, err := n.pinner.IsPinned(n.ctx, c); err != nil {
+	// Only the Recursive and Direct indexes are asked, never IsPinned: for a CID in neither, its Indirect check walks
+	// the children of EVERY recursive pin, and on a library node (thousands of pins) that ran for hours or failed —
+	// publish-all then left half the library out (2026-11-17). An indirect-only pin may take a Direct one beside it.
+	if pinned, err := n.pinnedDirectly(c); err != nil {
 		return cid.Undef, err
 	} else if !pinned {
 		if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
@@ -195,4 +198,14 @@ func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, 
 	n.madeDirs.Store(dn.Cid().String(), struct{}{})
 	n.announceNow(dn.Cid())
 	return dn.Cid(), notWhole, nil
+}
+
+// pinnedDirectly says whether c has a Recursive or a Direct pin of its own: two index lookups, no DAG walk.
+func (n *node) pinnedDirectly(c cid.Cid) (bool, error) {
+	for _, m := range []ipfspinner.Mode{ipfspinner.Recursive, ipfspinner.Direct} {
+		if _, pinned, err := n.pinner.IsPinnedWithType(n.ctx, c, m); err != nil || pinned {
+			return pinned, err
+		}
+	}
+	return false, nil
 }

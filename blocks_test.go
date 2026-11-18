@@ -376,3 +376,45 @@ func TestDirEntriesIsLocalShardedAndBounded(t *testing.T) {
 		t.Fatalf("a folder of %d entries past a cap of 10 listed %d", len(want), len(l))
 	}
 }
+
+// Putting a new node never walks the library's recursive pins: IsPinned's Indirect check does, so with thousands of
+// pins blockPut ran for hours, and with one whose child is not held it failed — publish-all left 4477 nodes out
+// (2026-11-17). Here a folder holding a folder is pinned recursively and the inner folder's block is then dropped (a raw
+// leaf would not do: the walk lists a raw block's links without reading it); a new block must still be put and
+// Direct-pinned, and a block the folder already keeps indirectly takes a Direct pin beside it.
+// Teeth: ask IsPinned (any mode) again and the walk reaches the dropped folder and blockPut fails.
+func TestBlockPutNeverWalksRecursivePins(t *testing.T) {
+	n := offlineNode(t)
+	a := mustRaw(t, n, []byte(`{"LABEL":"a","LAYERS":[]}`))
+	b := mustRaw(t, n, []byte(`{"LABEL":"b","LAYERS":[]}`))
+	inner, err := n.makeDir(map[string]string{a.String() + ".json": a.String()})
+	if err != nil {
+		t.Fatalf("makeDir inner: %v", err)
+	}
+	if _, err := n.makeDir(map[string]string{"inner": inner.String(), b.String() + ".json": b.String()}); err != nil {
+		t.Fatalf("makeDir outer: %v", err)
+	}
+	if err := n.pinner.Unpin(n.ctx, inner, true); err != nil {
+		t.Fatalf("unpin inner: %v", err)
+	}
+	if err := n.plain.DeleteBlock(n.ctx, inner); err != nil {
+		t.Fatalf("drop the inner folder: %v", err)
+	}
+	done := make(chan error, 1)
+	var c cid.Cid
+	go func() { var err error; c, err = n.blockPut([]byte(`{"LABEL":"new","LAYERS":[]}`)); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("blockPut walked the recursive pins: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("blockPut hung walking the recursive pins")
+	}
+	if _, pinned, err := n.pinner.IsPinnedWithType(n.ctx, c, ipfspinner.Direct); err != nil || !pinned {
+		t.Fatalf("new block not Direct-pinned (%v)", err)
+	}
+	if _, err := n.blockPut([]byte(`{"LABEL":"b","LAYERS":[]}`)); err != nil {
+		t.Fatalf("a block kept indirectly refused a Direct pin: %v", err)
+	}
+}
