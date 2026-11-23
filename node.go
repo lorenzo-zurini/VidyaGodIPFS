@@ -94,6 +94,7 @@ type node struct {
 	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
 	social *socialState
 	friend *friendService
+	nearby *nearbyService  // the VidyaGod devices on our network, by name (nearby.go)
 	linkm  *linkMaintainer // always-on per-friend link maintainer (overlaylink.go)
 
 	lanExclMu   sync.Mutex

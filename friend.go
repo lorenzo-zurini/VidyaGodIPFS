@@ -158,6 +158,10 @@ type friendService struct {
 	// off). Replaced wholesale from config at node-ready. Guarded by denyMu.
 	denyMu       sync.Mutex
 	presenceDeny map[string]bool
+
+	// reAccepted: when each friend that asked again was last answered with our accept (reAcceptDue).
+	reAcceptMu sync.Mutex
+	reAccepted map[string]time.Time
 }
 
 func newFriendService(ctx context.Context, h host.Host, r peerRouter, s *socialState, emit func(int, string)) *friendService {
@@ -243,9 +247,23 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 		if kind == evFriendAccept {
 			vlog("friend", "crossing with %s → sending accept back", shortPeer(remote))
 			safeGo("friend.crossAccept", func() { _ = f.send(remote, f.helloMsg("accept")) })
+		} else if c.State == stAccepted && f.reAcceptDue(remote) {
+			// A friend still asking: our accept never reached it (it was asleep, offline, between networks when we
+			// accepted), so its retry loop asks again. Answer again, or it waits in "request sent" forever while we
+			// show it as a friend — and drops what we share with it. Once per reAcceptEvery per friend: a stream
+			// packed with requests must not become a goroutine (and a dial) each.
+			vlog("friend", "request from friend %s → our accept again", shortPeer(remote))
+			safeGo("friend.reAccept", func() { _ = f.send(remote, f.helloMsg("accept")) })
 		}
 	case "accept":
-		// The peer we'd requested accepted. Mark accepted + absorb their profile.
+		// The peer we'd requested accepted. Mark accepted + absorb their profile. ONLY a peer we asked (pending) or
+		// already a friend (a crossing's accept back): an accept nobody asked for made its sender a friend — on our
+		// virtual LAN, told our presence — with no consent of ours.
+		prev, ok := f.social.get(remote)
+		if !ok || (prev.State != stPending && prev.State != stAccepted) {
+			vlog("friend", "unsolicited accept from %s ignored", shortPeer(remote))
+			return
+		}
 		c := f.social.upsert(remote, func(c *contact) {
 			c.State = stAccepted
 			if m.Nick != "" {
@@ -255,7 +273,13 @@ func (f *friendService) dispatch(remote string, m friendMsg) {
 				c.PicCID = m.PicCID
 			}
 		})
-		f.emitContact(evFriendAccept, c)
+		// Becoming a friend is the accept event (the app applies its New-peer defaults on it); an accept from a friend
+		// already (an answer to a request sent again) only refreshes its profile, never resets what was chosen for it.
+		if prev.State == stAccepted {
+			f.emitContact(evFriendProfile, c)
+		} else {
+			f.emitContact(evFriendAccept, c)
+		}
 	case "decline":
 		if c, ok := f.social.get(remote); ok {
 			f.social.remove(remote)
@@ -461,10 +485,30 @@ func (f *friendService) helloMsg(t string) friendMsg {
 	return friendMsg{Type: t, Nick: nick, PicCID: p.PicCID}
 }
 
+// reAcceptEvery: how often a friend that keeps asking is answered with our accept again (friend.go dispatch).
+const reAcceptEvery = 30 * time.Second
+
+// reAcceptDue reports whether a friend asking again may be answered now, and if so records that it was.
+func (f *friendService) reAcceptDue(pidStr string) bool {
+	f.reAcceptMu.Lock()
+	defer f.reAcceptMu.Unlock()
+	if f.reAccepted == nil {
+		f.reAccepted = map[string]time.Time{}
+	}
+	if t, ok := f.reAccepted[pidStr]; ok && time.Since(t) < reAcceptEvery {
+		return false
+	}
+	f.reAccepted[pidStr] = time.Now()
+	return true
+}
+
 // addFriend records an outgoing request and sends it (with our profile) to the peer.
 func (f *friendService) addFriend(pidStr, note string) error {
 	if _, err := peer.Decode(pidStr); err != nil {
 		return fmt.Errorf("bad peer id: %w", err) // the only synchronous failure — a malformed id no retry can fix
+	}
+	if c, ok := f.social.get(pidStr); ok && c.State == stAccepted {
+		return nil // a friend already: asking again would only bring its accept back (and nothing else)
 	}
 	// Optimistic + non-blocking: record the contact as pending and emit IMMEDIATELY so the UI shows it at once,
 	// independent of handshake state, then fire the request send off-thread. The send (DHT FindPeer + dial + stream)

@@ -259,3 +259,22 @@ func VgSetPresenceDeny(jsonArr *C.char) C.int {
 	f.setPresenceDeny(peers)
 	return 0
 }
+
+// The VidyaGod devices on our network, by name, for one-press pairing (nearby.go): JSON
+// [{peer, nick, state}]. Never waits on the network (a device not asked yet shows on a later call), so the GUI
+// may poll it. Empty while offline.
+//
+//export VgNearbyPeers
+func VgNearbyPeers(outJson **C.char) C.int {
+	n := get()
+	if n == nil || n.nearby == nil {
+		setStr(outJson, "[]")
+		return 0
+	}
+	b, _ := json.Marshal(n.nearby.list())
+	if string(b) == "null" {
+		b = []byte("[]")
+	}
+	setStr(outJson, string(b))
+	return 0
+}

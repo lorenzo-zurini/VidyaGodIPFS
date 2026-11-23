@@ -400,6 +400,14 @@ func (n *node) goOnline() error {
 		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
 		n.friend.start()
 		n.friend.startPresence(45 * time.Second)
+		n.nearby = newNearbyService(n.ctx, h, n.social, n.isLanPeer, func() nearbyInfo {
+			nick := n.social.getProfile().Nick
+			if nick == "" {
+				nick = defaultNick()
+			}
+			return nearbyInfo{Nick: nick}
+		})
+		n.nearby.start()
 		// ALWAYS-ON link maintainer (overlaylink.go): heartbeat + auto-reconnect + datagram-path proving per accepted
 		// friend for the app's lifetime — the LAN's links are warm BEFORE any game launches, and the UI gets
 		// live per-friend link state. Membership is re-read from the address book every beat.
