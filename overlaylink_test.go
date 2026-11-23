@@ -7,7 +7,7 @@ package main
 //   • the overlay TX trust gate routes packets over the reliable stream while the path is unproven — delivery
 //     never waits for datagrams (the half-dead/one-way-punch case DELIVERS instead of silently losing 100%);
 //   • a proven path whose pongs stop is DEMOTED (datagrams distrusted, traffic back on stream) WITHOUT the
-//     connection ever being torn down — bitswap/friend streams ride the same conn — and re-proves itself on the
+//     connection ever being torn down — bitswap/peer streams ride the same conn — and re-proves itself on the
 //     next pong (graceful recovery in both directions).
 
 import (
@@ -112,7 +112,7 @@ func TestDeadDatagramPathDemotesWithoutTeardownThenReProves(t *testing.T) {
 	if !demoted {
 		t.Fatal("missed pongs never demoted the link")
 	}
-	// INVARIANT 1: the connection was NOT torn down — bitswap/friend streams ride it.
+	// INVARIANT 1: the connection was NOT torn down — bitswap/peer streams ride it.
 	if ha.Network().Connectedness(hb.ID()) != network.Connected {
 		t.Fatal("demote tore down the connection — ClosePeer is banned")
 	}

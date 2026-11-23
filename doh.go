@@ -341,9 +341,9 @@ func dohHTTPClient(d *dohResolver) *http.Client {
 // exists (tools/gwprobe.sh + dated output: Pinata 404s an absent CID only at ~62 s; only-if-cached answered 412 for
 // present content in one manual probe and 200 in the committed one — inconsistent, so not usable). 45 s = ~2× margin
 // over the worst observed public-backend success (a 20.3 s first block, run-6; that run's log was overwritten —
-// results now survive one generation as .prev). Cost where NO gateway has the content (a friend's own package):
-// each stalled attempt pays hedge delay + this in the resume, so the offline-friend cycle is stall 20 s + ~55 s +
-// backoff ≈ 80 s per lap, for as long as the friend stays offline. (var: tests shrink it)
+// results now survive one generation as .prev). Cost where NO gateway has the content (a peer's own package):
+// each stalled attempt pays hedge delay + this in the resume, so the offline-peer cycle is stall 20 s + ~55 s +
+// backoff ≈ 80 s per lap, for as long as the peer stays offline. (var: tests shrink it)
 var gatewayHeaderTimeout = 45 * time.Second
 
 func dohStreamingClient(d *dohResolver) *http.Client {

@@ -8,7 +8,7 @@ package main
 // the want-block again, the peer-want manager drops that as already sent — and no new timeout starts. A peer without
 // HAVE support (bitswap 1.1) gets no timeout at all. On the replication, bitswap.pinata.cloud answered HAVE for every
 // block it pins and delivered none: wants sat on it while the seeder, which had said HAVE too, was never asked, until
-// our 20 s stall watchdog tore the fetch down (a 4.7 GB file then crawled in over the gateway; content only a friend
+// our 20 s stall watchdog tore the fetch down (a 4.7 GB file then crawled in over the gateway; content only a peer
 // has would just have stalled).
 //
 // boxo re-routes every want a peer held the moment that peer disconnects. So a peer is reported DISCONNECTED to our
@@ -35,7 +35,7 @@ package main
 // record, and it is forgotten quarantineForget after the last offence.
 //
 // How long a peer may sit silent on a want-block is its own business up to a point: three of its usual block
-// intervals, between quarantineAfter (3 s — a promiser, which never delivers) and quarantineMaxHold (10 s — a friend
+// intervals, between quarantineAfter (3 s — a promiser, which never delivers) and quarantineMaxHold (10 s — a peer
 // on a thin uplink). Progress is a delivered block, not bytes: a promiser's own HAVE replies are bitswap bytes too, and counting them let
 // it hold wants for as long as any other fetch kept it answering (replication 6: three stalls).
 
@@ -133,7 +133,7 @@ func (q *quarantineNet) ledger(p peer.ID) *peerLedger {
 }
 
 // hold: how long this peer may hold a want-block with nothing delivered — quarantineAfter, or three of its own block
-// intervals for a peer that delivers slowly (a friend on a thin uplink serving several of us), up to
+// intervals for a peer that delivers slowly (a peer on a thin uplink serving several of us), up to
 // quarantineMaxHold. A peer that never delivered gets the floor.
 func (l *peerLedger) hold() time.Duration {
 	d := 3 * l.gap

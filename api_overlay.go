@@ -1,9 +1,9 @@
 package main
 
-// api_overlay.go — the C ABI for the friend-LAN overlay tunnel (overlay.go + friendlan.go + overlaytun_linux.go),
+// api_overlay.go — the C ABI for the peer-LAN overlay tunnel (overlay.go + peerlan.go + overlaytun_linux.go),
 // mirrored in src/vgipfsapi.h. There is NO session/host: the vIP + routing table come from lanConfig() (the
-// accepted-friends set, each peer's vIP a pure function of its peer ID). Brings up a TUN and forwards IP packets
-// between friends over libp2p — with broadcast/multicast fanned out so LAN games discover each other.
+// accepted-peers set, each peer's vIP a pure function of its peer ID). Brings up a TUN and forwards IP packets
+// between peers over libp2p — with broadcast/multicast fanned out so LAN games discover each other.
 
 /*
 #include <stdlib.h>
@@ -18,8 +18,8 @@ import (
 	peer "github.com/libp2p/go-libp2p/core/peer"
 )
 
-// Bring up the friend-LAN overlay on the HOST netns (debug/CLI path): create a TUN, assign our vIP + the /16 route,
-// and forward packets to/from friends over libp2p. Requires CAP_NET_ADMIN. Returns the TUN name through outName.
+// Bring up the peer-LAN overlay on the HOST netns (debug/CLI path): create a TUN, assign our vIP + the /16 route,
+// and forward packets to/from peers over libp2p. Requires CAP_NET_ADMIN. Returns the TUN name through outName.
 // (The production launch path uses VgOverlayServe — the TUN lives inside the game's sandbox netns, never the host.)
 //
 //export VgOverlayStart
@@ -31,7 +31,7 @@ func VgOverlayStart(outName **C.char, errOut **C.char) C.int {
 	}
 	myVIP, subnet, peerByVIP, ok := n.lanConfig()
 	if !ok {
-		setStr(errOut, "friend LAN unavailable (no social state)")
+		setStr(errOut, "peer LAN unavailable (no social state)")
 		return -1
 	}
 	mask := "16"
@@ -55,7 +55,7 @@ func VgOverlayStart(outName **C.char, errOut **C.char) C.int {
 	return 0
 }
 
-// Nested-sandbox overlay (the production path): configure the friend-LAN routes and listen on sockPath for the TUN fd
+// Nested-sandbox overlay (the production path): configure the peer-LAN routes and listen on sockPath for the TUN fd
 // the in-sandbox sandbox-init will send (it creates + addresses the TUN inside the game's OWN netns — the host stack is
 // never touched). Non-blocking — returns once listening, so the caller can spawn bwrap. Forwarding attaches when the fd
 // arrives. bridge≠0 also brings up the in-node NAT gateway (internet + real-LAN unicast through the same TUN);
@@ -70,7 +70,7 @@ func VgOverlayServe(sockPath *C.char, bridge C.int, hostRelay C.int, errOut **C.
 	}
 	myVIP, subnet, peerByVIP, ok := n.lanConfig()
 	if !ok {
-		setStr(errOut, "friend LAN unavailable (no social state)")
+		setStr(errOut, "peer LAN unavailable (no social state)")
 		return -1
 	}
 	if err := n.overlay.configure(myVIP, subnet, peerByVIP); err != nil {
@@ -112,9 +112,9 @@ func VgOverlayActive() C.int {
 	return 0
 }
 
-// The custom variables a sandboxed game launch consumes to join the friend LAN + configure its LAN emulator
+// The custom variables a sandboxed game launch consumes to join the peer LAN + configure its LAN emulator
 // (VIDYAGOD_SANDBOX_NET=isolated / SELF_VIP / SUBNET / PEER_VIPS / PEER_NAMES). Returns a JSON object through
-// outJson; -1 if the friend LAN is unavailable.
+// outJson; -1 if the peer LAN is unavailable.
 //
 //export VgLanLaunchVars
 func VgLanLaunchVars(outJson **C.char) C.int {
@@ -134,7 +134,7 @@ func VgLanLaunchVars(outJson **C.char) C.int {
 	return 0
 }
 
-// Per-friend virtual-LAN link state for the UI (Friends tab + the launch window's Virtual LAN panel):
+// Per-peer virtual-LAN link state for the UI (Peers tab + the launch window's Virtual LAN panel):
 // [{peer, nick, vip, online, link:"direct"|"relayed"|"connecting"|"down", rttMs}]. -1 when the maintainer isn't up.
 //
 //export VgLanPeers
@@ -154,7 +154,7 @@ func VgLanPeers(outJson **C.char) C.int {
 
 // Replace the GLOBAL LAN roster's excluded set (comma-separated peer ids — the launch window's un-ticked members).
 // Applies immediately: excluded peers stop receiving/announcing game traffic (mid-game too) and disappear from the
-// LAN launch vars of subsequent launches. They remain friends and remain link-maintained.
+// LAN launch vars of subsequent launches. They remain peers and remain link-maintained.
 //
 //export VgLanSetExcluded
 func VgLanSetExcluded(csv *C.char) {

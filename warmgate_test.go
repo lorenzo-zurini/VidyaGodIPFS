@@ -47,27 +47,27 @@ var gateCid = func() cid.Cid {
 	return c
 }()
 
-// A connected friend is asked first; the DHT and the indexers wait the search delay and are never asked when the
-// fetch is over meanwhile (the session ends → ctx cancelled). This is what stops a receive from a friend walking the
+// A connected peer is asked first; the DHT and the indexers wait the search delay and are never asked when the
+// fetch is over meanwhile (the session ends → ctx cancelled). This is what stops a receive from a peer walking the
 // DHT once per block.
-func TestFinderHoldsTheNetworkBehindAConnectedFriend(t *testing.T) {
+func TestFinderHoldsTheNetworkBehindAConnectedPeer(t *testing.T) {
 	withSearchDelay(t, 300*time.Millisecond)
-	friend := &gateRouter{provs: []peer.AddrInfo{{ID: peer.ID("friend")}}}
+	peer := &gateRouter{provs: []peer.AddrInfo{{ID: peer.ID("peer")}}}
 	dht, idx := &gateRouter{}, &gateRouter{}
-	cf := combinedFinder{routers: []routing.ContentDiscovery{friend, dht, idx}, hold: func() bool { return true }}
+	cf := combinedFinder{routers: []routing.ContentDiscovery{peer, dht, idx}, hold: func() bool { return true }}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := cf.FindProvidersAsync(ctx, gateCid, 0)
-	if got := <-ch; got.ID != "friend" {
-		t.Fatalf("first provider = %q, want the friend", got.ID)
+	if got := <-ch; got.ID != "peer" {
+		t.Fatalf("first provider = %q, want the peer", got.ID)
 	}
 	cancel() // the block arrived: the session ends before the delay
 	drainProvs(ch)
 	if dht.calls.Load() != 0 || idx.calls.Load() != 0 {
-		t.Fatalf("DHT asked %d, indexer %d times while a friend was serving — want 0", dht.calls.Load(), idx.calls.Load())
+		t.Fatalf("DHT asked %d, indexer %d times while a peer was serving — want 0", dht.calls.Load(), idx.calls.Load())
 	}
 
-	// Still unserved after the delay (the friend lacks the block): the network is asked.
+	// Still unserved after the delay (the peer lacks the block): the network is asked.
 	ch = cf.FindProvidersAsync(context.Background(), gateCid, 0)
 	drainProvs(ch)
 	if dht.calls.Load() != 1 || idx.calls.Load() != 1 {
@@ -75,18 +75,18 @@ func TestFinderHoldsTheNetworkBehindAConnectedFriend(t *testing.T) {
 	}
 }
 
-// No connected friend: the network is asked at once, not after the delay.
-func TestFinderAsksTheNetworkAtOnceWithoutAFriend(t *testing.T) {
+// No connected peer: the network is asked at once, not after the delay.
+func TestFinderAsksTheNetworkAtOnceWithoutAPeer(t *testing.T) {
 	withSearchDelay(t, 5*time.Second)
-	friend, dht := &gateRouter{}, &gateRouter{provs: []peer.AddrInfo{{ID: peer.ID("seeder")}}}
-	cf := combinedFinder{routers: []routing.ContentDiscovery{friend, dht}, hold: func() bool { return false }}
+	peer, dht := &gateRouter{}, &gateRouter{provs: []peer.AddrInfo{{ID: peer.ID("seeder")}}}
+	cf := combinedFinder{routers: []routing.ContentDiscovery{peer, dht}, hold: func() bool { return false }}
 	start := time.Now()
 	ch := cf.FindProvidersAsync(context.Background(), gateCid, 0)
 	if got := <-ch; got.ID != "seeder" {
 		t.Fatalf("got %q, want the DHT's provider", got.ID)
 	}
 	if time.Since(start) > time.Second {
-		t.Fatalf("the DHT waited %s with no friend to wait for", time.Since(start))
+		t.Fatalf("the DHT waited %s with no peer to wait for", time.Since(start))
 	}
 	drainProvs(ch)
 }

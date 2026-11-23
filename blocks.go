@@ -107,7 +107,7 @@ func (n *node) makeDir(entries map[string]string) (cid.Cid, error) {
 	return c, err
 }
 
-// maxDirEntries bounds a folder listing: a friend's package folder is untrusted.
+// maxDirEntries bounds a folder listing: a peer's package folder is untrusted.
 var maxDirEntries = 100000 // var: tests shrink it
 
 // dirEntries lists a UnixFS folder — entry name → CID — from blocks this node holds, never the network: a received

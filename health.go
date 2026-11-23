@@ -92,7 +92,7 @@ func healthReport() []healthEntry {
 	// unsynchronized reads here raced it on every cold-start laptop (adversarial M1a).
 	gMu.Lock()
 	online, host, kad, exch, prov, mdnsSvc := n.online, n.host, n.dht, n.exchange, n.provider, n.mdns
-	friendSvc, social, linkm, overlay, bwc, serveFails := n.friend, n.social, n.linkm, n.overlay, n.bwc, n.serveFails
+	peerSvc, social, linkm, overlay, bwc, serveFails := n.peer, n.social, n.linkm, n.overlay, n.bwc, n.serveFails
 	gMu.Unlock()
 	add("Node", "ok", "repo open at "+n.repoPath)
 
@@ -176,9 +176,9 @@ func healthReport() []healthEntry {
 		add("LAN discovery (mDNS)", "ok", "announcing + listening on the local network")
 	}
 
-	// --- friends service ---
-	if friendSvc == nil || social == nil {
-		add("Friends", "down", "friend service not running")
+	// --- peers service ---
+	if peerSvc == nil || social == nil {
+		add("Peers", "down", "peer service not running")
 	} else {
 		accepted, online := 0, 0
 		for _, c := range social.list() {
@@ -189,12 +189,12 @@ func healthReport() []healthEntry {
 				}
 			}
 		}
-		add("Friends", "ok", fmt.Sprintf("%d friend(s), %d online (presence pings every 45s)", accepted, online))
+		add("Peers", "ok", fmt.Sprintf("%d peer(s), %d online (presence pings every 45s)", accepted, online))
 	}
 
 	// --- virtual-LAN link maintainer ---
 	if linkm == nil {
-		add("Virtual LAN links", "down", "link maintainer not running — friend links are not being kept alive")
+		add("Virtual LAN links", "down", "link maintainer not running — peer links are not being kept alive")
 	} else {
 		counts := map[string]int{}
 		for _, state := range linkm.snapshotStates() {

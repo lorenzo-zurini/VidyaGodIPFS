@@ -35,7 +35,7 @@ import (
 )
 
 // nilFinder is a provider router that finds nobody — the session must reach the seeder purely via its broadcast
-// to the directly-connected peer, which is exactly the "friend/seeder we're already connected to" path.
+// to the directly-connected peer, which is exactly the "peer/seeder we're already connected to" path.
 type nilFinder struct{}
 
 func (nilFinder) FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.AddrInfo {

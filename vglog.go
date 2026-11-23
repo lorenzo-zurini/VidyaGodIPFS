@@ -6,7 +6,7 @@ package main
 // setting VG_LOG=1 / VG_VERBOSE=1 in the environment (picked up at load time, before the flag path runs).
 //
 // vlog lines are for tracing the network stack end to end during a field test: connection open/close (with the
-// remote multiaddr, so relay vs direct vs which interface is visible), the friend handshake, the link maintainer's
+// remote multiaddr, so relay vs direct vs which interface is visible), the peer handshake, the link maintainer's
 // per-beat reasoning, and every overlay TX/RX decision. Format: "HH:MM:SS.mmm [component] message".
 
 import (

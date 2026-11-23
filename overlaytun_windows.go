@@ -14,7 +14,7 @@ package main
 // therefore a stub here.
 //
 // Requires the wintun.dll runtime (bundled beside the binary) and Administrator (adapter creation + netsh). The
-// friend-LAN overlay is off by default (Settings.LanEnabled), so this only runs when the user opts in.
+// peer-LAN overlay is off by default (Settings.LanEnabled), so this only runs when the user opts in.
 
 import (
 	"errors"

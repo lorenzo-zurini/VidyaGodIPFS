@@ -104,7 +104,7 @@ func bitswapOptions(tr tracer.Tracer) []bitswap.Option {
 // consults the fast delegated HTTP indexer alongside the (slow, cold) Amino DHT and uses whichever answers first.
 type combinedFinder struct {
 	routers []routing.ContentDiscovery
-	// hold reports that a friend is connected directly — then router 0 (the friends) is asked at once and the rest
+	// hold reports that a peer is connected directly — then router 0 (the peers) is asked at once and the rest
 	// (DHT, indexers) wait the search delay; nil = never hold.
 	hold func() bool
 	// noteProvider: a provider found for a fetch — dialing it is what the user waits on (netgate.go priority).
@@ -143,8 +143,8 @@ func (cf combinedFinder) FindProvidersAsync(ctx context.Context, c cid.Cid, coun
 	}
 	safeGo("finder.run", func() {
 		defer close(out)
-		// Every router fans out concurrently (a slow one never delays another) — except that while a friend is connected
-		// directly, the routers past the friends (a DHT walk, HTTPS indexer queries: each a burst of new flows through
+		// Every router fans out concurrently (a slow one never delays another) — except that while a peer is connected
+		// directly, the routers past the peers (a DHT walk, HTTPS indexer queries: each a burst of new flows through
 		// the home router) wait the same search delay bitswap applies to connected peers, and are never started if the
 		// block arrives meanwhile (the session ends, boxo's query manager cancels ctx).
 		held := cf.hold != nil && cf.hold()
@@ -183,7 +183,7 @@ func (n *node) goOnline() error {
 	if err != nil {
 		return err
 	}
-	n.priv = priv // kept for IPNS record signing (ipns.go) — same key as the peer ID / friend code
+	n.priv = priv // kept for IPNS record signing (ipns.go) — same key as the peer ID / peer code
 
 	// Connections: Kubo's defaults (32/96) — a home node holds a small peer set. The high-water once stood at 900
 	// (~1.3 GB of connection state, OOM on a swap-pressured box) and then 384 for provider fan-out; but providers are
@@ -252,7 +252,7 @@ func (n *node) goOnline() error {
 			// Close EVERYTHING built so far, newest-first — the retry loop otherwise accretes a DHT (on n.ctx,
 			// which outlives the attempt) and 32 bitswap workers per failed attempt (adversarial round-2).
 			// published flips only at the very END of goOnline: a panic in the late steps (provider, mDNS,
-			// friend/overlay wiring) must ALSO tear this attempt down, or the retry builds a second host with
+			// peer/overlay wiring) must ALSO tear this attempt down, or the retry builds a second host with
 			// the same identity over a live first one (adversarial round-3).
 			if n.mdns != nil {
 				_ = n.mdns.Close()
@@ -293,16 +293,16 @@ func (n *node) goOnline() error {
 	bsn := bsnet.NewFromIpfsHost(h)
 	var finder routing.ContentDiscovery = kad
 	// DoH-resolving HTTP client so the indexer host (delegated-ipfs.dev) also resolves through a DNS filter.
-	// friendFinder makes our accepted friends providers for EVERY cid (friendprovider.go) — the only content router
+	// peerFinder makes our accepted peers providers for EVERY cid (peerprovider.go) — the only content router
 	// that still works when the DHT is dead and the delegated indexer knows only a throttling third party. Listed
-	// FIRST so a friend who has the content is asked immediately, before the slow/rate-limited routers answer.
+	// FIRST so a peer who has the content is asked immediately, before the slow/rate-limited routers answer.
 	// Delegated HTTP indexers, RACED: combinedFinder fans out to every router, so a second indexer costs nothing and
 	// removes the single point of failure the path matrix exposed. Pinata does NOT announce to the Amino DHT (the
 	// DHT returned only our own dead seeder's stale record), so for Pinata-pinned content the indexer IS the libp2p
 	// path — and on the laptop-at-work run delegated-ipfs.dev answered 0, leaving nothing but the gateway. cid.contact
 	// is the canonical IPNI instance (same /routing/v1 API). Each gets a DoH-resolving client so it works through a
-	// DNS filter too. [finder] router indices: 0 friends, 1 DHT, then the indexers in delegatedIndexers order.
-	routers := []routing.ContentDiscovery{friendFinder{n}, kad}
+	// DNS filter too. [finder] router indices: 0 peers, 1 DHT, then the indexers in delegatedIndexers order.
+	routers := []routing.ContentDiscovery{peerFinder{n}, kad}
 	for _, u := range delegatedIndexers {
 		if hc, herr := routinghttp.New(u, routinghttp.WithHTTPClient(sharedHTTPClient())); herr == nil {
 			routers = append(routers, routinghttpcr.NewContentRoutingClient(hc))
@@ -312,7 +312,7 @@ func (n *node) goOnline() error {
 	// (quarantine.go) — and our finder does not hand it back to the sessions meanwhile.
 	qnet := newQuarantineNet(bsn)
 	qctx, qstop := context.WithCancel(n.ctx)
-	finder = combinedFinder{routers: routers, hold: n.friendConnected, noteProvider: n.noteWantedProvider, skip: qnet.out}
+	finder = combinedFinder{routers: routers, hold: n.peerConnected, noteProvider: n.noteWantedProvider, skip: qnet.out}
 	n.upSeen = make(map[string]int64)
 	safeGo("node.quarantine", func() { qnet.run(qctx) })
 	bswap := bitswap.New(n.ctx, qnet, finder, n.fstore, bitswapOptions(upTracer{n})...)
@@ -342,7 +342,7 @@ func (n *node) goOnline() error {
 	// Connection-event trace (verbose only): the single most useful signal for diagnosing NAT traversal in the
 	// field — every conn open/close with its remote multiaddr shows relay (/p2p-circuit) vs direct, the transport
 	// (quic/tcp), and which interface/address actually carried it (LAN, WireGuard, public). Direction tells us who
-	// dialed. Registered here so it covers bitswap, friend and overlay conns alike.
+	// dialed. Registered here so it covers bitswap, peer and overlay conns alike.
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
 			netStats.connsOpened.Add(1)
@@ -394,12 +394,12 @@ func (n *node) goOnline() error {
 		}
 	}
 
-	// Friends / multiplayer social layer: register the /vidyagod/friend protocol on the host and start presence.
+	// Peers / multiplayer social layer: register the /vidyagod/peer protocol on the host and start presence.
 	// Uses the DHT for peer routing (FindPeer) and the same libp2p auth that secures bitswap. Best-effort.
 	if n.social != nil {
-		n.friend = newFriendService(n.ctx, h, kad, n.social, emitFriendEvent)
-		n.friend.start()
-		n.friend.startPresence(45 * time.Second)
+		n.peer = newPeerService(n.ctx, h, kad, n.social, emitPeerEvent)
+		n.peer.start()
+		n.peer.startPresence(45 * time.Second)
 		n.nearby = newNearbyService(n.ctx, h, n.social, n.isLanPeer, func() nearbyInfo {
 			nick := n.social.getProfile().Nick
 			if nick == "" {
@@ -409,8 +409,8 @@ func (n *node) goOnline() error {
 		})
 		n.nearby.start()
 		// ALWAYS-ON link maintainer (overlaylink.go): heartbeat + auto-reconnect + datagram-path proving per accepted
-		// friend for the app's lifetime — the LAN's links are warm BEFORE any game launches, and the UI gets
-		// live per-friend link state. Membership is re-read from the address book every beat.
+		// peer for the app's lifetime — the LAN's links are warm BEFORE any game launches, and the UI gets
+		// live per-peer link state. Membership is re-read from the address book every beat.
 		n.linkm = newLinkMaintainer(n.ctx, h, kad, func() map[peer.ID]string {
 			out := map[peer.ID]string{}
 			for _, c := range n.social.list() {
@@ -429,8 +429,8 @@ func (n *node) goOnline() error {
 			}
 			return out
 		})
-		// Virtual LAN of friends: there is NO session/host. Each friend's vIP is a pure function of its peer ID
-		// (friendlan.go), so membership + the overlay routing table are derived from the accepted-friends set on
+		// Virtual LAN of peers: there is NO session/host. Each peer's vIP is a pure function of its peer ID
+		// (peerlan.go), so membership + the overlay routing table are derived from the accepted-peers set on
 		// demand. The overlay datapath registers the /vidyagod/overlay handler now; a TUN is attached at game launch.
 		// Created BEFORE the maintainer starts ticking: the constructor assigns lm.ensureRecvLoops, and starting
 		// run() first made that assignment race the first tick's read (adversarial M1c).
@@ -512,6 +512,10 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	defer cancel()
 	if err := m.h.Connect(ctx, pi); err != nil {
 		vlog("mdns", "connect %s failed: %v", shortPeer(pi.ID.String()), err)
+		return
+	}
+	if m.n != nil && m.n.peer != nil {
+		m.n.peer.peerReachable(pi.ID.String()) // a peer found beside us is reached now, not at the next tick
 	}
 }
 

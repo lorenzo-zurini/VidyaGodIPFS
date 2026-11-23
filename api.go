@@ -769,7 +769,7 @@ func VgSetExpectedSize(cidStr *C.char, size C.longlong) {
 //export VgSetTransferCb
 func VgSetTransferCb(cb C.vg_transfer_cb) { transferCb = cb }
 
-// VgIpnsResolve resolves /ipns/<name> (a peer ID / friend code, with or without the /ipns/ prefix) to its current
+// VgIpnsResolve resolves /ipns/<name> (a peer ID / peer code, with or without the /ipns/ prefix) to its current
 // /ipfs/<cid> path string. DHT first, then the HTTPS-gateway fallback; the signature is verified against the name, so
 // a forged record is rejected. Returns the resolved path (e.g. "/ipfs/Qm…") via out.
 //
@@ -790,7 +790,7 @@ func VgIpnsResolve(name *C.char, out **C.char, errOut **C.char) C.int {
 	return 0
 }
 
-// VgExportIdentity backs up the Ed25519 identity key (== friend code + library address) to destPath. Loss is permanent.
+// VgExportIdentity backs up the Ed25519 identity key (== peer code + library address) to destPath. Loss is permanent.
 //
 //export VgExportIdentity
 func VgExportIdentity(destPath *C.char, errOut **C.char) C.int {
@@ -806,7 +806,7 @@ func VgExportIdentity(destPath *C.char, errOut **C.char) C.int {
 }
 
 // VgImportIdentity installs a backed-up identity key. The running node keeps the old key until RESTARTED — the caller
-// must warn + restart for the new peer ID / friend code / library address to take effect.
+// must warn + restart for the new peer ID / peer code / library address to take effect.
 //
 //export VgImportIdentity
 func VgImportIdentity(srcPath *C.char, errOut **C.char) C.int {

@@ -13,7 +13,7 @@ import (
 	peer "github.com/libp2p/go-libp2p/core/peer"
 )
 
-// genPeer makes a real Ed25519 peer ID (the peer ID embeds the pubkey — the same shape a friend code has).
+// genPeer makes a real Ed25519 peer ID (the peer ID embeds the pubkey — the same shape a peer code has).
 func genPeer(t *testing.T) peer.ID {
 	t.Helper()
 	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
@@ -27,9 +27,9 @@ func genPeer(t *testing.T) peer.ID {
 	return id
 }
 
-// friendProviderPeers is what makes "the friend ID is everything" reach bitswap: accepted friends become providers
-// for every CID. Teeth: it must return exactly the ACCEPTED friends, never a pending/blocked one, and never self.
-func TestFriendProviderPeersOffersAcceptedFriendsNotSelfNotPending(t *testing.T) {
+// peerProviderPeers is what makes "the peer ID is everything" reach bitswap: accepted peers become providers
+// for every CID. Teeth: it must return exactly the ACCEPTED peers, never a pending/blocked one, and never self.
+func TestPeerProviderPeersOffersAcceptedPeersNotSelfNotPending(t *testing.T) {
 	s := newSocialState(filepath.Join(t.TempDir(), "sub"))
 	self := genPeer(t)
 	acceptedA, acceptedB := genPeer(t), genPeer(t)
@@ -40,26 +40,26 @@ func TestFriendProviderPeersOffersAcceptedFriendsNotSelfNotPending(t *testing.T)
 	s.upsert(acceptedB.String(), func(c *contact) { c.State = stAccepted })
 	s.upsert(pending.String(), func(c *contact) { c.State = stPending })
 	s.upsert(blocked.String(), func(c *contact) { c.State = stBlocked })
-	s.upsert(self.String(), func(c *contact) { c.State = stAccepted }) // self befriended somehow — must NOT be offered
+	s.upsert(self.String(), func(c *contact) { c.State = stAccepted }) // self paired somehow — must NOT be offered
 
 	got := map[peer.ID]bool{}
-	for _, p := range friendProviderPeers(s, self) {
+	for _, p := range peerProviderPeers(s, self) {
 		got[p] = true
 	}
 	if !got[acceptedA] || !got[acceptedB] {
-		t.Errorf("accepted friends must be offered as providers; got %v", got)
+		t.Errorf("accepted peers must be offered as providers; got %v", got)
 	}
 	if got[self] {
 		t.Error("self must never be offered as a provider (would make bitswap ask itself)")
 	}
 	if got[pending] {
-		t.Error("a PENDING contact is not a friend and must not be offered")
+		t.Error("a PENDING contact is not a peer and must not be offered")
 	}
 	if got[blocked] {
 		t.Error("a BLOCKED contact must not be offered")
 	}
 	if len(got) != 2 {
-		t.Errorf("expected exactly the 2 accepted non-self friends, got %d: %v", len(got), got)
+		t.Errorf("expected exactly the 2 accepted non-self peers, got %d: %v", len(got), got)
 	}
 }
 

@@ -2,7 +2,7 @@ package main
 
 // safego.go — the node's ONLY panic boundary. The embedded node is a c-shared library linked into the Qt app, and
 // Go's default is fatal: a panic in ANY goroutine, if it unwinds to the top with no recover, kills the WHOLE process
-// — bitswap, the DHT, the friend/overlay LAN, and the GUI, all at once. That is the "the whole node just went off"
+// — bitswap, the DHT, the peer/overlay LAN, and the GUI, all at once. That is the "the whole node just went off"
 // field failure: a latent bug on a background path (the always-on link maintainer's heartbeat tick, a per-conn
 // datagram loop, a presence send, a re-dial) takes down a node that was, a moment earlier, happily serving a
 // download. These helpers make a background panic a LOGGED, LOCAL event instead of a process death.

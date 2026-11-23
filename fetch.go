@@ -554,7 +554,7 @@ func classifyFetchErr(cidStr string, err error) int {
 
 // maxDirBytes bounds a folder fetch. The folders this node fetches are package folders (node files) and dehydrated
 // source trees — kilobytes to a few megabytes. A folder declaring or streaming more is refused: never landed, never
-// pinned, never re-provided (a friend's snapshot is untrusted input).
+// pinned, never re-provided (a peer's snapshot is untrusted input).
 const maxDirBytes int64 = 1 << 30
 
 var errFolderRefused = errors.New("folder refused")
@@ -731,7 +731,7 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 	wctx, wcancel := context.WithCancel(nctx)
 	defer wcancel()
 	n.warmForFetch(wctx, c, moved, true)
-	n.warmFriends() // a friend is a guaranteed provider the DHT never surfaces
+	n.warmPeers() // a peer is a guaranteed provider the DHT never surfaces
 	if _, err := os.Stat(dest); err == nil {
 		// dest already on disk. Two cases:
 		//  * no .part sidecar → finalize completed fully (referenced + pinned + announced) → fast no-op.
@@ -1299,7 +1299,7 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		// a WHOLE chunk arrived. That head-of-line-blocks: one straggler (a want the peer dropped) holds its chunk's
 		// slot open forever, and once every slot is held by a straggler NO new keys are ever requested — the session
 		// only knows the ≤ window keys handed so far, of which a few never come, and keys beyond the window are never
-		// asked for at all. Against a single stock-cap peer (a friend on a dead-DHT network reaching only Pinata) the
+		// asked for at all. Against a single stock-cap peer (a peer on a dead-DHT network reaching only Pinata) the
 		// stragglers never arrive, so the fetch wedges permanently. Measured: 3015/4037 then dead; 24→56 in minutes.
 		//
 		// Rolling window: request an initial `wantWindow` keys, then admit ONE new key for every block received, so
@@ -1385,8 +1385,8 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		// The resume is USER-CANCELLABLE on its own: fetch.worker (the session's cancel poller) has already exited
 		// on the stall, and nctx is n.ctx for a background download, so without userCancelCtx a Cancel pressed
 		// during a multi-GB CAR would stream on for minutes and then finalize + pin the file. COST where no gateway
-		// has the content (a friend's own package): gatewayHedgeDelay + gatewayHeaderTimeout (~55 s) per attempt
-		// whose session stalled — and while that friend stays offline the loop cycles stall → probe → backoff,
+		// has the content (a peer's own package): gatewayHedgeDelay + gatewayHeaderTimeout (~55 s) per attempt
+		// whose session stalled — and while that peer stays offline the loop cycles stall → probe → backoff,
 		// ~80 s per lap, on every lap. No cheaper definitive negative exists: see gatewayHeaderTimeout.
 		if !bits.allSet() && stalled.Load() && n.dht != nil && nctx.Err() == nil {
 			var missing []byteRange // leaves are in file order

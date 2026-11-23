@@ -5,7 +5,7 @@ package main
 // A node that restarts under the same identity must be heard again at once. With fresh random ports it was not: a
 // peer still held the dead process's QUIC connection (a killed process sends no close; QUIC has no kernel RST, so the
 // connection lives until its idle timeout), and the swarm sends every new stream down the connection with the most
-// open streams — the dead one, still carrying the old bitswap and friend streams. For ~30 s every reply we were owed
+// open streams — the dead one, still carrying the old bitswap and peer streams. For ~30 s every reply we were owed
 // went nowhere (replication 7: the seeder's HAVEs and blocks for the first 38 s after the receiver restarted; two
 // Silent Hill 2 root fetches timed out into a 14-minute gateway crawl). On the SAME port the restarted process gets
 // the peer's next packet on that dead connection and answers it with a QUIC stateless reset — valid, because
@@ -16,7 +16,7 @@ package main
 // dead connection could sit on either), and each port the same on IPv4 and IPv6 (port 0 gives the two families
 // different ones, and the one saved need not be the one a connection used). A saved port that cannot be had — taken,
 // excluded (Windows reshuffles its excluded ranges at boot), a damaged file — is replaced by a fresh one for that
-// run: the node always listens. Stable ports also keep the addresses friends and the DHT hold for us valid across
+// run: the node always listens. Stable ports also keep the addresses peers and the DHT hold for us valid across
 // restarts, and our UPnP mappings.
 //
 // Known limit: TCP listens with SO_REUSEPORT (libp2p's default), so a saved TCP port still held by a live process —

@@ -81,7 +81,7 @@ type overlayService struct {
 	logDatagram sync.Once // one-shot "[overlay] TX path: DATAGRAM" the first time a datagram carries a packet
 	logStream   sync.Once // one-shot "[overlay] TX path: STREAM"   the first time the stream fallback carries a packet
 
-	linkm *linkMaintainer // always-on per-friend heartbeat/state/repair (overlaylink.go); nil only in old tests
+	linkm *linkMaintainer // always-on per-peer heartbeat/state/repair (overlaylink.go); nil only in old tests
 
 	exclMu   sync.Mutex
 	excluded map[peer.ID]bool // the GLOBAL LAN roster's un-ticked members — carried in routes but never targeted
@@ -123,7 +123,7 @@ func (l *fdLink) WritePacket(p []byte) error { _, err := l.f.Write(p); return er
 func (l *fdLink) Close() error               { return l.f.Close() }
 
 // newOverlayService — lm is the always-on link maintainer, injected HERE because this wiring was once a field
-// assignment ("o.linkm = ...") that every TEST performed and production NEVER did: with linkm nil, no friend
+// assignment ("o.linkm = ...") that every TEST performed and production NEVER did: with linkm nil, no peer
 // connection ever got a datagram receive loop and inbound heartbeats were ignored, so pongs never happened in
 // the field — the LAN ran blind while the state machine guessed. Constructor injection makes the
 // forgotten-wiring class unrepresentable; nil stays legal for overlay-only tests (and disables the trust gate).
@@ -132,7 +132,7 @@ func newOverlayService(ctx context.Context, h host.Host, r peerRouter, lm *linkM
 		sends: map[peer.ID]network.Stream{}, dgRecv: map[network.Conn]bool{},
 		excluded: map[peer.ID]bool{}, senders: map[peer.ID]chan []byte{}, linkm: lm}
 	if lm != nil {
-		// The maintainer re-kicks receive loops from its tick: a conn that predated friend membership (a bitswap
+		// The maintainer re-kicks receive loops from its tick: a conn that predated peer membership (a bitswap
 		// dial, a presence stream) would otherwise NEVER get a loop — the dgRecv dedupe means a miss was permanent.
 		lm.ensureRecvLoops = func(pid peer.ID) {
 			for _, c := range h.Network().ConnsToPeer(pid) {
@@ -185,7 +185,7 @@ func (o *overlayService) start() {
 	o.host.Network().Notify(o.notifee)
 }
 
-// configure sets the local vIP, the /N subnet, and the vIP→peer routing table (peerByVIP maps each remote friend's vIP
+// configure sets the local vIP, the /N subnet, and the vIP→peer routing table (peerByVIP maps each remote peer's vIP
 // to their peer-ID). The subnet's directed-broadcast address is derived so broadcast/multicast packets can be fanned
 // out to every peer (LAN-game discovery) rather than dropped.
 func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string]string) error {
@@ -214,7 +214,7 @@ func (o *overlayService) configure(localVIP, subnet string, peerByVIP map[string
 	o.subnetNet = snet
 	o.mu.Unlock()
 	vlog("overlay", "configure selfVIP=%s subnet=%s routes=%d bcast=%s", localVIP, subnet, len(routes), bcast)
-	// Existing direct-QUIC connections to these peers (e.g. a fetch already holepunched to a friend) need a datagram
+	// Existing direct-QUIC connections to these peers (e.g. a fetch already holepunched to a peer) need a datagram
 	// receive loop too — the notifiee only catches connections that appear AFTER this point.
 	for _, pid := range routes {
 		for _, c := range o.host.Network().ConnsToPeer(pid) {
@@ -405,7 +405,7 @@ func (o *overlayService) handleOutbound(ctx context.Context, pkt []byte) {
 	pid, known := o.routes[dst]
 	gw, relay := o.gw, o.relay // snapshot with routes: detach nils them concurrently (adversarial M1b)
 	o.mu.Unlock()
-	// The GLOBAL roster (launch-window ticks): un-ticked members stay friends and stay routed-in-name, but no
+	// The GLOBAL roster (launch-window ticks): un-ticked members stay peers and stay routed-in-name, but no
 	// game traffic flows to them in either intention — outbound filtered here, and they simply never announce.
 	o.exclMu.Lock()
 	if fanout {
@@ -437,7 +437,7 @@ func (o *overlayService) handleOutbound(ctx context.Context, pkt []byte) {
 	}
 	if !known {
 		// Not a LAN address → the HOST plane: hand it to the in-node NAT (internet / real-LAN unicast).
-		// In-subnet addresses with no owning friend stay dropped — the vLAN never leaks into the NAT.
+		// In-subnet addresses with no owning peer stay dropped — the vLAN never leaks into the NAT.
 		o.mu.Lock()
 		snet := o.subnetNet
 		o.mu.Unlock()
@@ -543,7 +543,7 @@ func (o *overlayService) sendDatagram(pid peer.ID, pkt []byte) bool {
 				}
 			}
 		} else {
-			return false // maintainer live but peer unknown: never trust (removed friend's stale route)
+			return false // maintainer live but peer unknown: never trust (removed peer's stale route)
 		}
 	} else {
 		qc = quicConnTo(o.host, pid) // maintainer-less (tests): old behavior
@@ -591,7 +591,7 @@ func (o *overlayService) maybeStartDatagramLoop(c network.Conn) {
 	_, isRoute := routesContain(o.routes, c.RemotePeer())
 	o.mu.Unlock()
 	if !isRoute && (o.linkm == nil || !o.linkm.has(c.RemotePeer())) {
-		return // neither a session peer nor a maintained friend
+		return // neither a session peer nor a maintained peer
 	}
 	var qc *quic.Conn
 	if !c.As(&qc) || qc == nil {
@@ -723,7 +723,7 @@ func (o *overlayService) handleInbound(s network.Stream) {
 	defer s.Close()
 	// AUTHORIZATION (adversarial M8): the datagram RX path is gated on routes/maintained peers, but this stream
 	// handler is registered on the public host at goOnline — without this check ANY dialable peer could open
-	// /vidyagod/overlay/1.0.0 and inject arbitrary L3 frames into the game's netns. Only friends may speak here.
+	// /vidyagod/overlay/1.0.0 and inject arbitrary L3 frames into the game's netns. Only peers may speak here.
 	remote := s.Conn().RemotePeer()
 	authorized := func() bool {
 		o.mu.Lock()
@@ -732,7 +732,7 @@ func (o *overlayService) handleInbound(s network.Stream) {
 		return isRoute || (o.linkm != nil && o.linkm.has(remote))
 	}
 	if !authorized() {
-		vlog("overlay", "REJECT inbound overlay stream from non-friend %s", shortPeer(remote.String()))
+		vlog("overlay", "REJECT inbound overlay stream from non-peer %s", shortPeer(remote.String()))
 		return
 	}
 	for {
@@ -740,7 +740,7 @@ func (o *overlayService) handleInbound(s network.Stream) {
 		if err != nil {
 			return
 		}
-		// Re-checked PER FRAME, not just at open: a friend removed mid-session keeps their long-lived stream,
+		// Re-checked PER FRAME, not just at open: a peer removed mid-session keeps their long-lived stream,
 		// and the never-ClosePeer policy means the conn won't die on its own — revocation must close this door
 		// (adversarial round-2). One mutex + map hit per frame; the stream path is not the fast path.
 		if !authorized() {

@@ -3,8 +3,8 @@ package main
 // nettest.go — the Settings → Network "is my firewall the problem?" sweep.
 //
 // Every network subsystem VidyaGod has fails SOFT: a blocked UDP port degrades QUIC to TCP, a blocked 5353
-// silences same-LAN discovery, a hostile NAT quietly parks friends on relays — and each of those just looks
-// like "slow" or "can't see my friend". This runs one bounded, concurrent probe per subsystem and reports
+// silences same-LAN discovery, a hostile NAT quietly parks peers on relays — and each of those just looks
+// like "slow" or "can't see my peer". This runs one bounded, concurrent probe per subsystem and reports
 // ok/warn/fail with a human sentence, so the DIFFERENTIALS do the diagnosis: TCP peers but zero QUIC conns
 // means UDP is blocked; internet fine but no mDNS answers means multicast/5353 is filtered; public HTTPS OK
 // but zero DHT providers means the P2P ports specifically are the problem.
@@ -67,11 +67,11 @@ func (n *node) runNetworkTest() []netCheck {
 	run(func() { put(n.checkInbound()) })
 	run(func() { put(n.checkMDNS(ctx)) })
 	run(func() { put(n.checkDHT(ctx)) })
-	run(func() { put(n.checkFriendLinks()) })
+	run(func() { put(n.checkPeerLinks()) })
 	wg.Wait()
 
 	order := []string{"Internet (HTTPS)", "DNS over HTTPS", "Peer connectivity", "UDP / QUIC",
-		"Inbound reachability", "LAN discovery (mDNS)", "DHT lookups", "Friend links"}
+		"Inbound reachability", "LAN discovery (mDNS)", "DHT lookups", "Peer links"}
 	res := make([]netCheck, 0, len(order))
 	for _, k := range order {
 		if c, ok := out[k]; ok {
@@ -231,7 +231,7 @@ func (n *node) checkMDNS(ctx context.Context) netCheck {
 	if len(heard) == 0 {
 		c.Status = "warn"
 		c.Detail = "no mDNS answers in 4s — UDP 5353/multicast may be filtered (or no other libp2p node on this LAN); " +
-			"same-network friends would fall back to slower internet paths"
+			"same-network peers would fall back to slower internet paths"
 		return c
 	}
 	self := n.host.ID().String()
@@ -278,9 +278,9 @@ func (n *node) checkDHT(ctx context.Context) netCheck {
 	return c
 }
 
-// Friend links: the always-on maintainer's live view, summarized.
-func (n *node) checkFriendLinks() netCheck {
-	c := netCheck{Name: "Friend links"}
+// Peer links: the always-on maintainer's live view, summarized.
+func (n *node) checkPeerLinks() netCheck {
+	c := netCheck{Name: "Peer links"}
 	if n.linkm == nil {
 		c.Status, c.Detail = "warn", "link maintainer not running"
 		return c
@@ -288,7 +288,7 @@ func (n *node) checkFriendLinks() netCheck {
 	infos := n.linkm.snapshot(func(peer.ID) string { return "" })
 	if len(infos) == 0 {
 		// The maintainer's table fills on its 4s tick; right after node start it can be empty while the address
-		// book is not. Reporting "no friends" to someone WITH friends is a lie (first live run did exactly that) —
+		// book is not. Reporting "no peers" to someone WITH peers is a lie (first live run did exactly that) —
 		// distinguish the two.
 		accepted := 0
 		if n.social != nil {
@@ -299,9 +299,9 @@ func (n *node) checkFriendLinks() netCheck {
 			}
 		}
 		if accepted > 0 {
-			c.Status, c.Detail = "warn", fmt.Sprintf("%d friend(s) known but links not evaluated yet — run again in a few seconds", accepted)
+			c.Status, c.Detail = "warn", fmt.Sprintf("%d peer(s) known but links not evaluated yet — run again in a few seconds", accepted)
 		} else {
-			c.Status, c.Detail = "ok", "no friends yet — nothing to maintain"
+			c.Status, c.Detail = "ok", "no peers yet — nothing to maintain"
 		}
 		return c
 	}

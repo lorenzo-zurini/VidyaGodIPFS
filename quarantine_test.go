@@ -282,7 +282,7 @@ func TestQuarantineRules(t *testing.T) {
 	})
 }
 
-// A DONT_HAVE for a want-block the peer never said HAVE to (boxo sends optimistic want-blocks) is no lie: a friend
+// A DONT_HAVE for a want-block the peer never said HAVE to (boxo sends optimistic want-blocks) is no lie: a peer
 // holding part of a package, silent for a moment, pays in blocks what it has and DONT_HAVEs the rest — its record
 // clears. Teeth: count any DONT_HAVE for an owed block as a lie.
 func TestQuarantineForgivesAnHonestDontHave(t *testing.T) {
@@ -305,7 +305,7 @@ func TestQuarantineForgivesAnHonestDontHave(t *testing.T) {
 }
 
 // A peer that delivers slowly may sit silent on a want-block for three of its own block intervals (up to
-// quarantineMaxHold) before it goes out: a friend on a thin uplink, delivering every 2.5 s, is not taken out for a
+// quarantineMaxHold) before it goes out: a peer on a thin uplink, delivering every 2.5 s, is not taken out for a
 // 4 s pause the moment anyone else offers. A promiser, which never delivers, still goes out at quarantineAfter.
 // Teeth: one fixed threshold for every peer; learn the pace from idle gaps (a peer idle for minutes would get the
 // maximum).

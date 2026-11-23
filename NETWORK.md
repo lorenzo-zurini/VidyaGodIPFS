@@ -10,17 +10,17 @@ invariants any future change must preserve.*
 |---|---|---|
 | **Substrate** | `online.go`, `doh.go`, `peers.go` | libp2p host (TCP/QUIC/WS/WebTransport), Kademlia DHT + delegated HTTP routing, AutoRelay + DCUtR hole-punching, mDNS same-LAN discovery, bitswap (tuned), DoH for filtered networks. |
 | **Download rotation** | `quarantine.go` | Wraps bitswap's network: a peer sitting on our want-blocks while another peer offers them is reported *disconnected* to the bitswap client (never closed), so boxo re-routes its wants. |
-| **Social** | `friend.go`, `social.go` | `/vidyagod/friend/1.0.0`: mutual-consent friendship, profiles, online/offline liveness (45 s pings). No play-state/lobby/join — excised 2026-09-04. Address book survives offline (`social.json`). |
-| **Link** | `overlaylink.go` | ALWAYS-ON per-friend heartbeat/state machine: proves + repairs each friend link for the app's lifetime. The trust oracle for the datagram fast path. |
-| **Datapath** | `overlay.go` | `/vidyagod/overlay/1.0.0`: L3 forwarder between a TUN (in the game's netns) and friends. TX = proven-QUIC-datagram fast path over reliable-stream fallback. |
+| **Social** | `peer.go`, `social.go` | `/vidyagod/peer/1.0.0`: mutual-consent pairing, profiles, online/offline liveness (45 s pings). No play-state/lobby/join — excised 2026-09-04. Address book survives offline (`social.json`). |
+| **Link** | `overlaylink.go` | ALWAYS-ON per-peer heartbeat/state machine: proves + repairs each peer link for the app's lifetime. The trust oracle for the datagram fast path. |
+| **Datapath** | `overlay.go` | `/vidyagod/overlay/1.0.0`: L3 forwarder between a TUN (in the game's netns) and peers. TX = proven-QUIC-datagram fast path over reliable-stream fallback. |
 | **Tri-plane** | `natgateway.go`, `hostrelay.go` | Plane 2: userspace NAT (gVisor-style, in-process) for internet + host-LAN unicast. Plane 3: broadcast reflector bridging the real LAN. Both attach at overlay serve time. |
 | **Sandbox plumbing** | `overlayserve_linux.go`, C++ `sandboxinit` | TUN created inside the game's rootless netns; fd handed to the node over a unix socket. |
 | **Panic boundary** | `safego.go` | `guard`/`safeGo`/`guardErr` around every long-lived goroutine: a panic anywhere degrades to a logged skip, never node death. |
 
 ## The invariants (violate these and you re-introduce a field incident)
 
-1. **Never tear down a working connection.** One libp2p connection per friend multiplexes bitswap downloads,
-   the friend/presence protocol AND the overlay. `Network().ClosePeer` from maintenance logic once killed live
+1. **Never tear down a working connection.** One libp2p connection per peer multiplexes bitswap downloads,
+   the peer/presence protocol AND the overlay. `Network().ClosePeer` from maintenance logic once killed live
    downloads on a zombie *verdict* (not a zombie *fact*) — the "downloading at direct 5 ms, then node down"
    incident. The maintainer observes, dials and routes. It never closes.
 
@@ -34,7 +34,7 @@ invariants any future change must preserve.*
    instant). Delivery must never depend on an unverified path.
 
 3. **The stream fallback must work over ANY connection.** `NewStream` refuses relayed (circuit-v2 "limited")
-   conns unless the ctx carries `network.WithAllowLimitedConn`. Both custom protocols (`friend.go`,
+   conns unless the ctx carries `network.WithAllowLimitedConn`. Both custom protocols (`peer.go`,
    `overlay.go sendStream`) opt in — without it, a relay-only pair has *no* path at all.
 
 4. **No panic may cross a NODE-AUTHORED goroutine boundary unguarded.** The node is a c-shared library: an
@@ -49,8 +49,8 @@ invariants any future change must preserve.*
 
 5. **Every link state has an exit.** down →dial(backoff 2 s→30 s)→ connecting → relayed (usable via stream)
    →force-direct nudge (30 s cadence)→ direct-unproven (stream) →first pong→ direct-proven (datagrams)
-   →misses/send-error→ demoted-unproven (stream) → re-proven on next pong. Friend add/remove takes effect
-   within one 4 s beat. No state is terminal except "not friends anymore".
+   →misses/send-error→ demoted-unproven (stream) → re-proven on next pong. Peer add/remove takes effect
+   within one 4 s beat. No state is terminal except "not peers anymore".
 
 6. **Upgrade dials must force-direct and must have addresses.** `dialPeer` short-circuits when *any* conn
    exists, so upgrade nudges use `dialPeerDirect` (`network.WithForceDirectDial`). mDNS-discovered same-LAN
@@ -58,7 +58,7 @@ invariants any future change must preserve.*
    turns "two PCs on one LAN" into a 2 ms local link instead of a hairpin punch (measured: WG hairpin 60 ms,
    local path 2 ms).
 
-7. **Receive loops must be re-kicked, not assumed.** A conn established *before* the peer became a friend
+7. **Receive loops must be re-kicked, not assumed.** A conn established *before* the peer became a peer
    never got a datagram receive loop, and the `dgRecv` dedupe made the miss permanent (pongs land in the void
    forever). The maintainer calls `ensureRecvLoops` every evaluate — idempotent, cheap.
 
@@ -107,7 +107,7 @@ invariants any future change must preserve.*
 | Proven path dies (path change, sleep) | `linkBeatMiss` misses or a send error (`suspect`) | instant distrust → stream; nudge new direct path |
 | Hole punch impossible (symmetric NAT) | no direct conn at all | relayed state; limited-conn stream carries the LAN |
 | Peer on a build without heartbeats | `everPonged` never set | stream forever (correct, not fast); no demote loop |
-| Friend offline | connectedness lost | down + dial with backoff; conn re-protected on return |
+| Peer offline | connectedness lost | down + dial with backoff; conn re-protected on return |
 | Panic in any network goroutine | `guard` recover + stack log | that iteration/goroutine dies; node lives |
 | goOnline fails/panics at startup | `guardErr` | offline node + background retry with backoff |
 | A slow link, a deep queue at the provider | wants take seconds to come back | the pool shrinks to ~2 s of flight; new fetches are served at once |
@@ -120,6 +120,6 @@ invariants any future change must preserve.*
 - `VG_OVERLAY_FORCE_STREAM=1` — disable the datagram path entirely (A/B lever).
 - `--net-test` — headless network/firewall sweep.
 - `--lan --overlay-exec "<cmd>"` — bring the overlay TUN up headless and run a command inside it (the
-  standard 2-machine datapath test: `ping -c 15 <friend vIP>`).
+  standard 2-machine datapath test: `ping -c 15 <peer vIP>`).
 - State-change log lines carry counters: `dgTx/dgRx/streamTx/demoted` — a healthy proven link shows dgRx>0;
   a link riding the fallback shows streamTx climbing; `demoted` counts trust losses (flapping datagram path).

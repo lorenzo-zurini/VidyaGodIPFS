@@ -9,7 +9,7 @@ package main
 // circuitrelay_test.go — an IN-PROCESS circuit-v2 relay fixture: a relay host R and two UNREACHABLE clients that
 // can only meet through it. This is the topology the unit suite structurally lacked (every other fixture wires
 // directly-connected hosts, so Connectedness is always Connected): libp2p reports a relayed conn as
-// network.Limited, and treating Limited as "not connected" showed a live relay-only friend link as DOWN in the
+// network.Limited, and treating Limited as "not connected" showed a live relay-only peer link as DOWN in the
 // panel while re-dialing it uselessly every beat — a real field bug the E2E battery caught on 2026-09-04 and the
 // unit suite could not (adversarial finding: "no test anywhere constructs a Limited conn").
 
@@ -88,7 +88,7 @@ func TestRelayOnlyConnIsLimitedAndCountsAsConnected(t *testing.T) {
 		t.Fatalf("fixture broken: want Limited connectedness, got %v", c)
 	}
 
-	// The maintainer must classify a relay-only friend as RELAYED (usable via the limited-conn stream), never
+	// The maintainer must classify a relay-only peer as RELAYED (usable via the limited-conn stream), never
 	// down — and must not be stuck dialing it. Mutation-verified: dropping `|| Limited` in evaluate fails this.
 	m := newLinkMaintainer(context.Background(), a, nil, func() map[peer.ID]string {
 		return map[peer.ID]string{b.ID(): "b"}
@@ -101,7 +101,7 @@ func TestRelayOnlyConnIsLimitedAndCountsAsConnected(t *testing.T) {
 		}
 	}
 	if state != linkRelayed {
-		t.Fatalf("relay-only friend must read %q, got %q (Limited misclassified as down?)", linkRelayed, state)
+		t.Fatalf("relay-only peer must read %q, got %q (Limited misclassified as down?)", linkRelayed, state)
 	}
 
 	// dialPeer must treat the limited conn as a live link with NO redial churn: over a real router it must
@@ -117,13 +117,13 @@ func TestRelayOnlyConnIsLimitedAndCountsAsConnected(t *testing.T) {
 		t.Fatalf("dialPeer over a limited conn must NOT resolve/redial: %d FindPeer call(s) (Limited treated as down?)", cr.calls)
 	}
 
-	// And the friend protocol must WORK over it end-to-end (WithAllowLimitedConn — the original relay-only fix).
+	// And the peer protocol must WORK over it end-to-end (WithAllowLimitedConn — the original relay-only fix).
 	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
-	fA, fB := newFriendService(context.Background(), a, nil, sA, nil), newFriendService(context.Background(), b, nil, sB, nil)
+	fA, fB := newPeerService(context.Background(), a, nil, sA, nil), newPeerService(context.Background(), b, nil, sB, nil)
 	fA.start()
 	fB.start()
-	if err := fA.addFriend(b.ID().String(), "over the relay"); err != nil {
-		t.Fatalf("friend request over a limited conn: %v", err)
+	if err := fA.addPeer(b.ID().String(), "over the relay"); err != nil {
+		t.Fatalf("peer request over a limited conn: %v", err)
 	}
 	waitFor(t, "b sees the incoming request through the relay", func() bool {
 		c, ok := sB.get(a.ID().String())

@@ -1,14 +1,14 @@
 package main
 
 // nearby.go — "VidyaGod devices on your network": the LAN peers (found by mDNS, netgate.go lanPeers) that run
-// VidyaGod, by the name a person knows them by, so pairing is one press instead of typing a friend code.
+// VidyaGod, by the name a person knows them by, so pairing is one press instead of typing a peer code.
 //
 // The node already finds and connects to every libp2p node on the local network (online.go, mDNS). What it lacked
-// is a name: a peer ID means nothing to a person, and the friend protocol carries the nickname only with a request.
-// /vidyagod/nearby answers our nickname (the one friends see; it defaults to the hostname) — and ONLY to a peer on our
+// is a name: a peer ID means nothing to a person, and the peer protocol carries the nickname only with a request.
+// /vidyagod/nearby answers our nickname (the one peers see; it defaults to the hostname) — and ONLY to a peer on our
 // own network: anyone across the internet gets the stream reset. Someone on the same network (a café's Wi-Fi) does
-// learn the nickname; the machine's hostname is never sent beside a nickname chosen instead of it. Pairing itself is the ordinary friend request
-// (friend.go): mutual consent, nothing new is trusted here.
+// learn the nickname; the machine's hostname is never sent beside a nickname chosen instead of it. Pairing itself is the ordinary peer request
+// (peer.go): mutual consent, nothing new is trusted here.
 
 import (
 	"context"
@@ -41,7 +41,7 @@ type nearbyInfo struct {
 type nearbyPeer struct {
 	Peer  string `json:"peer"`
 	Nick  string `json:"nick"`
-	State string `json:"state"` // the friend state ("" = not in the address book): pending | incoming | accepted
+	State string `json:"state"` // the peer state ("" = not in the address book): pending | incoming | accepted
 }
 
 type nearbyEntry struct {
@@ -99,7 +99,7 @@ func (s *nearbyService) ask(p peer.ID) {
 		if err := json.NewDecoder(io.LimitReader(st, maxNearbyReply)).Decode(&info); err != nil {
 			return false
 		}
-		// Attacker-controlled on the far end: bounded like a friend request's nickname.
+		// Attacker-controlled on the far end: bounded like a peer request's nickname.
 		info.Nick = capUtf8(info.Nick, maxNickLen)
 		return info.Nick != ""
 	}()

@@ -8,13 +8,13 @@ package main
 //
 // So every new outbound PEER DIAL takes a token from one per-node bucket (dialRate/s, dialBurst) before it touches the
 // network, whichever subsystem asks. (One dial may try a few of the peer's addresses and transports, so a token is a
-// few flows at most — the budget is in dials, the table in flows.) A friend, a peer found on our LAN, and a provider we are fetching from go
+// few flows at most — the budget is in dials, the table in flows.) A peer, a peer found on our LAN, and a provider we are fetching from go
 // first (they are what the user is waiting on); a dial that cannot get a token within dialMaxWait is refused (the DHT
 // moves on to the next peer). An existing connection costs nothing — the gater is consulted only for a new one.
 //
 // And a remote peer's PRIVATE addresses (10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT, loopback, link-local, ULA) are
 // never dialed across the internet — they can't answer, and each attempt is a dead table entry for 60–120 s (Kubo's
-// "server" profile filters them for the same reason) — unless the peer is a friend, was found on our LAN (mDNS), or
+// "server" profile filters them for the same reason) — unless the peer is a peer, was found on our LAN (mDNS), or
 // was named by address in an explicit connect.
 
 import (
@@ -81,7 +81,7 @@ type netGate struct {
 
 // priority: dials the user is waiting on skip the line (still counted).
 func (g *netGate) priority(p peer.ID) bool {
-	return g.n.isFriend(p) || g.n.isLanPeer(p) || g.n.isWantedProvider(p)
+	return g.n.isPeer(p) || g.n.isLanPeer(p) || g.n.isWantedProvider(p)
 }
 
 func (g *netGate) InterceptPeerDial(p peer.ID) bool {
@@ -107,7 +107,7 @@ func (g *netGate) InterceptAddrDial(p peer.ID, a ma.Multiaddr) bool {
 	if g.inner != nil && !g.inner.InterceptAddrDial(p, a) {
 		return false
 	}
-	if privateAddr(a) && !g.n.isFriend(p) && !g.n.isLanPeer(p) {
+	if privateAddr(a) && !g.n.isPeer(p) && !g.n.isLanPeer(p) {
 		netStats.dialsPrivateSkipped.Add(1)
 		return false
 	}
@@ -140,8 +140,8 @@ func privateAddr(a ma.Multiaddr) bool {
 
 // ---- who the node knows is close ----
 
-// isFriend: an accepted friend.
-func (n *node) isFriend(p peer.ID) bool {
+// isPeer: an accepted peer.
+func (n *node) isPeer(p peer.ID) bool {
 	if n.social == nil {
 		return false
 	}

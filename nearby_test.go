@@ -49,7 +49,7 @@ func waitNearby(t *testing.T, n *nearbyService, what string, cond func([]nearbyP
 
 // A VidyaGod device on our network shows by its name and host, with what it is to us; a libp2p node that does not
 // speak nearby (another IPFS node on the LAN) never shows. Teeth: the name not asked, a non-VidyaGod node listed,
-// a node that does not speak it asked at all, the friend state missing, a device dropped by one missed re-ask.
+// a node that does not speak it asked at all, the peer state missing, a device dropped by one missed re-ask.
 func TestNearbyListsVidyaGodDevicesByName(t *testing.T) {
 	hA, hB, hC := testHost(t), testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
@@ -70,7 +70,7 @@ func TestNearbyListsVidyaGodDevicesByName(t *testing.T) {
 	}
 	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stPending })
 	if l := a.list(); len(l) != 1 || l[0].State != string(stPending) {
-		t.Fatalf("friend state not shown: %+v", l)
+		t.Fatalf("peer state not shown: %+v", l)
 	}
 
 	// A re-ask that fails (a slow moment) keeps the device listed: the row would vanish and come back otherwise.
@@ -146,7 +146,7 @@ func TestNearbyStaysOnTheLocalNetwork(t *testing.T) {
 	}
 }
 
-// A name longer than a nickname may be is cut to one, as a friend request's is: the far end is anyone's code.
+// A name longer than a nickname may be is cut to one, as a peer request's is: the far end is anyone's code.
 func TestNearbyBoundsTheNames(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
@@ -162,22 +162,22 @@ func TestNearbyBoundsTheNames(t *testing.T) {
 	}
 }
 
-// An "accept" from a peer we never asked makes it nothing: before, it made the sender a friend (on our virtual LAN,
+// An "accept" from a peer we never asked makes it nothing: before, it made the sender a peer (on our virtual LAN,
 // told our presence) with no consent of ours. A real accept, to our request, still lands. Teeth: the accept gate.
 func TestUnsolicitedAcceptIsIgnored(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
 	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
 	ctx := context.Background()
-	fA := newFriendService(ctx, hA, nil, sA, nil)
-	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA := newPeerService(ctx, hA, nil, sA, nil)
+	fB := newPeerService(ctx, hB, nil, sB, nil)
 	fA.start()
 	fB.start()
 
 	_ = fB.send(hA.ID().String(), fB.helloMsg("accept"))
 	time.Sleep(300 * time.Millisecond)
 	if c, ok := sA.get(hB.ID().String()); ok && c.State == stAccepted {
-		t.Fatalf("an unsolicited accept made a friend: %+v", c)
+		t.Fatalf("an unsolicited accept made a peer: %+v", c)
 	}
 	// Its own request first, then an accept of it: still only a request waiting on us.
 	_ = fB.send(hA.ID().String(), fB.helloMsg("request"))
@@ -185,25 +185,25 @@ func TestUnsolicitedAcceptIsIgnored(t *testing.T) {
 	_ = fB.send(hA.ID().String(), fB.helloMsg("accept"))
 	time.Sleep(300 * time.Millisecond)
 	if c, _ := sA.get(hB.ID().String()); c.State != stIncoming {
-		t.Fatalf("a requester accepting its own request made a friend: %+v", c)
+		t.Fatalf("a requester accepting its own request made a peer: %+v", c)
 	}
 	sA.remove(hB.ID().String())
 
-	_ = fA.addFriend(hB.ID().String(), "")
+	_ = fA.addPeer(hB.ID().String(), "")
 	waitFor(t, "B sees the request", func() bool { c, ok := sB.get(hA.ID().String()); return ok && c.State == stIncoming })
-	_ = fB.acceptFriend(hA.ID().String())
+	_ = fB.acceptPeer(hA.ID().String())
 	waitFor(t, "A sees the real accept", func() bool { c, ok := sA.get(hB.ID().String()); return ok && c.State == stAccepted })
 }
 
-// A friend still asking (it missed our accept: asleep, offline when we accepted) gets our accept again, so it stops
-// waiting in "request sent" while we show it as a friend. Teeth: a friend's request left unanswered.
-func TestAFriendsRequestIsAnsweredWithAccept(t *testing.T) {
+// A peer still asking (it missed our accept: asleep, offline when we accepted) gets our accept again, so it stops
+// waiting in "request sent" while we show it as a peer. Teeth: a peer's request left unanswered.
+func TestAPeersRequestIsAnsweredWithAccept(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
 	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
 	ctx := context.Background()
-	fA := newFriendService(ctx, hA, nil, sA, nil)
-	fB := newFriendService(ctx, hB, nil, sB, nil)
+	fA := newPeerService(ctx, hA, nil, sA, nil)
+	fB := newPeerService(ctx, hB, nil, sB, nil)
 	fA.start()
 	fB.start()
 	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stPending })  // A asked; B's accept never arrived
@@ -212,29 +212,29 @@ func TestAFriendsRequestIsAnsweredWithAccept(t *testing.T) {
 	waitFor(t, "A hears B's accept again", func() bool { c, _ := sA.get(hB.ID().String()); return c.State == stAccepted })
 }
 
-// A friend asking again is answered once per reAcceptEvery, not once per request: a stream packed with requests must
+// A peer asking again is answered once per reAcceptEvery, not once per request: a stream packed with requests must
 // not become a goroutine and a dial each. Teeth: the limit gone.
-func TestReAcceptIsLimitedPerFriend(t *testing.T) {
-	f := newFriendService(context.Background(), testHost(t), nil, newSocialState(t.TempDir()), nil)
+func TestReAcceptIsLimitedPerPeer(t *testing.T) {
+	f := newPeerService(context.Background(), testHost(t), nil, newSocialState(t.TempDir()), nil)
 	if !f.reAcceptDue("p1") || f.reAcceptDue("p1") {
-		t.Fatalf("a friend asking twice at once is answered twice")
+		t.Fatalf("a peer asking twice at once is answered twice")
 	}
 	if !f.reAcceptDue("p2") {
-		t.Fatalf("one friend's answer held another's back")
+		t.Fatalf("one peer's answer held another's back")
 	}
 }
 
-// An accept from a friend already (the answer to a request sent again) refreshes its profile and is not the accept
-// event: the app applies its New-peer defaults on that, over what was chosen for the friend. Asking a friend again
-// sends nothing. Teeth: the accept event on a re-accept, a request sent to a friend.
-func TestAReAcceptIsNoNewFriendship(t *testing.T) {
+// An accept from a peer already (the answer to a request sent again) refreshes its profile and is not the accept
+// event: the app applies its New-peer defaults on that, over what was chosen for the peer. Asking a peer again
+// sends nothing. Teeth: the accept event on a re-accept, a request sent to a peer.
+func TestAReAcceptIsNoNewPairing(t *testing.T) {
 	hA, hB := testHost(t), testHost(t)
 	connectHosts(t, hA, hB)
 	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
 	var mu sync.Mutex
 	var kinds []int
-	fA := newFriendService(context.Background(), hA, nil, sA, func(k int, _ string) { mu.Lock(); kinds = append(kinds, k); mu.Unlock() })
-	fB := newFriendService(context.Background(), hB, nil, sB, nil)
+	fA := newPeerService(context.Background(), hA, nil, sA, func(k int, _ string) { mu.Lock(); kinds = append(kinds, k); mu.Unlock() })
+	fB := newPeerService(context.Background(), hB, nil, sB, nil)
 	fA.start()
 	fB.start()
 	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stAccepted })
@@ -242,19 +242,77 @@ func TestAReAcceptIsNoNewFriendship(t *testing.T) {
 	_ = fB.send(hA.ID().String(), fB.helloMsg("accept"))
 	waitFor(t, "A takes B's accept", func() bool { mu.Lock(); defer mu.Unlock(); return len(kinds) == 1 })
 	mu.Lock()
-	if kinds[0] != evFriendProfile {
-		t.Fatalf("a friend's accept again was event %d, not a profile refresh", kinds[0])
+	if kinds[0] != evPeerProfile {
+		t.Fatalf("a peer's accept again was event %d, not a profile refresh", kinds[0])
 	}
 	mu.Unlock()
 
 	var got int
 	var gmu sync.Mutex
 	fB.emit = func(k int, _ string) { gmu.Lock(); got++; gmu.Unlock() }
-	_ = fA.addFriend(hB.ID().String(), "")
+	_ = fA.addPeer(hB.ID().String(), "")
 	time.Sleep(300 * time.Millisecond)
 	gmu.Lock()
 	defer gmu.Unlock()
 	if got != 0 {
-		t.Fatalf("asking a friend again reached it (%d events)", got)
+		t.Fatalf("asking a peer again reached it (%d events)", got)
+	}
+}
+
+// A peer found on our network that we asked is asked again at once (and answered: a peer accepts again), not at the
+// next presence tick; found again within reachEvery, nothing more is sent. A stranger is never contacted. Teeth: the
+// reach doing nothing, no limit, a stranger asked.
+func TestAPeerFoundIsReachedAtOnce(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	sA, sB := newSocialState(t.TempDir()), newSocialState(t.TempDir())
+	var mu sync.Mutex
+	got := 0
+	fA := newPeerService(context.Background(), hA, nil, sA, nil)
+	fB := newPeerService(context.Background(), hB, nil, sB, func(int, string) { mu.Lock(); got++; mu.Unlock() })
+	fA.start()
+	fB.start()
+
+	fA.peerReachable(hB.ID().String()) // a stranger: nothing
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	if got != 0 {
+		t.Fatalf("a stranger found on the network was contacted")
+	}
+	mu.Unlock()
+
+	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stPending })
+	sB.upsert(hA.ID().String(), func(c *contact) { c.State = stAccepted })
+	fA.peerReachable(hB.ID().String())
+	waitFor(t, "A, reached at once, hears B's accept", func() bool { c, _ := sA.get(hB.ID().String()); return c.State == stAccepted })
+
+	sA.upsert(hB.ID().String(), func(c *contact) { c.State = stPending })
+	mu.Lock()
+	got = 0
+	mu.Unlock()
+	fA.peerReachable(hB.ID().String()) // found again at once: within reachEvery
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 0 {
+		t.Fatalf("a peer found again at once was reached again (%d events)", got)
+	}
+}
+
+// The address book lists in the order contacts were added, the same at every call (a page polling it keeps its rows).
+// Teeth: a map's order.
+func TestTheAddressBookListsInAStableOrder(t *testing.T) {
+	s := newSocialState(t.TempDir())
+	for i, p := range []string{"zeta", "alpha", "mid", "beta", "omega", "gamma"} {
+		s.upsert(p, func(c *contact) { c.State = stAccepted; c.AddedAt = int64(100 + i) })
+	}
+	want := []string{"zeta", "alpha", "mid", "beta", "omega", "gamma"}
+	for n := 0; n < 20; n++ {
+		got := s.list()
+		for i := range want {
+			if got[i].PeerID != want[i] {
+				t.Fatalf("call %d: order %v", n, got)
+			}
+		}
 	}
 }

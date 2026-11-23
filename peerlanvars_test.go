@@ -1,10 +1,10 @@
 package main
 
-// friendlanvars_test.go — the launch variables derived from the friend LAN.
+// peerlanvars_test.go — the launch variables derived from the peer LAN.
 //
 // The ordering test guards a bug that is invisible in any single run: PEER_VIPS/PEER_NAMES used to be built by
 // ranging a Go map, so both lists came out in a different order every call. Anything positional ("the first
-// friend", as the CLI overlay harness takes) therefore picked a DIFFERENT peer on each launch.
+// peer", as the CLI overlay harness takes) therefore picked a DIFFERENT peer on each launch.
 
 import (
 	"strings"
@@ -70,7 +70,7 @@ func TestLanLaunchVarsDeterministicOrder(t *testing.T) {
 }
 
 func TestLanLaunchVarsNamelessPeersAreDistinct(t *testing.T) {
-	// Every Ed25519 peer id starts with "12D3KooW", so a prefix-based fallback rendered every nickname-less friend
+	// Every Ed25519 peer id starts with "12D3KooW", so a prefix-based fallback rendered every nickname-less peer
 	// as the same string.
 	s, _ := lanVarsFixture(t, nil)
 	vars, _ := lanLaunchVarsFrom("12D3KooWSelf00000000000000000000000000000000000", s, nil)
@@ -78,7 +78,7 @@ func TestLanLaunchVarsNamelessPeersAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	for _, n := range names {
 		if seen[n] {
-			t.Fatalf("two nickname-less friends render identically as %q", n)
+			t.Fatalf("two nickname-less peers render identically as %q", n)
 		}
 		seen[n] = true
 	}

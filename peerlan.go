@@ -1,10 +1,10 @@
 package main
 
-// friendlan.go — the host-less virtual LAN of friends. There is NO session/lobby and NO authoritative host: friends
+// peerlan.go — the host-less virtual LAN of peers. There is NO session/lobby and NO authoritative host: peers
 // are simply on one shared virtual LAN (10.66.0.0/16), and each peer's vIP is a PURE deterministic function of its
 // peer ID — so everyone computes the same vIP for everyone from the peer ID alone, with zero coordination. Adding a
-// friend = you both already know each other's vIP, instantly on the LAN ("seamlessly extendable"). The LAN membership
-// is just the accepted-friends set (socialState); the routing table for the overlay datapath (overlay.go) and the
+// peer = you both already know each other's vIP, instantly on the LAN ("seamlessly extendable"). The LAN membership
+// is just the accepted-peers set (socialState); the routing table for the overlay datapath (overlay.go) and the
 // game-launch vars are derived from it here. The LAN exists ONLY inside a game's bubblewrap netns (sandbox-only) — see
 // the isolated-netns TUN in sandboxinit.go/overlayserve.
 
@@ -15,7 +15,7 @@ import (
 	"strings"
 )
 
-// The single shared /16 all friends share. A /16 keeps collisions negligible at friend scale (65k hosts) and is one
+// The single shared /16 all peers share. A /16 keeps collisions negligible at peer scale (65k hosts) and is one
 // broadcast domain (directed broadcast 10.66.255.255), so LAN-game discovery reaches every peer via overlay fan-out.
 const lanSubnet = "10.66.0.0/16"
 const lanBroadcast = "10.66.255.255"
@@ -35,10 +35,10 @@ func lanVIP(peerID string) string {
 	return fmt.Sprintf("10.66.%d.%d", hi, lo)
 }
 
-// lanConfigFrom builds the overlay parameters for the friend LAN: our own vIP, the /16 subnet, and the vIP→peer route
-// table for EVERY accepted friend — deliberately including currently-offline ones: routing to an offline peer just
+// lanConfigFrom builds the overlay parameters for the peer LAN: our own vIP, the /16 subnet, and the vIP→peer route
+// table for EVERY accepted peer — deliberately including currently-offline ones: routing to an offline peer just
 // drops packets, while the always-on link maintainer (overlaylink.go) brings them live the moment they appear, so a
-// friend can join MID-GAME instead of "next launch". excluded (peer-id set, may be nil) is the launch-window
+// peer can join MID-GAME instead of "next launch". excluded (peer-id set, may be nil) is the launch-window
 // roster's un-ticked members. ok is false only if there is no social state.
 func lanConfigFrom(self string, social *socialState, excluded map[string]bool) (myVIP, subnet string, peerByVIP map[string]string, ok bool) {
 	if social == nil {
@@ -54,7 +54,7 @@ func lanConfigFrom(self string, social *socialState, excluded map[string]bool) (
 	return lanVIP(self), lanSubnet, peerByVIP, true
 }
 
-// lanLaunchVarsFrom maps the friend LAN into the custom variables a sandboxed game launch consumes to join the overlay
+// lanLaunchVarsFrom maps the peer LAN into the custom variables a sandboxed game launch consumes to join the overlay
 // and configure its LAN emulator (Goldberg et al.): the sandbox toggle, ISOLATED net (the LAN is sandbox-only, never
 // the host stack), our vIP + the /16 subnet, and the parallel comma-lists of peer vIPs + nicknames.
 func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]bool) (map[string]string, bool) {
@@ -69,7 +69,7 @@ func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]boo
 		}
 	}
 	// Order by peer id, not by map iteration. Ranging peerByVIP directly made both lists come out in a DIFFERENT
-	// order on every call — so anything positional ("the first friend", as cli/cliipfs.cpp takes) silently picked a
+	// order on every call — so anything positional ("the first peer", as cli/cliipfs.cpp takes) silently picked a
 	// different peer each run. Sorting once here also keeps the two lists parallel by construction.
 	pids := make([]string, 0, len(peerByVIP))
 	vipByPeer := make(map[string]string, len(peerByVIP))
@@ -85,7 +85,7 @@ func lanLaunchVarsFrom(self string, social *socialState, excluded map[string]boo
 		n := nickByPeer[pid]
 		if n == "" {
 			// NOT pid[:8]: every Ed25519 peer id starts with the constant "12D3KooW", so that rendered every
-			// nickname-less friend as the same string. shortPeer takes the distinguishing tail.
+			// nickname-less peer as the same string. shortPeer takes the distinguishing tail.
 			n = shortPeer(pid)
 		}
 		names = append(names, n)

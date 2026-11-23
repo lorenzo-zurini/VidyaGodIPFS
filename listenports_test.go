@@ -48,7 +48,7 @@ func TestRestartChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	switch mode {
-	case "hold": // a live node's connection: long-lived streams (bitswap, friend, overlay)
+	case "hold": // a live node's connection: long-lived streams (bitswap, peer, overlay)
 		for i := 0; i < 6; i++ {
 			s, err := h.NewStream(ctx, ai.ID, "/vgtest/hold/1")
 			if err != nil {

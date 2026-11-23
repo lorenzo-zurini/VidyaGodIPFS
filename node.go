@@ -79,7 +79,7 @@ type node struct {
 	lanPeers   sync.Map // peer.ID → expiry: found on our LAN (mDNS) or connected to by address — netgate.go
 	wantedProv sync.Map // peer.ID → expiry: providers a fetch found — netgate.go
 
-	// IPNS (ipns.go): the peer's Ed25519 identity key (also the friend code) signs a tiny mutable record pointing
+	// IPNS (ipns.go): the peer's Ed25519 identity key (also the peer code) signs a tiny mutable record pointing
 	// the peer's name at the current library-index CID; namesys publishes/resolves via the DHT, with the datastore
 	// carrying the sequence number across restarts. ipnsCurrent is the value we last published under our own name,
 	// re-published by a background loop before its EOL. nil/empty until goOnline.
@@ -90,12 +90,12 @@ type node struct {
 	mdns        interface{ Close() error } // local-network discovery service (mDNS)
 	bwc         *metrics.BandwidthCounter  // libp2p bandwidth counter → global up/down rates (nil until online)
 
-	// friends / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
-	// survive offline; friend (the live protocol) is wired in goOnline once the host exists.
+	// peers / multiplayer social layer. social (the persistent address book) is loaded at openNode so contacts
+	// survive offline; peer (the live protocol) is wired in goOnline once the host exists.
 	social *socialState
-	friend *friendService
+	peer   *peerService
 	nearby *nearbyService  // the VidyaGod devices on our network, by name (nearby.go)
-	linkm  *linkMaintainer // always-on per-friend link maintainer (overlaylink.go)
+	linkm  *linkMaintainer // always-on per-peer link maintainer (overlaylink.go)
 
 	lanExclMu   sync.Mutex
 	lanExcluded map[string]bool // the LAN roster's un-ticked members (peer-id strings), set via VgLanSetExcluded
@@ -195,7 +195,7 @@ func openNode(repoPath string) error {
 	// background with backoff instead of leaving the node offline for the whole session.
 	// VIDYAGOD_IPFS_OFFLINE forces a purely-local node (used by the tests and as a no-network escape hatch).
 	if os.Getenv("VIDYAGOD_IPFS_OFFLINE") == "" {
-		// guardErr: a panic in goOnline (which now wires the whole friend/overlay LAN stack) must not crash the
+		// guardErr: a panic in goOnline (which now wires the whole peer/overlay LAN stack) must not crash the
 		// process — convert it to an error so the existing retry path handles it, leaving a usable offline node.
 		if err := guardErr("goOnline", gNode.goOnline); err != nil {
 			fmt.Fprintf(os.Stderr, "[node] goOnline failed: %v — retrying in background\n", err)

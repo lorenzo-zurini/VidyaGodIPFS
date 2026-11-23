@@ -1,6 +1,6 @@
 package main
 
-// ipns.go — the mutable layer: a peer's Ed25519 identity key (its friend code / peer ID) signs a tiny IPNS record
+// ipns.go — the mutable layer: a peer's Ed25519 identity key (its peer code / peer ID) signs a tiny IPNS record
 // pointing the peer's NAME at the current library-index CID. Everything under that name stays content-addressed and
 // verifiable exactly as before; only this one record moves when the publisher hits "Verify/Publish".
 //
@@ -287,7 +287,7 @@ func ipnsRecordOverHTTP(ctx context.Context, hc *http.Client, gateways []string,
 // cidForLog is a logging helper — a bad string yields cid.Undef, which shortCid renders harmlessly.
 func cidForLog(s string) cid.Cid { c, _ := cid.Decode(s); return c }
 
-// exportIdentity copies the Ed25519 private key (identity.key = the friend code + library address) to dest. Losing it
+// exportIdentity copies the Ed25519 private key (identity.key = the peer code + library address) to dest. Losing it
 // is permanent (a new key = a new peer ID = a new address nobody has), so this is the "back up your identity" path.
 func (n *node) exportIdentity(dest string) error {
 	src := filepath.Join(n.repoPath, "identity.key")
@@ -334,7 +334,7 @@ func (n *node) importIdentity(src string) error {
 	}
 	// 3. Drop the previous identity's published VALUE so the republish loop can't re-sign the OLD identity's index
 	//    under the restored name. Keep ipns_seq.json: the new identity has a different name (a fresh entry), and the
-	//    map also holds FRIENDS' rollback high-waters, which must survive an identity restore.
+	//    map also holds PEERS' rollback high-waters, which must survive an identity restore.
 	_ = os.Remove(n.ipnsSelfFile())
 	n.ipnsMu.Lock()
 	n.ipnsCurrent = ""

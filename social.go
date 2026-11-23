@@ -1,47 +1,48 @@
 package main
 
-// social.go — the friends/contacts layer: a persistent address book keyed by libp2p peer ID (for an Ed25519 key the
-// peer ID *embeds the public key*, so the peer ID IS the shareable "friend code" and libp2p authenticates a friend
+// social.go — the peers/contacts layer: a persistent address book keyed by libp2p peer ID (for an Ed25519 key the
+// peer ID *embeds the public key*, so the peer ID IS the shareable "peer code" and libp2p authenticates a peer
 // against it for free) plus this node's own shareable profile (nickname + profile-picture CID).
 //
 // Persistence is deliberately independent of the network: the contact list lives in <repo>/social.json and loads at
-// openNode, so it survives while offline. The live wire protocol (friend.go) attaches to it once the host is up.
+// openNode, so it survives while offline. The live wire protocol (peer.go) attaches to it once the host is up.
 //
-// Scope: identity + mutual-consent friendship + online/offline liveness. There is intentionally NO "what are you
-// playing" presence, no join-a-specific-friend targeting and no co-play suggestions — the multiplayer model is a
-// flat always-on virtual LAN of accepted friends (friendlan.go), not a lobby/host/join system.
+// Scope: identity + mutual-consent pairing + online/offline liveness. There is intentionally NO "what are you
+// playing" presence, no join-a-specific-peer targeting and no co-play suggestions — the multiplayer model is a
+// flat always-on virtual LAN of accepted peers (peerlan.go), not a lobby/host/join system.
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
 
-// friendState is the lifecycle of a contact. A friendship is mutual-consent: a request goes out (pending) / comes in
+// peerState is the lifecycle of a contact. A pairing is mutual-consent: a request goes out (pending) / comes in
 // (incoming), and only becomes accepted once the other side agrees. blocked drops all traffic from a peer.
-type friendState string
+type peerState string
 
 const (
-	stPending  friendState = "pending"  // we sent a request; awaiting their accept
-	stIncoming friendState = "incoming" // they requested us; awaiting our accept
-	stAccepted friendState = "accepted" // mutual friends
-	stBlocked  friendState = "blocked"  // we reject everything from this peer
+	stPending  peerState = "pending"  // we sent a request; awaiting their accept
+	stIncoming peerState = "incoming" // they requested us; awaiting our accept
+	stAccepted peerState = "accepted" // mutual peers
+	stBlocked  peerState = "blocked"  // we reject everything from this peer
 )
 
 // contact is one address-book entry. The exported fields persist; online is transient (recomputed by presence).
 type contact struct {
-	PeerID   string      `json:"peer"`
-	Nick     string      `json:"nick,omitempty"`
-	PicCID   string      `json:"pic,omitempty"`
-	State    friendState `json:"state"`
-	AddedAt  int64       `json:"added"`          // unix-ms
-	LastSeen int64       `json:"seen,omitempty"` // unix-ms of last successful contact; 0 = never
-	online   bool        // transient — not persisted
+	PeerID   string    `json:"peer"`
+	Nick     string    `json:"nick,omitempty"`
+	PicCID   string    `json:"pic,omitempty"`
+	State    peerState `json:"state"`
+	AddedAt  int64     `json:"added"`          // unix-ms
+	LastSeen int64     `json:"seen,omitempty"` // unix-ms of last successful contact; 0 = never
+	online   bool      // transient — not persisted
 }
 
-// profile is this node's own shareable identity, sent to friends on handshake.
+// profile is this node's own shareable identity, sent to peers on handshake.
 type profile struct {
 	Nick   string `json:"nick,omitempty"`
 	PicCID string `json:"pic,omitempty"`
@@ -138,8 +139,8 @@ func (s *socialState) upsert(peerID string, mutate func(c *contact)) contact {
 	defer s.mu.Unlock()
 	c := s.contacts[peerID]
 	if c == nil {
-		// Stateless on creation: each caller sets the intended state explicitly (addFriend→pending,
-		// acceptFriend→accepted, the request handler→incoming). A default of pending would make the request
+		// Stateless on creation: each caller sets the intended state explicitly (addPeer→pending,
+		// acceptPeer→accepted, the request handler→incoming). A default of pending would make the request
 		// handler mistake a brand-new inbound contact for a mutual crossing.
 		c = &contact{PeerID: peerID, AddedAt: time.Now().UnixMilli()}
 		s.contacts[peerID] = c
@@ -180,6 +181,14 @@ func (s *socialState) list() []contact {
 	for _, c := range s.contacts {
 		out = append(out, *c)
 	}
+	// In the order they were added, the same at every call: a page polling it keeps its rows (a map's order changes
+	// from one call to the next, and every row was rebuilt — a controller's place on the page lost — each poll).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AddedAt != out[j].AddedAt {
+			return out[i].AddedAt < out[j].AddedAt
+		}
+		return out[i].PeerID < out[j].PeerID
+	})
 	return out
 }
 
@@ -206,7 +215,7 @@ func (s *socialState) setPresence(peerID string, online bool) (bool, contact) {
 	return changed, *c
 }
 
-// acceptedPeers returns the peer IDs of mutual friends (for the presence loop).
+// acceptedPeers returns the peer IDs of mutual peers (for the presence loop).
 func (s *socialState) acceptedPeers() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

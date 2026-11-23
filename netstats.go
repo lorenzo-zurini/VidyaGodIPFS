@@ -19,15 +19,15 @@ type netCounters struct {
 	connsInbound        atomic.Int64 // … of which a remote peer dialed us
 	countLookups        atomic.Int64 // provider-count DHT walks (explicit requests only), through netq
 	dialsBudget         atomic.Int64 // new outbound connections that took a budget token (netgate.go)
-	dialsPriority       atomic.Int64 // … that skipped the line (friend, LAN peer, a fetch's provider)
+	dialsPriority       atomic.Int64 // … that skipped the line (peer, LAN peer, a fetch's provider)
 	dialsRefused        atomic.Int64 // … refused: no token within dialMaxWait
 	dialsPrivateSkipped atomic.Int64 // private addresses of remote peers not dialed
 	warmWalks           atomic.Int64 // provider walks warmProviders actually started
 	warmSkipped         atomic.Int64 // warm walks not needed: the fetch moved (or ended) within the search delay
-	findPeers           atomic.Int64 // live FindPeer walks (provider address refresh, friend warm-up)
+	findPeers           atomic.Int64 // live FindPeer walks (provider address refresh, peer warm-up)
 	finderDHT           atomic.Int64 // bitswap provider queries that reached the DHT
 	finderIndexer       atomic.Int64 // … that reached a delegated HTTP indexer
-	finderHeld          atomic.Int64 // … held behind a connected friend, and never needed
+	finderHeld          atomic.Int64 // … held behind a connected peer, and never needed
 	provides            atomic.Int64 // provider-record messages sent (sweeping provider, through netq)
 	provideWalks        atomic.Int64 // DHT walks the sweeping provider made (one per keyspace region, through netq)
 	provideDials        atomic.Int64 // record sends that needed a new connection (through netq)
@@ -53,7 +53,7 @@ func netStatsLine(prev, cur netSnapshot, peers int) string {
 	d := func(i int) int64 { return cur[i] - prev[i] }
 	active, waiting := netq.load()
 	return fmt.Sprintf("[net] dials: +%d budget, +%d priority, %d refused, %d private skipped | +%d conns, %d inbound (%d peers) | warm walks +%d, skipped +%d | findpeer +%d | "+
-		"provider queries: dht +%d, indexer +%d, held behind a friend +%d | provide walks +%d, records +%d (new conns +%d) | "+
+		"provider queries: dht +%d, indexer +%d, held behind a peer +%d | provide walks +%d, records +%d (new conns +%d) | "+
 		"provider counts +%d | queue %d/%d busy, %d waiting",
 		d(12), d(13), d(14), d(15), d(0), d(10), peers, d(1), d(2), d(3), d(4), d(5), d(6), d(8), d(7), d(9), d(11), active, netq.size(), waiting)
 }

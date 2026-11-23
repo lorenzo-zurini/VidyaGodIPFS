@@ -1,14 +1,14 @@
 package main
 
 // overlaylink.go — the ALWAYS-ON link maintainer behind the virtual LAN: one tiny heartbeat/state machine per
-// accepted friend, running for the app's lifetime (not just while a game is up). It exists because the field
+// accepted peer, running for the app's lifetime (not just while a game is up). It exists because the field
 // failure mode of the overlay was SILENT: a NAT mapping idles out (or a hole-punch comes up one-way), the direct
 // QUIC connection turns half-dead, and every game packet vanishes with no error and no fallback — the LAN menu
 // just stays empty. The maintainer makes the link's health explicit and self-repairing, under two invariants
 // distilled from the field (2026-09-03/04):
 //
-//   INVARIANT 1 — NEVER TEAR DOWN A WORKING CONNECTION. The one libp2p connection to a friend multiplexes
-//   bitswap downloads, the friend/presence protocol AND the overlay. An earlier repair strategy ClosePeer'd on a
+//   INVARIANT 1 — NEVER TEAR DOWN A WORKING CONNECTION. The one libp2p connection to a peer multiplexes
+//   bitswap downloads, the peer/presence protocol AND the overlay. An earlier repair strategy ClosePeer'd on a
 //   zombie verdict and took live downloads with it ("the whole panel said direct 5ms and the download died").
 //   The maintainer only observes, dials and routes; teardown is banned.
 //
@@ -19,21 +19,21 @@ package main
 //   including relayed) until the first pong, and demotes back to the stream the moment pongs stop. Loss of the
 //   fast path degrades bandwidth/latency, never delivery.
 //
-// The per-friend state machine, every state with an exit (graceful recovery from ANY state):
+// The per-peer state machine, every state with an exit (graceful recovery from ANY state):
 //
 //   down ──kickDial(backoff 2s→30s)──▶ connecting ──▶ relayed (stream carries traffic; works over relay via
 //   limited-conn streams) ──force-direct nudge every linkUpgradeTry──▶ direct-UNPROVEN (still stream; heartbeats
 //   probing) ──first pong──▶ direct-PROVEN (datagram fast path) ──linkBeatMiss missed pongs / send error──▶
-//   demoted to UNPROVEN (traffic instantly back on stream) + fresh force-direct nudge. Friend removed → link
-//   dropped + unprotected. Friend added → link appears within one beat (membership re-read every tick).
+//   demoted to UNPROVEN (traffic instantly back on stream) + fresh force-direct nudge. Peer removed → link
+//   dropped + unprotected. Peer added → link appears within one beat (membership re-read every tick).
 //
 //   • HEARTBEAT: a ~13-byte control datagram every linkBeatEvery over the same direct-QUIC connection the game
 //     traffic rides. Defeats NAT idle timeouts (4s ≪ 30s), yields live RTT for the UI, and IS the trust signal.
 //   • STATE: direct (QUIC + fresh pongs) / relayed (usable via stream — includes an unproven direct conn) /
-//     connecting / down — exposed via VgLanPeers for the Friends tab and the launch window's Virtual LAN panel.
+//     connecting / down — exposed via VgLanPeers for the Peers tab and the launch window's Virtual LAN panel.
 //   • PROTECT: maintained peers' connections are pinned in the ConnManager so background churn never trims them.
 //   • RECV LOOPS: every evaluate re-kicks the overlay's datagram receive loops for the peer's conns
-//     (ensureRecvLoops) — a conn established BEFORE the peer became a friend would otherwise never get a loop
+//     (ensureRecvLoops) — a conn established BEFORE the peer became a peer would otherwise never get a loop
 //     and silently drop every datagram, including the pongs that prove the path.
 //
 // Wire format (QUIC datagram, intercepted in datagramRecvLoop BEFORE the IPv4 check — 'V' = 0x56 can never be an
@@ -60,8 +60,8 @@ const (
 	linkBeatEvery   = 4 * time.Second // heartbeat cadence — well under mobile-NAT UDP idle timeouts (~30s)
 	linkBeatMiss    = 3               // missed pongs on a previously-responsive peer ⇒ demote datagrams to stream
 	linkDialBackoff = 2 * time.Second // reconnect backoff floor (doubles to linkDialMax)
-	// An offline friend is looked up on the DHT at every dial (a walk: dozens of new flows through the router), so an
-	// unreachable one backs off to minutes; a friend coming online dials us (presence) and the link comes up anyway.
+	// An offline peer is looked up on the DHT at every dial (a walk: dozens of new flows through the router), so an
+	// unreachable one backs off to minutes; a peer coming online dials us (presence) and the link comes up anyway.
 	linkDialMax    = 5 * time.Minute
 	linkUpgradeTry = 30 * time.Second // how often to nudge a relayed/unproven link toward a fresh direct path
 	linkProtectTag = "vg-lan"
@@ -90,7 +90,7 @@ func heartbeatPacket(kind byte, tsNano int64) []byte {
 // isHeartbeat reports whether a datagram is a maintainer control packet (vs a forwarded IP packet).
 func isHeartbeat(pkt []byte) bool { return len(pkt) == 13 && string(pkt[:4]) == linkMagic }
 
-// peerLink is one friend's maintained link.
+// peerLink is one peer's maintained link.
 type peerLink struct {
 	pid  peer.ID
 	nick string
@@ -112,13 +112,13 @@ type peerLink struct {
 	dgTx, dgRx, streamTx, demoted uint64
 }
 
-// linkMaintainer runs the per-friend heartbeat/state/repair loop.
+// linkMaintainer runs the per-peer heartbeat/state/repair loop.
 type linkMaintainer struct {
 	ctx    context.Context
 	host   host.Host
 	router peerRouter
-	// peersFn returns the CURRENT accepted-friend set (pid → nick) each tick — the maintainer never caches
-	// membership, so friend add/remove takes effect within one beat with no event plumbing.
+	// peersFn returns the CURRENT accepted-peer set (pid → nick) each tick — the maintainer never caches
+	// membership, so peer add/remove takes effect within one beat with no event plumbing.
 	peersFn func() map[peer.ID]string
 
 	// ensureRecvLoops re-kicks datagram receive loops for a peer's existing conns (set by newOverlayService).
@@ -149,7 +149,7 @@ func (m *linkMaintainer) run() {
 	}
 }
 
-// has reports whether pid is a maintained friend (the overlay's datagram RX gate includes maintained peers so
+// has reports whether pid is a maintained peer (the overlay's datagram RX gate includes maintained peers so
 // heartbeats flow even when no game/link is attached).
 func (m *linkMaintainer) has(pid peer.ID) bool {
 	m.mu.Lock()
@@ -167,7 +167,7 @@ func (m *linkMaintainer) datagramsTrusted(pid peer.ID) bool {
 	defer m.mu.Unlock()
 	l := m.links[pid]
 	if l == nil {
-		// A peer the maintainer does not track gets NO trust: a friend removed mid-game leaves a stale route
+		// A peer the maintainer does not track gets NO trust: a peer removed mid-game leaves a stale route
 		// whose heartbeats have stopped — exactly the forever-unproven path Invariant 2 bans (adversarial M2).
 		// The stream fallback still delivers. (Overlay-only tests run with linkm==nil and never reach here.)
 		return false
@@ -247,7 +247,7 @@ func (m *linkMaintainer) tick() {
 	want := m.peersFn()
 
 	m.mu.Lock()
-	// Membership sync: new friends get a link; removed friends get unprotected + dropped.
+	// Membership sync: new peers get a link; removed peers get unprotected + dropped.
 	for pid, nick := range want {
 		if _, ok := m.links[pid]; !ok {
 			m.links[pid] = &peerLink{pid: pid, nick: nick, state: linkDown, rttMs: -1, backoff: linkDialBackoff}
@@ -274,7 +274,7 @@ func (m *linkMaintainer) tick() {
 
 func (m *linkMaintainer) evaluate(l *peerLink) {
 	// Limited (circuit-v2 relayed) COUNTS as connected: our stream fallback opts into limited conns, so a
-	// relay-only friend has a fully working link — treating Limited as "down" showed a live link as down in the
+	// relay-only peer has a fully working link — treating Limited as "down" showed a live link as down in the
 	// panel and re-dialed it uselessly every beat (caught by the battery's post-outage state assert, 2026-09-04).
 	connState := m.host.Network().Connectedness(l.pid)
 	connected := connState == network.Connected || connState == network.Limited
@@ -307,7 +307,7 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 	vlog("linkm", "eval %s state=%s connected=%v directQUIC=%v proven=%v missed=%d rtt=%dms",
 		l.nick, l.state, connected, direct, proven, missed, rtt)
 
-	// Re-kick datagram receive loops for every existing conn — a conn that predated friendship (a bitswap dial,
+	// Re-kick datagram receive loops for every existing conn — a conn that predated pairing (a bitswap dial,
 	// a presence stream) would otherwise NEVER get a loop, and a missed loop means our pings' pongs land in the
 	// void forever. Idempotent per conn.
 	if m.ensureRecvLoops != nil && connected {
@@ -335,7 +335,7 @@ func (m *linkMaintainer) evaluate(l *peerLink) {
 		// Beat — proving a fresh path or confirming a proven one. A previously-responsive peer that stops
 		// ponging has a dead datagram path (idled-out NAT mapping, path change): DEMOTE it (Invariant 2) so
 		// traffic rides the reliable stream, and nudge a fresh force-direct dial for a new datagram path.
-		// NEVER ClosePeer (Invariant 1) — bitswap and the friend protocol share this connection.
+		// NEVER ClosePeer (Invariant 1) — bitswap and the peer protocol share this connection.
 		for _, c := range conns { // beat EVERY direct conn: any of them may pong and become the proven path
 			var qc *quic.Conn
 			if c.As(&qc) && qc != nil {

@@ -13,7 +13,7 @@ package main
 // on the attempt's context, ending with it. And it follows bitswap's own rule (boxo's ProviderSearchDelay): the peers
 // we are connected to are asked first; only an attempt that has received nothing new after providerSearchDelay walks,
 // one walk at a time. (Started unconditionally at every fetch start on the node's lifetime, a receive of a few hundred
-// small blocks from a connected friend ran ~90 overlapping walks and took the household router down.)
+// small blocks from a connected peer ran ~90 overlapping walks and took the household router down.)
 
 import (
 	"context"

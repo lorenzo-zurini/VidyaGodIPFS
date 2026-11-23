@@ -42,12 +42,12 @@ func TestDialBudgetPacesAndRefuses(t *testing.T) {
 	}
 }
 
-// Friends, LAN peers and a fetch's providers skip the line even when the budget is spent.
+// Peers, LAN peers and a fetch's providers skip the line even when the budget is spent.
 func TestDialBudgetLetsWhatTheUserWaitsOnThrough(t *testing.T) {
 	withBudget(t, 0.001, 1, 10*time.Millisecond)
 	s := newSocialState(t.TempDir())
-	friend := peer.ID("friend")
-	s.contacts[friend.String()] = &contact{State: stAccepted}
+	pal := peer.ID("pal")
+	s.contacts[pal.String()] = &contact{State: stAccepted}
 	n := &node{social: s}
 	g := &netGate{n: n}
 	g.InterceptPeerDial("stranger") // spends the only token
@@ -56,7 +56,7 @@ func TestDialBudgetLetsWhatTheUserWaitsOnThrough(t *testing.T) {
 	}
 	n.noteLanPeer("lan")
 	n.noteWantedProvider("seed")
-	for _, p := range []peer.ID{friend, "lan", "seed"} {
+	for _, p := range []peer.ID{pal, "lan", "seed"} {
 		if !g.InterceptPeerDial(p) {
 			t.Fatalf("%s was held behind the budget", p)
 		}
@@ -73,10 +73,10 @@ func TestDialBudgetLetsWhatTheUserWaitsOnThrough(t *testing.T) {
 	}
 }
 
-// A stranger's private addresses are not dialed across the internet; a friend's or LAN peer's are; public ones always.
+// A stranger's private addresses are not dialed across the internet; a peer's or LAN peer's are; public ones always.
 func TestPrivateAddressesOnlyForClosePeers(t *testing.T) {
 	s := newSocialState(t.TempDir())
-	s.contacts[peer.ID("friend").String()] = &contact{State: stAccepted}
+	s.contacts[peer.ID("peer").String()] = &contact{State: stAccepted}
 	n := &node{social: s}
 	n.noteLanPeer("lan")
 	g := &netGate{n: n}
@@ -88,7 +88,7 @@ func TestPrivateAddressesOnlyForClosePeers(t *testing.T) {
 		if g.InterceptAddrDial("stranger", a) {
 			t.Errorf("stranger's %s was dialed", s)
 		}
-		if !g.InterceptAddrDial("friend", a) || !g.InterceptAddrDial("lan", a) {
+		if !g.InterceptAddrDial("peer", a) || !g.InterceptAddrDial("lan", a) {
 			t.Errorf("a close peer's %s was refused", s)
 		}
 	}

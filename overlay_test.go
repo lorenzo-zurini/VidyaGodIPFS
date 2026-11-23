@@ -72,7 +72,7 @@ func ipv4Packet(src, dst [4]byte, payload []byte) []byte {
 }
 
 func TestOverlayForwardsPacketToOwningPeer(t *testing.T) {
-	hA, hB := testHost(t), testHost(t) // helpers from friend_test.go
+	hA, hB := testHost(t), testHost(t) // helpers from peer_test.go
 	connectHosts(t, hA, hB)
 
 	ctx := context.Background()
@@ -220,7 +220,7 @@ func TestOverlayFansOutBroadcast(t *testing.T) {
 	oB.start()
 	oC.start()
 
-	// A routes to both B and C (its two online LAN friends).
+	// A routes to both B and C (its two online LAN peers).
 	if err := oA.configure("10.66.0.1", "10.66.0.0/16", map[string]string{
 		"10.66.0.2": hB.ID().String(), "10.66.0.3": hC.ID().String(),
 	}); err != nil {
