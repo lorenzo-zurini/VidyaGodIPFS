@@ -2,9 +2,13 @@ package main
 
 import (
 	"crypto/rand"
+	mrand "math/rand"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
+
+	cid "github.com/ipfs/go-cid"
 )
 
 // Dropping a file's references does not read the file: a raw leaf has no links, so the walk that finds what to
@@ -57,5 +61,41 @@ func TestDroppingACachedClosureDoesNotReadItsLeaves(t *testing.T) {
 	}
 	if has, _ := n.plain.Has(n.ctx, root.Cid()); has {
 		t.Fatal("the root is still cached")
+	}
+}
+
+// Many references dropped together are each dropped — references gone, pins gone — in one call. Teeth: walk only the
+// first root (the second stays held); unpin only the first (the second stays pinned).
+func TestDropRefsDropsEachRoot(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	var cs []cid.Cid
+	for i := 0; i < 3; i++ {
+		b := make([]byte, len(sampleBytes()))
+		mrand.New(mrand.NewSource(int64(i + 77))).Read(b)
+		f := filepath.Join(dir, "f"+strconv.Itoa(i))
+		writeFile(t, f, b)
+		c, err := n.addNoCopy(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs = append(cs, c)
+	}
+	before := dropCalls.Load()
+	n.dropRefs(cs[:2])
+	if calls := dropCalls.Load() - before; calls != 1 {
+		t.Fatalf("%d drops for one call", calls)
+	}
+	for i, c := range cs {
+		pinned, err := n.pinnedDirectly(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 2 && (n.hasLocal(c) || pinned) {
+			t.Fatalf("root %d: held %v, pinned %v after its drop", i, n.hasLocal(c), pinned)
+		}
+		if i == 2 && (!n.hasLocal(c) || !pinned) {
+			t.Fatal("the root not dropped went with them")
+		}
 	}
 }

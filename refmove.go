@@ -69,6 +69,9 @@ func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
 	if err := n.fstore.FileManager().PutMany(ctx, moved); err != nil { // overwrites each entry in one commit
 		return 0, err
 	}
+	// The files they named before are named no more: the listing of files (orphanedRefPaths) learns that from the
+	// writes — a file it lists that is gone is looked for in the index once more, even one confirmed before.
+	n.refRepointed.Store(true)
 	return len(moved), nil
 }
 

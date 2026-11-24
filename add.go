@@ -113,22 +113,22 @@ func (n *node) addNoCopyIf(path string, want cid.Cid, background bool) (cid.Cid,
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, &fileReadError{err}
 	}
 	st, err := os.Stat(abs)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, &fileReadError{err} // gone, or not ours to read: the file, not the store
 	}
 	if st.IsDir() {
 		if want.Defined() {
-			return cid.Undef, fmt.Errorf("%s is a directory, not one file", abs)
+			return cid.Undef, &fileReadError{fmt.Errorf("%s is a directory, not one file", abs)}
 		}
 		return n.addDirNoCopy(abs)
 	}
 	scratch := &scratchDag{}
 	root, err := buildFileNode(scratch, abs, st)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, &fileReadError{err} // the file, not the store: nothing of it was kept
 	}
 	if want.Defined() && !root.Cid().Equals(want) {
 		return root.Cid(), nil // not the content asked for: nothing of it was kept
@@ -145,6 +145,15 @@ func (n *node) addNoCopyIf(path string, want cid.Cid, background bool) (cid.Cid,
 			return cid.Undef, err
 		} else if !held {
 			refs = append(refs, fn)
+		}
+	}
+	//A leaf another file is referenced for (a heal re-pointing a gone file's blocks, a shared run) is taken over: the
+	//orphan probe looks again for a gone file it had confirmed. A leaf new to the store (a download) is not (the bloom
+	//filter answers most of these without a read).
+	for _, fn := range refs {
+		if had, err := n.fstore.FileManager().Has(n.ctx, fn.Cid()); err == nil && had {
+			n.refRepointed.Store(true)
+			break
 		}
 	}
 	if err := n.plain.PutMany(n.ctx, stored); err != nil {
@@ -370,3 +379,10 @@ func (n *node) addMetaNoCopy(path string) (cid.Cid, error) {
 	n.announce(root.Cid()) // publish to the DHT now so it's discoverable without waiting for the 22h reprovide
 	return root.Cid(), nil
 }
+
+// fileReadError: addNoCopyIf could not read the file it was to add (nothing was kept) — as against the node failing to
+// keep what it read.
+type fileReadError struct{ err error }
+
+func (e *fileReadError) Error() string { return e.err.Error() }
+func (e *fileReadError) Unwrap() error { return e.err }

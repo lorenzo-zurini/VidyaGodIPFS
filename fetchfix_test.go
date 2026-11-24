@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -252,5 +253,65 @@ func TestRollingWindowRollsUnderATightBudget(t *testing.T) {
 	}
 	if globalWantPool.available() != 8 {
 		t.Errorf("budget not restored after fetch: available=%d want 8", globalWantPool.available())
+	}
+}
+
+// The repair reads the file once: hashing it and referencing it are one pass (a check, then the add, read it twice —
+// a restored library twice its size in reads). Teeth: hash it first again (computeCid), then add.
+func TestTheRepairReadsTheFileOnce(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("reads counted from /proc")
+	}
+	n := offlineNode(t)
+	dest := filepath.Join(t.TempDir(), "big.bin")
+	b := make([]byte, 8<<20)
+	for i := range b {
+		b[i] = byte(i*13 + i/7)
+	}
+	writeFile(t, dest, b)
+	c, err := n.addNoCopy(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.dropRef(c)
+	if err := os.WriteFile(dest+".part", []byte("marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := readBytes(t)
+	if err := n.fetchToPath(c.String(), dest, nil, nil); err != nil {
+		t.Fatalf("repair fetch returned %v", err)
+	}
+	if read := readBytes(t) - before; read > int64(len(b))*3/2 {
+		t.Fatalf("the repair read %d bytes of an %d-byte file", read, len(b))
+	}
+	if !n.hasLocal(c) || n.cidMissing(c) {
+		t.Fatal("not repaired")
+	}
+}
+
+// A crashed finalize whose file cannot be read is discarded and fetched again, not taken for a failing store: an
+// unreadable or vanished file is the file's problem. Teeth: let addNoCopyIf return a read failure unmarked (the fetch
+// fails as local-fatal, the file kept).
+func TestAnUnreadableRepairIsDiscarded(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every file")
+	}
+	n := offlineNode(t)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	writeFile(t, dest, sampleBytes())
+	c, err := n.addNoCopy(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.dropRef(c)
+	if err := os.WriteFile(dest+".part", []byte("marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dest, 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.fetchToPath(c.String(), dest, nil, nil) // offline: the fresh fetch after the discard finds nobody
+	if _, err := os.Stat(dest); err == nil {
+		t.Fatal("an unreadable file was kept, its repair taken for a store failure")
 	}
 }

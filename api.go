@@ -235,6 +235,35 @@ func VgDropRef(cidStr *C.char, errOut **C.char) C.int {
 	return 0
 }
 
+// VgDropRefs: VgDropRef of each CID of a JSON array, together (one delete batch, one round of unpins and provider
+// writes, one compaction asked). Bad CIDs are skipped.
+//
+//export VgDropRefs
+func VgDropRefs(cidsJson *C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	var strs []string
+	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &strs); err != nil {
+		return fail(errOut, err)
+	}
+	var cs []cid.Cid
+	for _, s := range strs {
+		if c, err := cid.Decode(s); err == nil {
+			cs = append(cs, c)
+		}
+	}
+	n.dropRefs(cs)
+	return 0
+}
+
+// VgDebugDropCalls: dropRefs calls since start (tests only: drops asked together are one call).
+//
+//export VgDebugDropCalls
+func VgDebugDropCalls() C.longlong { return C.longlong(dropCalls.Load()) }
+
 //export VgDropCached
 func VgDropCached(cidStr *C.char, errOut **C.char) C.int {
 	n := get()
@@ -268,6 +297,38 @@ func VgBlockPut(bytesStr *C.char, outCid **C.char, errOut **C.char) C.int {
 		return fail(errOut, err)
 	}
 	setStr(outCid, c.String())
+	return 0
+}
+
+// VgBlockPutMany stores many nodes' bytes (a JSON array of strings) as raw leaves — one stored batch, their pins'
+// dirty flag set and cleared once, one announcement — and returns their CIDs (*outJson, a JSON array in the same
+// order). -1, errOut, when one is over a chunk (then nothing is stored) or a pin fails (the blocks stay stored).
+//
+//export VgBlockPutMany
+func VgBlockPutMany(bytesJson *C.char, outJson **C.char, errOut **C.char) C.int {
+	n := get()
+	if n == nil {
+		setStr(errOut, "node not started")
+		return -1
+	}
+	var strs []string
+	if err := json.Unmarshal([]byte(C.GoString(bytesJson)), &strs); err != nil {
+		return fail(errOut, err)
+	}
+	bs := make([][]byte, len(strs))
+	for i, s := range strs {
+		bs[i] = []byte(s)
+	}
+	cs, err := n.blockPutMany(bs)
+	if err != nil {
+		return fail(errOut, err)
+	}
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.String()
+	}
+	b, _ := json.Marshal(out)
+	setStr(outJson, string(b))
 	return 0
 }
 
@@ -929,6 +990,103 @@ func VgMoveRefs(movesJson *C.char, errOut **C.char) C.longlong {
 		return -1
 	}
 	return C.longlong(moved)
+}
+
+// VgHeldWholeMany: VgHeldWhole for each CID of a JSON array, checked together (one worker per CPU, one stat per
+// backing file); *outJson = a JSON array of booleans in the same order. -1 when the node is down or the list is bad.
+//
+//export VgHeldWholeMany
+func VgHeldWholeMany(cidsJson *C.char, outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	var strs []string
+	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &strs); err != nil {
+		return -1
+	}
+	cs := make([]cid.Cid, len(strs))
+	bad := make([]bool, len(strs))
+	for i, s := range strs {
+		c, err := cid.Decode(s)
+		if err != nil {
+			bad[i] = true
+			continue
+		}
+		cs[i] = c
+	}
+	var good []cid.Cid
+	var at []int
+	for i := range cs {
+		if !bad[i] {
+			good = append(good, cs[i])
+			at = append(at, i)
+		}
+	}
+	whole := n.heldWholeMany(good)
+	res := make([]bool, len(strs))
+	for k, i := range at {
+		res[i] = whole[k]
+	}
+	b, _ := json.Marshal(res)
+	setStr(outJson, string(b))
+	return 0
+}
+
+// VgCidServeStatusMany: for each CID of a JSON array, what serving it here would meet and whether a file it is
+// referenced into is gone — VgCidServeStatus and VgCidMissing of each, in one pass (a shared block walked once, each
+// file stat'd once); *outJson = a JSON array of {"err", "gone"} in the same order. -1 when the node is down.
+//
+//export VgCidServeStatusMany
+func VgCidServeStatusMany(cidsJson *C.char, outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	var strs []string
+	if err := json.Unmarshal([]byte(C.GoString(cidsJson)), &strs); err != nil {
+		return -1
+	}
+	res := make([]serveVerdict, len(strs))
+	var cs []cid.Cid
+	var at []int
+	for i, s := range strs {
+		c, err := cid.Decode(s)
+		if err != nil {
+			res[i] = serveVerdict{Err: "not a CID: " + s}
+			continue
+		}
+		cs = append(cs, c)
+		at = append(at, i)
+	}
+	for k, v := range n.serveStatusMany(cs) {
+		res[at[k]] = v
+	}
+	b, _ := json.Marshal(res)
+	setStr(outJson, string(b))
+	return 0
+}
+
+// VgHeldWholeFiles: VgHeldWhole, and the files the CID's leaves are referenced into (*outJson, a JSON array; empty for
+// stored blocks only). 1 held whole, 0 not, -1 node down or a bad CID.
+//
+//export VgHeldWholeFiles
+func VgHeldWholeFiles(cidStr *C.char, outJson **C.char) C.int {
+	n := get()
+	if n == nil {
+		return -1
+	}
+	c, err := cid.Decode(C.GoString(cidStr))
+	if err != nil {
+		return -1
+	}
+	files, err := n.heldWholeFiles(c)
+	if err != nil {
+		return 0
+	}
+	b, _ := json.Marshal(files)
+	setStr(outJson, string(b))
+	return 1
 }
 
 // VgHeldWhole: 1 if every block of the CID's DAG is held and every file it is referenced into is present, else 0.

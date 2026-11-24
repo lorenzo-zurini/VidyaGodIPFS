@@ -34,6 +34,8 @@ import (
 	ci "github.com/libp2p/go-libp2p/core/crypto"
 	host "github.com/libp2p/go-libp2p/core/host"
 	metrics "github.com/libp2p/go-libp2p/core/metrics"
+	goleveldbfilter "github.com/syndtr/goleveldb/leveldb/filter"
+	goleveldbopt "github.com/syndtr/goleveldb/leveldb/opt"
 	goleveldbutil "github.com/syndtr/goleveldb/leveldb/util"
 )
 
@@ -48,25 +50,30 @@ type node struct {
 	// Compaction lifecycle: coalesce overlapping requests, refuse new ones once closing, and let closeNode WAIT
 	// for the in-flight run — closing the datastore under a live CompactRange races goleveldb's internal
 	// compaction/close machinery (-race caught it as a pre-existing flake once CI ran with -race).
-	compactMu     sync.Mutex
-	compactBusy   bool
-	compactClosed bool
-	compactWG     sync.WaitGroup
-	ds            datastore.Batching
-	refGen        *atomic.Uint64 // writes to the filestore's references so far (refwatch.go)
-	refPathsMu    sync.Mutex
-	refPaths      []string // the distinct files the references name, listed at refPathsGen (orphanedRefPaths)
-	refPathsGen   uint64
-	refPathsValid bool
-	fstore        *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
-	bstore        blockstore.Blockstore
-	plain         blockstore.Blockstore // the blockstore under the filestore: stored bytes, never a reference
-	bserv         blockservice.BlockService
-	dserv         ipld.DAGService
-	localDserv    ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
-	madeDirs      sync.Map        // folder CID → struct{}: folders makeDir built, each entry verified whole (blocks.go)
-	pinner        ipfspinner.Pinner
-	serveFails    *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
+	compactMu         sync.Mutex
+	compactBusy       bool
+	compactClosed     bool
+	compactWG         sync.WaitGroup
+	ds                datastore.Batching
+	refDropped        *atomic.Uint64 // reference drops: only these make the listing of files read again
+	refAdded          *refAdded      // files references were written to since the listing
+	refPathsMu        sync.Mutex
+	refPaths          []string            // the distinct files the references name, listed at refPathsGen (orphanedRefPaths)
+	refPathsGen       uint64              // refDropped when the listing was read
+	refPathsWritten   bool                // references were written since the listing was read: it may name a file none names now
+	refPathsConfirmed map[string]struct{} // gone files a read of the index confirmed still referenced
+	putManyMu         sync.Mutex          // one blockPutMany at a time (it turns the pinner's autosync off while it runs)
+	refRepointed      atomic.Bool         // a reference some file already had was written over (a heal, a move) since: no confirmation holds
+	refPathsValid     bool
+	fstore            *filestore.Filestore // routes FilestoreNode leaves to references, everything else to the blockstore
+	bstore            blockstore.Blockstore
+	plain             blockstore.Blockstore // the blockstore under the filestore: stored bytes, never a reference
+	bserv             blockservice.BlockService
+	dserv             ipld.DAGService
+	localDserv        ipld.DAGService // always-offline DAG service for local-only checks (never fetches over the network)
+	madeDirs          sync.Map        // folder CID → struct{}: folders makeDir built, each entry verified whole (blocks.go)
+	pinner            ipfspinner.Pinner
+	serveFails        *failureLog // blocks a peer asked for that we could not deliver (see servefail.go)
 
 	// network (M3) — nil/false until goOnline succeeds
 	online     bool
@@ -123,6 +130,9 @@ var (
 )
 
 // openNode initializes the node at repoPath (created if missing). Idempotent: a second call is a no-op.
+// openLevelDB opens the node's store (a test sees the options the node opens it with).
+var openLevelDB = leveldb.NewDatastore
+
 func openNode(repoPath string) error {
 	gMu.Lock()
 	defer gMu.Unlock()
@@ -139,16 +149,16 @@ func openNode(repoPath string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Persistent block/pin/reference metadata in a leveldb datastore under the repo.
-	ldb, err := leveldb.NewDatastore(filepath.Join(repoPath, "datastore"), nil)
+	ldb, err := openLevelDB(filepath.Join(repoPath, "datastore"), (*leveldb.Options)(storeOptions()))
 	if err != nil {
 		cancel()
 		return err
 	}
-	refGen := &atomic.Uint64{}
+	refDropped, added := &atomic.Uint64{}, &refAdded{}
 	// leveldb is safe for concurrent use and streams a query from an iterator (a snapshot): no mutex wrapper. Its
 	// Query read the whole result before giving the first entry — every reference scan held them all (~2.5 GB for
 	// 5.8 M references) and every write waited behind it (refscan_test.go).
-	ds := refWatch{Batching: ldb, gen: refGen}
+	ds := refWatch{Batching: ldb, dropped: refDropped, added: added}
 
 	bstore := blockstore.NewBlockstore(ds)
 	// FileManager references on-disk files, recorded relative to its root ("/"; a volume on Windows, filestoreroot.go).
@@ -179,7 +189,7 @@ func openNode(repoPath string) error {
 	gNode = &node{
 		ctx: ctx, cancel: cancel, repoPath: repoPath,
 		ldb: ldb,
-		ds:  ds, refGen: refGen, fstore: fstore, bstore: served, plain: bstore, bserv: bserv, dserv: dserv, pinner: pnr, serveFails: failLog,
+		ds:  ds, refDropped: refDropped, refAdded: added, fstore: fstore, bstore: served, plain: bstore, bserv: bserv, dserv: dserv, pinner: pnr, serveFails: failLog,
 		// localDserv stays this offline DAG service even after goOnline swaps dserv to online bitswap — so
 		// local-only checks (cidMissing) never trigger a network fetch.
 		localDserv: dserv,
@@ -310,4 +320,16 @@ func get() *node {
 	gMu.Lock()
 	defer gMu.Unlock()
 	return gNode
+}
+
+// storeOptions: leveldb sized for a library's store (~1 GB, 5.8 M references, ~570 tables), not its defaults (an
+// 8 MiB block cache, 500 open tables, no filter): a walk over a library's references re-read and re-decompressed the
+// same blocks and re-opened tables as it went, ~100 µs a lookup. A bloom filter lets a lookup of an absent key skip a
+// table without reading it (a table gets its filter when compaction writes it; one without is read as before).
+func storeOptions() *goleveldbopt.Options {
+	return &goleveldbopt.Options{
+		Filter:                 goleveldbfilter.NewBloomFilter(10),
+		BlockCacheCapacity:     64 << 20,
+		OpenFilesCacheCapacity: 1024,
+	}
 }

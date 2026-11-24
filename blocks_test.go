@@ -418,3 +418,133 @@ func TestBlockPutNeverWalksRecursivePins(t *testing.T) {
 		t.Fatalf("a block kept indirectly refused a Direct pin: %v", err)
 	}
 }
+
+// Many nodes put together (a mint's) are what putting each gives: their file CIDs, held, pinned directly, and stored
+// over a dead reference to the same bytes. Teeth: drop the dead-reference drop (it reads as missing); drop the pins
+// (not pinned); answer in another order (the CIDs do not match the bytes).
+func TestBlockPutManyIsBlockPutOfEach(t *testing.T) {
+	n := offlineNode(t)
+	landed := []byte(`{"LABEL":"landed","LAYERS":[{"DIR":"y"}]}`)
+	p := filepath.Join(t.TempDir(), "landed.json")
+	writeFile(t, p, landed)
+	dead, err := n.addNoCopy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	nodes := [][]byte{[]byte(`{"LABEL":"a"}`), landed, []byte(`{"LABEL":"c"}`)}
+	cs, err := n.blockPutMany(nodes)
+	if err != nil || len(cs) != 3 {
+		t.Fatalf("blockPutMany = %v, %v", cs, err)
+	}
+	for i, b := range nodes {
+		want, err := rawCid(b) // the CID alone: blockPut would store and pin it, and hide what the batch did
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cs[i].Equals(want) {
+			t.Fatalf("node %d: %s, its bytes hash to %s", i, cs[i], want)
+		}
+		if got, err := n.blockGet(cs[i]); err != nil || string(got) != string(b) {
+			t.Fatalf("node %d not held: %v", i, err)
+		}
+		if pinned, err := n.pinnedDirectly(cs[i]); err != nil || !pinned {
+			t.Fatalf("node %d not pinned: %v", i, err)
+		}
+	}
+	if !cs[1].Equals(dead) || n.cidMissing(dead) {
+		t.Fatal("the dead reference still reads the block as missing")
+	}
+	if _, err := n.blockPutMany([][]byte{make([]byte, chunkSize+1)}); err == nil {
+		t.Fatal("blockPutMany accepted more than one chunk")
+	}
+}
+
+// A folder made again (every publish remakes every package's folders) is not pinned again, and a folder of node files
+// linked by their sizes is the folder their blocks make. Teeth: pin whatever was pinned (two pins); link a raw entry
+// with another size (another folder CID).
+func TestAFolderMadeAgainIsNotPinnedAgainAndIsTheSameFolder(t *testing.T) {
+	n := offlineNode(t)
+	a, err := n.blockPut([]byte(`{"LABEL":"a","LAYERS":[{"ZIP":"a.zip"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := n.blockPut([]byte(`{"LABEL":"b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := map[string]string{"a.json": a.String(), "b.json": b.String()}
+	before := dirPins.Load()
+	d1, err := n.makeDir(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := n.makeDir(entries)
+	if err != nil || !d2.Equals(d1) {
+		t.Fatalf("made again: %s, %v", d2, err)
+	}
+	if pins := dirPins.Load() - before; pins != 1 {
+		t.Fatalf("%d pins for one folder made twice", pins)
+	}
+	// The folder the blocks themselves make.
+	ref, err := ufsio.NewDirectory(n.dserv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.json", "b.json"} {
+		c, _ := cid.Decode(entries[name])
+		nd, err := n.localDserv.Get(n.ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ref.AddChild(n.ctx, name, nd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rn, err := ref.GetNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rn.Cid().Equals(d1) {
+		t.Fatalf("linked by size: %s, by the blocks: %s", d1, rn.Cid())
+	}
+}
+
+// A folder built over size-only links never stores one: a sharded folder adds each child to the store, and a link
+// carries no bytes — stored, it would be an empty block held under the node's CID. Teeth: build the folder over the
+// plain DAG service (the empty block lands).
+func TestASizeOnlyLinkIsNeverStored(t *testing.T) {
+	n := offlineNode(t)
+	c, err := rawCid([]byte(`{"LABEL":"never stored"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (linkOnlyDserv{n.dserv}).Add(n.ctx, &sizedLeaf{c: c, size: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (linkOnlyDserv{n.dserv}).AddMany(n.ctx, []ipld.Node{&sizedLeaf{c: c, size: 24}}); err != nil {
+		t.Fatal(err)
+	}
+	if n.hasLocal(c) {
+		t.Fatal("a size-only link was stored as a block")
+	}
+}
+
+// A node file referenced in place is read when its folder is made: its file may have changed since it was added (the
+// same length, other bytes), and a folder over it would be pinned and announced over an entry nobody can be served.
+// Teeth: link referenced entries by their size too (the folder is made).
+func TestAFolderOverAChangedReferencedNodeIsRefused(t *testing.T) {
+	n := offlineNode(t)
+	p := filepath.Join(t.TempDir(), "landed.json")
+	writeFile(t, p, []byte(`{"LABEL":"landed","LAYERS":[{"DIR":"a"}]}`))
+	c, err := n.addNoCopy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, p, []byte(`{"LABEL":"landed","LAYERS":[{"DIR":"b"}]}`)) // the same length, other bytes
+	if _, err := n.makeDir(map[string]string{"landed.json": c.String()}); err == nil {
+		t.Fatal("a folder was made over a referenced node whose file changed")
+	}
+}

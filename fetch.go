@@ -762,18 +762,20 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 		if _, serr := os.Stat(dest); serr != nil {
 			goto fetchFresh
 		}
-		got, cerr := computeCid(dest)
+		// One read: addNoCopyIf hashes the file and, only when it is c, references it in place and pins it — a check
+		// and then the add read it twice (a restored 900 GB library: 1.8 TB of reads).
+		got, cerr := n.addNoCopyIf(dest, c, false)
+		var unreadable *fileReadError
 		switch {
+		case cerr != nil && !errors.As(cerr, &unreadable):
+			return localFatal(cerr) // referencing/pinning a present, correct file failed = local/datastore error
 		case cerr != nil:
 			// The bytes on disk are unreadable/corrupt — discard and re-fetch clean (a fresh fetch fixes it).
 			fdbg("fetchToPathOnce: dest unreadable for repair (%v) → discard + re-fetch cid=%s", cerr, cidStr)
 			_ = os.Remove(dest)
 			removePartial(dest)
 		case got == c:
-			// Content is correct and complete → finish the finalize idempotently (reference in place + pin).
-			if _, aerr := n.addNoCopy(dest); aerr != nil {
-				return localFatal(aerr) // referencing/pinning a present, correct file failed = local/datastore error
-			}
+			// Content is correct and complete → the finalize finished idempotently (referenced in place + pinned).
 			removePartial(dest)
 			fdbg("fetchToPathOnce: repair OK cid=%s", cidStr)
 			return nil
@@ -1618,7 +1620,16 @@ func (n *node) dropClosure(root cid.Cid) {
 // offline DAG service so an orphaned leaf (whose backing file is gone) is simply skipped, never fetched over the
 // network. Only the small dag-pb intermediate nodes need reading to enumerate leaf CIDs; the leaves themselves are
 // deleted by CID without reading their (possibly gone) content.
-func (n *node) dropRef(root cid.Cid) {
+func (n *node) dropRef(root cid.Cid) { n.dropRefs([]cid.Cid{root}) }
+
+// dropRefs is dropRef of many roots at once: one walk, one delete batch, their pins dropped and their announcements
+// stopped together, one compaction asked. Called per item in loops (a received library's landed nodes, a source's
+// files), each drop was its own commit, its own unpins and provider writes, its own compaction request.
+func (n *node) dropRefs(roots []cid.Cid) {
+	if len(roots) == 0 {
+		return
+	}
+	dropCalls.Add(1)
 	// Enumerate the closure first (reading only the small dag-pb intermediates), then delete every leaf in ONE
 	// datastore batch. Per-leaf fstore.DeleteBlock was O(leaves) sync writes to leveldb — ~21 ms each, so a 763-leaf
 	// file stalled ~16 s. A single batched commit is ~one sync. Each leaf may live as a filestore reference
@@ -1641,7 +1652,9 @@ func (n *node) dropRef(root cid.Cid) {
 		}
 		cids = append(cids, c)
 	}
-	walk(root)
+	for _, root := range roots {
+		walk(root)
+	}
 	if batch, err := n.ds.Batch(n.ctx); err == nil {
 		for _, c := range cids {
 			k := dshelp.MultihashToDsKey(c.Hash())
@@ -1658,6 +1671,12 @@ func (n *node) dropRef(root cid.Cid) {
 			_ = n.fstore.DeleteBlock(n.ctx, c)
 		}
 	}
-	_ = n.unpin(root) // drop the stale recursive pin; the re-add re-pins against the new backing file
+	n.stopProviding(roots...)
+	for _, root := range roots {
+		_ = n.pinner.Unpin(n.ctx, root, true) // drop the stale recursive pin; the re-add re-pins against the new backing file
+	}
 	n.scheduleCompaction()
 }
+
+// dropCalls counts dropRefs calls (a test reads it: many drops asked together are one).
+var dropCalls atomic.Int64

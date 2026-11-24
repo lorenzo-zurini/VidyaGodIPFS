@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
@@ -79,6 +80,67 @@ func (n *node) blockPut(b []byte) (cid.Cid, error) {
 	return c, nil
 }
 
+// blockPutMany is blockPut for many nodes — a mint's every new node — in one stored batch, their pins made with the
+// pinner's dirty and clean flags written once for all of them, and one announcement: a node at a time, each was ~5
+// synced writes (its block, the dirty flag, its pin's record and index, the clean flag). Each pin's record and index
+// are still a synced write apiece (leveldb syncs every Put). A node over one chunk refuses all of them, before
+// anything is stored; a pin that fails after the store leaves the blocks stored, unannounced.
+func (n *node) blockPutMany(bs [][]byte) ([]cid.Cid, error) {
+	cs := make([]cid.Cid, len(bs))
+	blks := make([]blocks.Block, 0, len(bs))
+	for i, b := range bs {
+		if int64(len(b)) > chunkSize {
+			return nil, fmt.Errorf("block %d is %d bytes — over one %d-byte chunk", i, len(b), chunkSize)
+		}
+		c, err := rawCid(b)
+		if err != nil {
+			return nil, err
+		}
+		blk, err := blocks.NewBlockWithCid(b, c)
+		if err != nil {
+			return nil, err
+		}
+		cs[i] = c
+		blks = append(blks, blk)
+	}
+	if err := n.plain.PutMany(n.ctx, blks); err != nil {
+		return nil, err
+	}
+	pinned := false
+	// The dirty flag set once and cleared once (Flush) for every pin below, not around each of them. One batch at a
+	// time: the flag is the pinner's, and two batches saving and restoring it crossed would leave it off for good.
+	n.putManyMu.Lock()
+	defer n.putManyMu.Unlock()
+	if a, ok := n.pinner.(interface{ SetAutosync(bool) bool }); ok {
+		defer a.SetAutosync(a.SetAutosync(false))
+	}
+	for _, c := range cs {
+		if n.cidMissing(c) { // a dead reference to the same bytes goes too (blockPut)
+			if err := n.fstore.FileManager().DeleteBlock(n.ctx, c); err != nil {
+				return nil, err
+			}
+		}
+		if has, err := n.pinnedDirectly(c); err != nil {
+			return nil, err
+		} else if !has {
+			if err := n.pinner.PinWithMode(n.ctx, c, ipfspinner.Direct, ""); err != nil {
+				if pinned {
+					_ = n.pinner.Flush(n.ctx) // the pins made so far, recorded clean: a dirty flag left set rebuilds the index at the next start
+				}
+				return nil, err
+			}
+			pinned = true
+		}
+	}
+	if pinned {
+		if err := n.pinner.Flush(n.ctx); err != nil {
+			return nil, err
+		}
+	}
+	n.startProviding(cs...)
+	return cs, nil
+}
+
 // blockGet returns one raw block's bytes, fetched over bitswap when it is not local. Only raw leaves: a dag-pb CID is
 // a chunked file or a folder, never one node.
 func (n *node) blockGet(c cid.Cid) ([]byte, error) {
@@ -139,7 +201,7 @@ func (n *node) dirEntries(c cid.Cid) (map[string]string, error) {
 // of refusing — so a caller choosing what to include does not check each entry first (a second walk of every DAG).
 // When no entry is whole it makes no folder (cid.Undef, no error).
 func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, []string, error) {
-	d, err := ufsio.NewDirectory(n.dserv)
+	d, err := ufsio.NewDirectory(linkOnlyDserv{n.dserv})
 	if err != nil {
 		return cid.Undef, nil, err
 	}
@@ -172,7 +234,20 @@ func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, 
 			}
 		}
 		var child ipld.Node
-		if child, err = n.localDserv.Get(n.ctx, c); err != nil { // held here or refused: never fetched to be linked
+		storedRaw := false
+		if c.Prefix().Codec == cid.Raw {
+			storedRaw, _ = n.plain.Has(n.ctx, c)
+		}
+		if storedRaw {
+			// A minted node (stored bytes, hashed when put) is linked by its size: reading every one of them to link it
+			// read a library's node files at every publish. A node file referenced in place is read, below: its file may
+			// have changed since, and the read checks it.
+			size, err := n.plain.GetSize(n.ctx, c)
+			if err != nil {
+				return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
+			}
+			child = &sizedLeaf{c: c, size: uint64(size)}
+		} else if child, err = n.localDserv.Get(n.ctx, c); err != nil { // held here or refused: never fetched to be linked
 			return cid.Undef, nil, fmt.Errorf("entry %q: %w", name, err)
 		}
 		if err := d.AddChild(n.ctx, name, child); err != nil {
@@ -189,11 +264,18 @@ func (n *node) makeWholeDir(entries map[string]string, leaveOut bool) (cid.Cid, 
 	if err := n.dserv.Add(n.ctx, dn); err != nil {
 		return cid.Undef, nil, err
 	}
-	if err := n.pinner.PinWithMode(n.ctx, dn.Cid(), ipfspinner.Recursive, ""); err != nil {
+	// Pinned already (the same folder made again: every publish remakes every package's three): a recursive pin of a
+	// pinned CID is taken off and put back — ~6 synced writes and a flush, for each of a library's 2,000 folders.
+	if _, has, err := n.pinner.IsPinnedWithType(n.ctx, dn.Cid(), ipfspinner.Recursive); err != nil {
 		return cid.Undef, nil, err
-	}
-	if err := n.pinner.Flush(n.ctx); err != nil {
-		return cid.Undef, nil, err
+	} else if !has {
+		if err := n.pinner.PinWithMode(n.ctx, dn.Cid(), ipfspinner.Recursive, ""); err != nil {
+			return cid.Undef, nil, err
+		}
+		if err := n.pinner.Flush(n.ctx); err != nil {
+			return cid.Undef, nil, err
+		}
+		dirPins.Add(1)
 	}
 	n.madeDirs.Store(dn.Cid().String(), struct{}{})
 	n.announceNow(dn.Cid())
@@ -208,4 +290,56 @@ func (n *node) pinnedDirectly(c cid.Cid) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// dirPins counts the folders makeWholeDir pinned (a test reads it: a folder made again is not pinned again).
+var dirPins atomic.Int64
+
+// sizedLeaf is a raw block linked by its CID and size alone, for a folder listing it: the link is all a folder keeps of
+// an entry (ipld.MakeLink reads Cid and Size), so its bytes need not be read to make it.
+type sizedLeaf struct {
+	c    cid.Cid
+	size uint64
+}
+
+func (l *sizedLeaf) RawData() []byte { return nil }
+func (l *sizedLeaf) Cid() cid.Cid    { return l.c }
+func (l *sizedLeaf) String() string  { return l.c.String() }
+func (l *sizedLeaf) Loggable() map[string]interface{} {
+	return map[string]interface{}{"node": l.c.String()}
+}
+func (l *sizedLeaf) Resolve([]string) (interface{}, []string, error) {
+	return nil, nil, fmt.Errorf("a leaf has no paths")
+}
+func (l *sizedLeaf) Tree(string, int) []string { return nil }
+func (l *sizedLeaf) ResolveLink([]string) (*ipld.Link, []string, error) {
+	return nil, nil, fmt.Errorf("a leaf has no links")
+}
+func (l *sizedLeaf) Copy() ipld.Node     { c := *l; return &c }
+func (l *sizedLeaf) Links() []*ipld.Link { return nil }
+func (l *sizedLeaf) Stat() (*ipld.NodeStat, error) {
+	return &ipld.NodeStat{Hash: l.c.String(), CumulativeSize: int(l.size), DataSize: int(l.size)}, nil
+}
+func (l *sizedLeaf) Size() (uint64, error) { return l.size, nil }
+
+// linkOnlyDserv: the DAG service a folder is built over. A sharded folder adds each child it is given to the store (boxo
+// hamt Swap): a sizedLeaf carries no bytes, and stored it would be an empty block under its CID — held whole, served
+// as nothing. It is never stored; it is there already (that is why it may be linked by its size).
+type linkOnlyDserv struct{ ipld.DAGService }
+
+func (d linkOnlyDserv) Add(ctx context.Context, nd ipld.Node) error {
+	if _, ok := nd.(*sizedLeaf); ok {
+		return nil
+	}
+	return d.DAGService.Add(ctx, nd)
+}
+
+func (d linkOnlyDserv) AddMany(ctx context.Context, nds []ipld.Node) error {
+	keep := make([]ipld.Node, 0, len(nds))
+	for _, nd := range nds {
+		if _, ok := nd.(*sizedLeaf); !ok {
+			keep = append(keep, nd)
+		}
+	}
+	return d.DAGService.AddMany(ctx, keep)
 }

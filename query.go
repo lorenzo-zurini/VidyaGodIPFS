@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -163,9 +165,90 @@ var wholeWalks atomic.Int64
 // dag-pb interior (small); a leaf is checked by one lookup of its reference (or its stored bytes), and, referenced into
 // a file, that file by one stat per distinct path (gone, or ending before the leaf) — nothing re-hashed.
 func (n *node) heldWhole(c cid.Cid) error {
+	return n.heldWholeWith(c, newStatMemo())
+}
+
+// statMemo: each backing file's size, -1 gone, stat'd once however many leaves (and walks, on however many workers)
+// reference into it.
+type statMemo struct {
+	mu    sync.Mutex
+	sizes map[string]*statOnce
+}
+
+type statOnce struct {
+	once sync.Once
+	size int64
+}
+
+// memoStats counts the backing files a statMemo stat'd (a test reads it: a file is stat'd once per check of many).
+var memoStats atomic.Int64
+
+func newStatMemo() *statMemo { return &statMemo{sizes: map[string]*statOnce{}} }
+
+func (m *statMemo) size(p string) int64 {
+	m.mu.Lock()
+	e, ok := m.sizes[p]
+	if !ok {
+		e = &statOnce{}
+		m.sizes[p] = e
+	}
+	m.mu.Unlock()
+	e.once.Do(func() {
+		memoStats.Add(1)
+		e.size = -1
+		if st, err := os.Stat(p); err == nil {
+			e.size = st.Size()
+		}
+	})
+	return e.size
+}
+
+// heldWholeMany: heldWhole for each of cs, on one worker per CPU, one stat per backing file across them all. Every
+// start asked the library's content one file at a time: 3.6 M leaf lookups in a row, a minute and more of the store's
+// reads before the first file was seeded.
+func (n *node) heldWholeMany(cs []cid.Cid) []bool {
+	out := make([]bool, len(cs))
+	memo := newStatMemo()
+	next := atomic.Int64{}
+	var wg sync.WaitGroup
+	workers := runtime.NumCPU()
+	if workers > len(cs) {
+		workers = len(cs)
+	}
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(cs) || n.ctx.Err() != nil {
+					return
+				}
+				out[i] = n.heldWholeWith(cs[i], memo) == nil
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// heldWholeFiles: heldWhole, and the distinct files c's leaves are referenced into — the files a read of c reads.
+func (n *node) heldWholeFiles(c cid.Cid) ([]string, error) {
+	memo := newStatMemo()
+	if err := n.heldWholeWith(c, memo); err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(memo.sizes))
+	for p := range memo.sizes {
+		files = append(files, p)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func (n *node) heldWholeWith(c cid.Cid, memo *statMemo) error {
 	wholeWalks.Add(1)
 	seen := cid.NewSet()
-	sizes := map[string]int64{} // backing path → its size, -1 gone (a large file's thousands of leaves share one path)
 	var walk func(c cid.Cid) error
 	walk = func(c cid.Cid) error {
 		if !seen.Visit(c) {
@@ -177,14 +260,7 @@ func (n *node) heldWhole(c cid.Cid) error {
 			// reads at every start.
 			if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
 				p := filepath.Join(fileRoot, res.FilePath) // relative to the FileManager root (filestoreroot.go)
-				size, done := sizes[p]
-				if !done {
-					size = -1
-					if st, err := os.Stat(p); err == nil {
-						size = st.Size()
-					}
-					sizes[p] = size
-				}
+				size := memo.size(p)
 				if size < 0 {
 					return fmt.Errorf("%s: the file it is referenced into (%s) is gone", c, p)
 				}
@@ -232,15 +308,69 @@ func (n *node) heldWhole(c cid.Cid) error {
 func (n *node) orphanedRefPaths() []string {
 	n.refPathsMu.Lock()
 	defer n.refPathsMu.Unlock()
-	if gen := n.refGen.Load(); !n.refPathsValid || gen != n.refPathsGen {
+	scanned := false
+	scan := func() bool {
+		n.refAdded.take() // everything written so far is in what the scan reads
+		gen := n.refDropped.Load()
 		paths, ok := n.refFilePaths()
 		if !ok {
+			n.refPathsValid = false // what it took is not in a listing: the next call reads the index again
+			return false
+		}
+		n.refPaths, n.refPathsGen, n.refPathsValid, scanned = paths, gen, true, true
+		n.refPathsWritten = false
+		return true
+	}
+	if !n.refPathsValid || n.refDropped.Load() != n.refPathsGen {
+		if !scan() {
 			return nil
 		}
-		n.refPaths, n.refPathsGen, n.refPathsValid = paths, gen, true
+	} else if added := n.refAdded.take(); len(added) > 0 {
+		// Written since: their files join the listing, which is read again only when a reference was dropped.
+		n.refPathsWritten = true
+		have := make(map[string]struct{}, len(n.refPaths))
+		for _, p := range n.refPaths {
+			have[p] = struct{}{}
+		}
+		for _, p := range added {
+			if _, ok := have[p]; !ok {
+				n.refPaths = append(n.refPaths, p)
+			}
+		}
+		sort.Strings(n.refPaths)
 	}
+	if n.refRepointed.Swap(false) {
+		n.refPathsConfirmed = nil // a gone file's blocks may be named by another file now: each is looked for again
+	}
+	gone := n.goneOf(n.refPaths)
+	// A file that looks gone, references having been written since the listing was read: one written over another's
+	// (the same block in two files) can leave a file nothing names any more. Read once more before saying so — once
+	// per file: a gone file a read already confirmed does not make every probe during a download read the index.
+	fresh := false
+	for _, p := range gone {
+		if _, ok := n.refPathsConfirmed[p]; !ok {
+			fresh = true
+			break
+		}
+	}
+	if fresh && n.refPathsWritten && !scanned {
+		if !scan() {
+			return nil
+		}
+		gone = n.goneOf(n.refPaths)
+	}
+	if scanned {
+		n.refPathsConfirmed = make(map[string]struct{}, len(gone))
+		for _, p := range gone {
+			n.refPathsConfirmed[p] = struct{}{}
+		}
+	}
+	return gone
+}
+
+func (n *node) goneOf(paths []string) []string {
 	var gone []string
-	for _, p := range n.refPaths {
+	for _, p := range paths {
 		if _, statErr := os.Stat(p); statErr != nil {
 			gone = append(gone, p)
 		}
@@ -392,6 +522,69 @@ func (n *node) cidServeStatus(c cid.Cid) string {
 	// covered extent (handled above) actually breaks delivery. Treating "grew" as broken would have been a false
 	// alarm that also destroyed a working reference during repair.
 	return ""
+}
+
+// serveVerdict: what serving a CID's DAG here would meet — Err, the first problem (as cidServeStatus words it), and
+// Gone, whether a file a leaf is referenced into is gone (cidMissing).
+type serveVerdict struct {
+	Err  string `json:"err"`
+	Gone bool   `json:"gone"`
+}
+
+// serveWalks counts the blocks serveStatusMany walked (a test reads it: a block shared by many CIDs is walked once).
+var serveWalks atomic.Int64
+
+// serveStatusMany: cidServeStatus and cidMissing of each CID, in one pass over all of them: a subtree's verdict is
+// kept, and each backing file stat'd once, for every CID that reaches it. The IPFS tab asked each pin on its own — a
+// content leaf is reached from its file, its package's content folder and its pin folder, walked three times, each
+// leaf stat'd every time — and then walked every row again for cidMissing.
+func (n *node) serveStatusMany(cs []cid.Cid) []serveVerdict {
+	memo := map[cid.Cid]serveVerdict{}
+	stats := newStatMemo()
+	var walk func(c cid.Cid) serveVerdict
+	walk = func(c cid.Cid) serveVerdict {
+		if v, ok := memo[c]; ok {
+			return v
+		}
+		memo[c] = serveVerdict{} // a block reached again while being walked (no DAG has one): nothing more to find
+		serveWalks.Add(1)
+		var v serveVerdict
+		if res := filestore.List(n.ctx, n.fstore, c); res != nil && res.FilePath != "" {
+			p := filepath.Join("/", res.FilePath)
+			size := stats.size(p)
+			switch {
+			case size < 0:
+				v = serveVerdict{Err: "backing file gone: " + p, Gone: true}
+			case uint64(size) < res.Offset+res.Size:
+				v = serveVerdict{Err: "backing file truncated: " + p}
+			}
+			memo[c] = v
+			return v
+		}
+		if nd, err := n.localDserv.Get(n.ctx, c); err == nil {
+			for _, l := range nd.Links() {
+				cv := walk(l.Cid)
+				if v.Err == "" {
+					v.Err = cv.Err
+				}
+				v.Gone = v.Gone || cv.Gone
+			}
+		}
+		memo[c] = v
+		return v
+	}
+	out := make([]serveVerdict, len(cs))
+	for i, c := range cs {
+		if n.ctx.Err() != nil { // shutting down: not checked, never "serves"
+			out[i] = serveVerdict{Err: "not checked: the node is stopping"}
+			continue
+		}
+		out[i] = walk(c)
+		if n.ctx.Err() != nil { // stopped during the walk: what it found (its reads failing) is no verdict
+			out[i] = serveVerdict{Err: "not checked: the node is stopping"}
+		}
+	}
+	return out
 }
 
 func (n *node) cidMissing(c cid.Cid) bool {
