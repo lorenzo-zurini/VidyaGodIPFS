@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	ipfspinner "github.com/ipfs/boxo/pinning/pinner"
 	"io"
 	"io/fs"
 	"math"
@@ -942,6 +943,9 @@ func perFetch() int64 {
 // So tokens are always returned exactly, with no separate exit-drain and no cross-goroutine race. The channel
 // closes when every block has been delivered or ctx is cancelled (the caller's stall watchdog / user-cancel).
 func fdiag(format string, args ...any) {
+	if !dbgFetch { // one line per fetch attempt: thousands while a library lands — a diagnosis's, not a session log's
+		return
+	}
 	fmt.Fprintf(os.Stderr, "[fetchdiag] "+format+"\n", args...)
 }
 
@@ -1145,6 +1149,10 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 			fdbg("writeThrough: .part loaded but tmp open FAILED (%v) → starting fresh cid=%s", oerr, cidStr)
 		}
 	}
+	// Bytes an earlier attempt wrote were checked by that attempt as they came, and are trusted to have reached the disk
+	// since: a sync that failed, or a card that acknowledged a write it lost, leaves the bitmap claiming garbage. The
+	// finalize of a resumed file reads it back (the pin's walk); a fresh one does not (every leaf checked on arrival).
+	resumed := out != nil && bits != nil && bits.nset > 0
 	if out == nil {
 		_ = os.RemoveAll(tmp)
 		f, cerr := os.Create(tmp)
@@ -1503,18 +1511,19 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 	fsns := make([]*posinfo.FilestoreNode, 0, len(leaves))
 	for _, lf := range leaves {
 		fsns = append(fsns, &posinfo.FilestoreNode{
-			Node:    &refLeaf{c: lf.c, size: lf.sz},
+			Node: &refLeaf{c: lf.c, size: lf.sz},
 			// Cleaned: the filestore checks the path against its root as a plain prefix, and on Windows a caller's
 			// "D:/a/x" is not under the root "D:\\" until its separators are native.
 			PosInfo: &posinfo.PosInfo{Offset: lf.off, FullPath: filepath.Clean(dest), Stat: st},
 		})
 	}
-	fdbg("finalize %s: dest size=%d, referencing %d leaves via PutMany (validates each leaf hash vs on-disk bytes)", root, st.Size(), len(fsns))
+	fdbg("finalize %s: dest size=%d, referencing %d leaves via PutMany (records path/offset/size: reads nothing)", root, st.Size(), len(fsns))
 	putStart := time.Now()
 	if err := fm.PutMany(n.ctx, fsns); err != nil { // one batched commit of all references
 		fdbg("PutMany(%s) FAILED after %s: %v (isMissingFile=%v)", root, time.Since(putStart).Round(time.Millisecond), err, isMissingFile(err))
-		// A CorruptReferenceError here means the bytes we just wrote to dest DON'T hash to their leaf CIDs — a
-		// corrupt/incomplete transfer, NOT a stale local reference. Returning errMissingFiles would send the wrapper
+		// PutMany records references without reading the file (boxo's FileManager), so this is not where a bad byte
+		// shows; a missing-file error here is the dest gone under us — a corrupt/incomplete transfer, NOT a stale
+		// local reference. Returning errMissingFiles would send the wrapper
 		// down dropRef (wrong medicine) AND leave the bad dest + partial in place, so every retry re-fails identically
 		// (the "errored missing files that keeps re-downloading" symptom). Instead DISCARD the bad output and the
 		// resume sidecar and report errIncomplete so the wrapper backs off and re-fetches from scratch.
@@ -1540,11 +1549,17 @@ func (n *node) writeThrough(nctx context.Context, root cid.Cid, rootNode ipld.No
 		onFinalize(100)
 	}
 
-	// Pin the root so it's seeded + reprovided (mirrors addNoCopy in the fallback path). Walks the DAG via the OFFLINE
-	// pinner dagservice (captured pre-goOnline) so leaves resolve from the filestore/disk, never the network.
+	// Pin the root so it's seeded + reprovided. For a file fetched in this attempt, RECORDED, not walked (PinWithMode,
+	// as addNoCopy's seed does): every leaf was hash-checked as it arrived and referenced into dest just above, so the
+	// walk proved nothing new — and read the whole file back and hashed it again (finalizeread_test.go). A resumed
+	// file's earlier bytes are walked: the walk is their only check (resumecheck_test.go).
 	fdbg("finalize: recursive PIN START cid=%s", cidStr)
 	pinStart := time.Now()
-	if err := n.pinner.Pin(n.ctx, rootNode, true, dest); err != nil {
+	pin := func() error { return n.pinner.PinWithMode(n.ctx, rootNode.Cid(), ipfspinner.Recursive, dest) }
+	if resumed { // bytes from an earlier attempt: read back and checked (the filestore hashes each leaf it reads)
+		pin = func() error { return n.pinner.Pin(n.ctx, rootNode, true, dest) }
+	}
+	if err := pin(); err != nil {
 		fdbg("finalize: PIN FAILED in %s cid=%s err=%v", time.Since(pinStart).Round(time.Millisecond), cidStr, err)
 		return localFatal(err)
 	}
@@ -1574,9 +1589,11 @@ func (n *node) dropClosure(root cid.Cid) {
 		if !seen.Visit(c) {
 			return
 		}
-		if nd, err := n.localDserv.Get(n.ctx, c); err == nil { // only present (cached) nodes are readable offline
-			for _, l := range nd.Links() {
-				walk(l.Cid)
+		if c.Prefix().Codec != cid.Raw { // a raw leaf has no links: never read (a cached one's bytes are the whole file)
+			if nd, err := n.localDserv.Get(n.ctx, c); err == nil { // only present (cached) nodes are readable offline
+				for _, l := range nd.Links() {
+					walk(l.Cid)
+				}
 			}
 		}
 		cids = append(cids, c)
@@ -1613,9 +1630,13 @@ func (n *node) dropRef(root cid.Cid) {
 		if !seen.Visit(c) {
 			return
 		}
-		if nd, err := n.localDserv.Get(n.ctx, c); err == nil {
-			for _, l := range nd.Links() {
-				walk(l.Cid)
+		// A raw leaf has no links: never read. Reading it read its 256 KiB back from the file and hashed it, so dropping
+		// a file read all of it — and a leaf whose file is gone logged a serve failure apiece (refdrop_test.go).
+		if c.Prefix().Codec != cid.Raw {
+			if nd, err := n.localDserv.Get(n.ctx, c); err == nil {
+				for _, l := range nd.Links() {
+					walk(l.Cid)
+				}
 			}
 		}
 		cids = append(cids, c)

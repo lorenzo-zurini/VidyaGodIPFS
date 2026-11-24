@@ -28,7 +28,6 @@ import (
 	dspinner "github.com/ipfs/boxo/pinning/pinner/dspinner"
 	cid "github.com/ipfs/go-cid"
 	datastore "github.com/ipfs/go-datastore"
-	dssync "github.com/ipfs/go-datastore/sync"
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	ipld "github.com/ipfs/go-ipld-format"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -146,7 +145,10 @@ func openNode(repoPath string) error {
 		return err
 	}
 	refGen := &atomic.Uint64{}
-	ds := refWatch{Batching: dssync.MutexWrap(ldb), gen: refGen}
+	// leveldb is safe for concurrent use and streams a query from an iterator (a snapshot): no mutex wrapper. Its
+	// Query read the whole result before giving the first entry — every reference scan held them all (~2.5 GB for
+	// 5.8 M references) and every write waited behind it (refscan_test.go).
+	ds := refWatch{Batching: ldb, gen: refGen}
 
 	bstore := blockstore.NewBlockstore(ds)
 	// FileManager references on-disk files, recorded relative to its root ("/"; a volume on Windows, filestoreroot.go).

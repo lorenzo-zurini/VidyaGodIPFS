@@ -236,6 +236,7 @@ func (n *node) goOnline() error {
 		gate.trace = activeDialTracer
 	}
 	libp2pOpts = append(libp2pOpts, libp2p.ConnectionGater(gate))
+	libp2pOpts = append(libp2pOpts, libp2p.SwarmOpts(swarm.WithDialRanker(localFirstRanker(localNets)))) // a peer beside us: across the room first (lanpath.go)
 	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return err

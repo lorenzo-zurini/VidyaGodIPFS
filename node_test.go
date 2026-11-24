@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -871,4 +872,45 @@ func TestMoveRefsFollowsARenamedFile(t *testing.T) {
 	if res := filestore.List(n.ctx, n.fstore, cOther); res == nil || filepath.Join("/", res.FilePath) != other {
 		t.Fatalf("a sibling whose name starts the same was re-pointed: %+v", res)
 	}
+}
+
+// A publish moves every renamed node file's references in ONE call — thousands of moves over millions of references —
+// so each reference finds its move by a lookup up its folders, not a comparison with every move (that cost ~4 s per
+// renamed file on a real library: a first publish took hours). 800 references × 40,000 moves is 32 M comparisons
+// the old way, seconds; the lookup takes milliseconds. Teeth: compare each reference with every move again.
+func TestMoveRefsManyMovesIsALookupPerReference(t *testing.T) {
+	n := offlineNode(t)
+	root := t.TempDir()
+	var cids []cid.Cid
+	for i := 0; i < 800; i++ {
+		p := filepath.Join(root, "lib", fmt.Sprintf("pkg%d", i%40), fmt.Sprintf("f%d.json", i))
+		writeFile(t, p, []byte(fmt.Sprintf(`{"LABEL":"%d"}`, i)))
+		c, err := n.addNoCopy(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cids = append(cids, c)
+	}
+	moves := make([]refMove, 0, 40001)
+	for i := 0; i < 40000; i++ { // other packages' renames: files that hold no reference here
+		moves = append(moves, refMove{filepath.Join(root, "other", fmt.Sprintf("p%d", i%500), fmt.Sprintf("x%d.json", i)), filepath.Join(root, "other", fmt.Sprintf("y%d.json", i))})
+	}
+	from, to := filepath.Join(root, "lib", "pkg7", "f7.json"), filepath.Join(root, "lib", "pkg7", "Label 7.json")
+	if err := os.Rename(from, to); err != nil {
+		t.Fatal(err)
+	}
+	moves = append(moves, refMove{from, to})
+	t0 := time.Now()
+	moved, err := n.moveRefs(n.ctx, moves...)
+	took := time.Since(t0)
+	if err != nil || moved != 1 {
+		t.Fatalf("moved %d (err %v), want the one renamed file's reference", moved, err)
+	}
+	if n.cidMissing(cids[7]) {
+		t.Fatal("the renamed file's reference did not follow it")
+	}
+	if took > 2*time.Second {
+		t.Fatalf("one move of %d paths over %d references took %v: each reference is compared with every move", len(moves), len(cids), took)
+	}
+	t.Logf("%d moves over %d references: %v", len(moves), len(cids), took)
 }

@@ -12,7 +12,9 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 
 	"github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
@@ -24,11 +26,16 @@ type refMove struct{ from, to string }
 
 // moveRefs re-points every filestore reference whose file lies under a move's from to the same relative path under
 // its to — the longest from that holds the file wins (a landed folder whose files moved up, inside the package dir
-// that moved) — in ONE scan of the references (each scan reads the whole index: ~0.5 s on a 60 GB library).
+// that moved) — in ONE scan of the references (each scan reads the whole index: ~7 s for 5.8 M references).
+// Each reference looks its own path and the folders above it up in the moves, nearest first: the first found is
+// the longest from that holds it. Comparing every reference with every move cost a publish ~4 s per renamed node
+// file (5.8 M references × the package's renames), hours for a library's first publish.
 // Returns how many references moved.
 func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
-	for i := range moves {
-		moves[i] = refMove{filepath.Clean(moves[i].from), filepath.Clean(moves[i].to)}
+	moveRefScans.Add(1)
+	to := make(map[string]string, len(moves)) // from (folded where the file system folds case) → to
+	for _, m := range moves {
+		to[refKey(filepath.Clean(m.from))] = filepath.Clean(m.to)
 	}
 	next, err := filestore.ListAll(ctx, n.fstore, false)
 	if err != nil {
@@ -40,26 +47,21 @@ func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
 			continue // a plain block, not a reference
 		}
 		p := filepath.Join(fileRoot, r.FilePath)
-		best, bestRel := -1, ""
-		for i, m := range moves {
-			rel, err := filepath.Rel(m.from, p)
-			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				continue // not under this move's folder
+		for dir := p; ; {
+			if dest, ok := to[refKey(dir)]; ok {
+				rel := strings.TrimPrefix(p[len(dir):], string(filepath.Separator))
+				moved = append(moved, &posinfo.FilestoreNode{
+					Node:    &refLeaf{c: r.Key, size: int(r.Size)},
+					PosInfo: &posinfo.PosInfo{Offset: r.Offset, FullPath: filepath.Join(dest, rel)},
+				})
+				break
 			}
-			if rel == "." {
-				rel = "" // the file itself moved
+			up := filepath.Dir(dir)
+			if up == dir {
+				break // the root: no move holds this file
 			}
-			if best < 0 || len(m.from) > len(moves[best].from) {
-				best, bestRel = i, rel
-			}
+			dir = up
 		}
-		if best < 0 {
-			continue
-		}
-		moved = append(moved, &posinfo.FilestoreNode{
-			Node:    &refLeaf{c: r.Key, size: int(r.Size)},
-			PosInfo: &posinfo.PosInfo{Offset: r.Offset, FullPath: filepath.Join(moves[best].to, bestRel)},
-		})
 	}
 	if len(moved) == 0 {
 		return 0, nil
@@ -68,4 +70,16 @@ func (n *node) moveRefs(ctx context.Context, moves ...refMove) (int, error) {
 		return 0, err
 	}
 	return len(moved), nil
+}
+
+// moveRefScans counts moveRefs' scans of the whole reference index (a test reads it: a publish moves its references
+// in one).
+var moveRefScans atomic.Int64
+
+// refKey is how a path is compared with a move's from: as the file system compares names (Windows folds case).
+func refKey(p string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(p)
+	}
+	return p
 }

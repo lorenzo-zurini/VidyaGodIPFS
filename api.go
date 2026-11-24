@@ -877,6 +877,16 @@ var netHoldsTaken atomic.Int64
 //export VgDebugNetHolds
 func VgDebugNetHolds() C.longlong { return C.longlong(netHoldsTaken.Load()) }
 
+// VgDebugRefScans: how many whole-index scans the orphan check (orphanedRefPaths) has made since start. Tests only.
+//
+//export VgDebugRefScans
+func VgDebugRefScans() C.longlong { return C.longlong(refScans.Load()) }
+
+// VgDebugMoveRefScans: how many whole-index scans moving references has made since start. Tests only.
+//
+//export VgDebugMoveRefScans
+func VgDebugMoveRefScans() C.longlong { return C.longlong(moveRefScans.Load()) }
+
 // VgDebugNetForegroundIdle: 1 when no fetch holds or waits for a slot and nobody holds the foreground. Tests only.
 //
 //export VgDebugNetForegroundIdle
