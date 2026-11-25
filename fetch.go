@@ -756,6 +756,12 @@ func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProg
 	if err != nil {
 		return localFatal(err) // malformed CID — no retry can fix it
 	}
+	// A bounded fetch is a node file: one raw block, nothing else. A file DAG's root says its own size, and its links
+	// can repeat one leaf any number of times — written out, a few kilobytes fetched fill the disk. Refused before any
+	// block is asked for.
+	if bound > 0 && c.Type() != cid.Raw {
+		return localFatal(fmt.Errorf("%w: %s is not a single raw block", errTooLarge, cidStr))
+	}
 	// Freshen provider addresses for an attempt that is NOT being served by the peers we are connected to (warm.go):
 	// a provider that restarted (new ports) or a NAT'd seeder is re-discovered/holepunched instead of the C++ rotation
 	// re-dialing a stale peerstore forever. Ends with this attempt. All no-op offline.

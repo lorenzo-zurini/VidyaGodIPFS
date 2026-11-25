@@ -169,7 +169,9 @@ func (s *socialState) upsertChanged(peerID string, mutate func(c *contact)) (con
 const maxIncoming = 64
 
 // makeRoomForIncoming drops the oldest waiting requests until a new one fits under maxIncoming.
-func (s *socialState) makeRoomForIncoming() {
+// It returns the peers dropped (the caller announces them), and does not save: the new request's own save that
+// follows writes the address book once.
+func (s *socialState) makeRoomForIncoming() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var waiting []*contact
@@ -179,13 +181,15 @@ func (s *socialState) makeRoomForIncoming() {
 		}
 	}
 	if len(waiting) < maxIncoming {
-		return
+		return nil
 	}
 	sort.Slice(waiting, func(i, j int) bool { return waiting[i].AddedAt < waiting[j].AddedAt })
+	var dropped []string
 	for _, c := range waiting[:len(waiting)-maxIncoming+1] {
 		delete(s.contacts, c.PeerID)
+		dropped = append(dropped, c.PeerID)
 	}
-	s.saveLocked()
+	return dropped
 }
 
 // get returns a copy of a contact and whether it exists.

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	unixfs "github.com/ipfs/boxo/ipld/unixfs"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
 	peer "github.com/libp2p/go-libp2p/core/peer"
 )
@@ -347,5 +349,38 @@ func TestANodeFileFetchIsBounded(t *testing.T) {
 	}
 	if err := n.fetchToPath(cb.String(), filepath.Join(dir, "out", "content.bin"), nil, nil); err != nil {
 		t.Fatalf("an unbounded fetch of the same file failed: %v", err)
+	}
+	// A file root that under-declares its size, linking one leaf many times: what it says is not looked at — a node
+	// file is one raw block, and nothing else is fetched. (Teeth: trust the declared size — 10 bytes passes, and the
+	// leaf is written out 64 times.)
+	leaf := merkledag.NewRawNode(bytes.Repeat([]byte("z"), 64<<10))
+	if err := n.dserv.Add(n.ctx, leaf); err != nil {
+		t.Fatal(err)
+	}
+	fsn := unixfs.NewFSNode(unixfs.TFile)
+	for i := 0; i < 64; i++ {
+		fsn.AddBlockSize(0)
+	}
+	fsn.SetData(nil)
+	data, err := fsn.GetBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	liar := merkledag.NodeWithData(data)
+	for i := 0; i < 64; i++ {
+		if err := liar.AddNodeLink("", leaf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := n.dserv.Add(n.ctx, liar); err != nil {
+		t.Fatal(err)
+	}
+	lied := filepath.Join(dir, "out", "liar.json")
+	err = n.fetchToPath(liar.Cid().String(), lied, nil, nil, maxNodeBytes)
+	if err == nil || !strings.Contains(err.Error(), "not a single raw block") || classifyFetchErr(liar.Cid().String(), err) != fetchTerminal {
+		t.Fatalf("an under-declaring file root: err=%v (want a terminal refusal before it is fetched)", err)
+	}
+	if st, serr := os.Stat(lied); serr == nil {
+		t.Fatalf("the under-declaring root landed %d bytes", st.Size())
 	}
 }

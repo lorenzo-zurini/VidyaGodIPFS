@@ -228,7 +228,9 @@ func (f *peerService) dispatch(remote string, m peerMsg) {
 		// completes the handshake → accepted.
 		var kind = evPeerRequest
 		if _, known := f.social.get(remote); !known {
-			f.social.makeRoomForIncoming()
+			for _, gone := range f.social.makeRoomForIncoming() { // the oldest waiting ones go, and the GUI is told
+				f.emit(evPeerRemoved, fmt.Sprintf(`{"peer":%q}`, gone))
+			}
 		}
 		c, changed := f.social.upsertChanged(remote, func(c *contact) {
 			if m.Nick != "" {

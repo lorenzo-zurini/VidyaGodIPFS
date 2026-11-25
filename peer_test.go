@@ -540,7 +540,12 @@ func TestPresenceLivenessToggles(t *testing.T) {
 // every request (the book grows without bound).
 func TestRequestFloodIsBounded(t *testing.T) {
 	s := newSocialState(t.TempDir())
-	f := newPeerService(context.Background(), nil, nil, s, nil)
+	var removed []string
+	f := newPeerService(context.Background(), nil, nil, s, func(kind int, payload string) {
+		if kind == evPeerRemoved {
+			removed = append(removed, payload)
+		}
+	})
 	f.dispatch("12D3KooWSame", peerMsg{Type: "request", Nick: "x"})
 	before := s.saves
 	for i := 0; i < 50; i++ {
@@ -549,9 +554,17 @@ func TestRequestFloodIsBounded(t *testing.T) {
 	if s.saves != before {
 		t.Fatalf("the same request rewrote the address book %d times", s.saves-before)
 	}
+	savesBefore := s.saves
 	for i := 0; i < maxIncoming+20; i++ {
 		f.dispatch(fmt.Sprintf("12D3KooWFlood%03d", i), peerMsg{Type: "request"})
 		time.Sleep(time.Millisecond) // distinct AddedAt
+	}
+	// One save per new request, the eviction included (it was two past the bound); each one dropped is announced.
+	if got := s.saves - savesBefore; got != maxIncoming+20 {
+		t.Fatalf("%d requests saved the address book %d times", maxIncoming+20, got)
+	}
+	if len(removed) != 21 { // the bound is 64 waiting: "Same" + the first 63 fit, 21 go
+		t.Fatalf("%d dropped requests announced, want 21", len(removed))
 	}
 	incoming := 0
 	for _, c := range s.list() {
