@@ -144,6 +144,11 @@ func VgPeerAccept(peerID *C.char, errOut **C.char) C.int {
 func VgPeerDecline(peerID *C.char, errOut **C.char) C.int {
 	f := peerSvc()
 	if f == nil {
+		// Offline (or not yet online): the address book still says it — the decline message is best-effort anyway.
+		if n := get(); n != nil && n.social != nil {
+			n.social.remove(C.GoString(peerID))
+			return 0
+		}
 		setStr(errOut, "networking is offline")
 		return -1
 	}
@@ -157,6 +162,11 @@ func VgPeerDecline(peerID *C.char, errOut **C.char) C.int {
 func VgPeerBlock(peerID *C.char, errOut **C.char) C.int {
 	f := peerSvc()
 	if f == nil {
+		// Offline: blocked in the address book now, so the peer is no peer when the host comes up.
+		if n := get(); n != nil && n.social != nil {
+			n.social.upsert(C.GoString(peerID), func(c *contact) { c.State = stBlocked; c.online = false })
+			return 0
+		}
 		setStr(errOut, "networking is offline")
 		return -1
 	}

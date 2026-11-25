@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -313,5 +314,38 @@ func TestAnUnreadableRepairIsDiscarded(t *testing.T) {
 	_ = n.fetchToPath(c.String(), dest, nil, nil) // offline: the fresh fetch after the discard finds nobody
 	if _, err := os.Stat(dest); err == nil {
 		t.Fatal("an unreadable file was kept, its repair taken for a store failure")
+	}
+}
+
+// A node file a peer's snapshot names is at most a node's size: a larger one is refused from its root before a byte
+// lands, terminally (never retried); one within the bound lands. Teeth: no bound (the 300 KiB file lands as a "node").
+func TestANodeFileFetchIsBounded(t *testing.T) {
+	n := offlineNode(t)
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.bin")
+	writeFile(t, big, bytes.Repeat([]byte("x"), 300<<10))
+	small := filepath.Join(dir, "small.bin")
+	writeFile(t, small, bytes.Repeat([]byte("y"), 100<<10))
+	cb, err := n.addNoCopy(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := n.addNoCopy(small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "out", "node.json")
+	err = n.fetchToPath(cb.String(), dest, nil, nil, maxNodeBytes)
+	if err == nil || !strings.Contains(err.Error(), errTooLarge.Error()) || classifyFetchErr(cb.String(), err) != fetchTerminal {
+		t.Fatalf("a 300 KiB node file: err=%v (want a terminal too-large refusal)", err)
+	}
+	if _, serr := os.Stat(dest); serr == nil {
+		t.Fatal("the over-large node file landed")
+	}
+	if err := n.fetchToPath(cs.String(), dest, nil, nil, maxNodeBytes); err != nil {
+		t.Fatalf("a 100 KiB node file was refused: %v", err)
+	}
+	if err := n.fetchToPath(cb.String(), filepath.Join(dir, "out", "content.bin"), nil, nil); err != nil {
+		t.Fatalf("an unbounded fetch of the same file failed: %v", err)
 	}
 }

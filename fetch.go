@@ -29,6 +29,8 @@ import (
 	files "github.com/ipfs/boxo/files"
 	filestore "github.com/ipfs/boxo/filestore"
 	posinfo "github.com/ipfs/boxo/filestore/posinfo"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
+	unixfs "github.com/ipfs/boxo/ipld/unixfs"
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 	ufsio "github.com/ipfs/boxo/ipld/unixfs/io"
 	blocks "github.com/ipfs/go-block-format"
@@ -515,10 +517,12 @@ func lockDest(dest string) func() {
 	}
 }
 
-func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64)) error {
+// maxBytes (optional): the most the file may be — a node file a peer's snapshot names is kilobytes; past the bound it is
+// refused before a byte lands (terminal: never retried, never pinned, never re-provided).
+func (n *node) fetchToPath(cidStr, dest string, onProgress, onFinalize func(pct float64), maxBytes ...int64) error {
 	unlock := lockDest(dest)
 	defer unlock()
-	err := n.fetchToPathOnce(n.ctx, cidStr, dest, onProgress, onFinalize)
+	err := n.fetchToPathOnce(n.ctx, cidStr, dest, onProgress, onFinalize, maxBytes...)
 	if err == errMissingFiles {
 		if c, derr := cid.Decode(cidStr); derr == nil {
 			n.dropRef(c) // clear the stale ref (+ cached blocks) so the next dispatch fetches over the network
@@ -716,7 +720,33 @@ func (n *node) fetchDirOnce(cidStr, dest string, onProgress func(pct float64), o
 // onProgress is called with 0..100 during the transfer; onFinalize is called once the bytes are all down and the
 // (slower) re-reference/"pinning" step runs — with 0..100 progress through that step on the write-through path, or -1
 // (indeterminate) on the fallback re-add path (so the UI can show "Pinning… 42%" instead of looking stuck at 100%).
-func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64)) error {
+// maxNodeBytes bounds a node file (format: a node is at most 256 KiB).
+const maxNodeBytes int64 = 256 << 10
+
+var errTooLarge = errors.New("larger than it may be")
+
+// declaredFileSize is what a UnixFS file root says its file is: a raw leaf's own length, a dag-pb file's FileSize;
+// -1 for anything else.
+func declaredFileSize(root ipld.Node) int64 {
+	if root.Cid().Type() == cid.Raw {
+		return int64(len(root.RawData()))
+	}
+	pn, ok := root.(*merkledag.ProtoNode)
+	if !ok {
+		return -1
+	}
+	fsn, err := unixfs.FSNodeFromBytes(pn.Data())
+	if err != nil {
+		return -1
+	}
+	return int64(fsn.FileSize())
+}
+
+func (n *node) fetchToPathOnce(nctx context.Context, cidStr, dest string, onProgress func(pct float64), onFinalize func(pct float64), maxBytes ...int64) error {
+	var bound int64
+	if len(maxBytes) > 0 {
+		bound = maxBytes[0]
+	}
 	if isCancelled(cidStr) {
 		return errors.New("cancelled")
 	}
@@ -809,6 +839,11 @@ fetchFresh:
 		return err
 	}
 	fdbg("fetchToPathOnce: got root block codec=%d in %s cid=%s", root.Cid().Prefix().Codec, time.Since(getStart).Round(time.Millisecond), cidStr)
+	if bound > 0 {
+		if sz := declaredFileSize(root); sz < 0 || sz > bound {
+			return localFatal(fmt.Errorf("%w: %s declares %d bytes, over the %d-byte bound", errTooLarge, cidStr, sz, bound))
+		}
+	}
 	fdbg("fetchToPathOnce: %s", n.connsDump()) // RELAYED vs DIRECT to the seeder — the throughput ceiling
 
 	// Fast path: stream the fetched leaf blocks straight to dest AND reference them in place — no re-chunk/re-hash
@@ -817,6 +852,13 @@ fetchFresh:
 	fdbg("writeThrough(%s) -> %v", cidStr, wtErr)
 	if err := wtErr; err == nil {
 		n.scheduleCompaction() // reclaim tombstone disk from the leaves we dropped from the blockstore
+		if bound > 0 {         // a root can under-declare: what landed decides
+			if st, serr := os.Stat(dest); serr == nil && st.Size() > bound {
+				n.dropRef(c)
+				_ = os.Remove(dest)
+				return localFatal(fmt.Errorf("%w: %s landed %d bytes, over the %d-byte bound", errTooLarge, cidStr, st.Size(), bound))
+			}
+		}
 		return nil
 	} else if err == errIncomplete {
 		return errIncomplete // stalled/dropped mid-transfer — partial kept; the wrapper backs off + resumes

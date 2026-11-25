@@ -81,6 +81,7 @@ type peerMsg struct {
 // is rejected before it touches memory-resident state or config.
 const (
 	maxPeerMsgBytes  = 8 << 20 // 8 MiB per inbound message — bounds the pre-auth decode buffer
+	maxPeerMsgs      = 8       // messages per inbound stream: a real burst is one or two; more is a flood
 	maxSharedLibs    = 4096    // libraries per snapshot
 	maxLibCids       = 100000  // shared items per library
 	maxLibNameLen    = 256     // library-name length
@@ -201,7 +202,7 @@ func (f *peerService) handleStream(s network.Stream) {
 	// before the stAccepted/size gates in dispatch ever run. send() opens a one-shot stream per burst, so this cap
 	// comfortably covers a real message set while killing the pre-auth memory-DoS.
 	dec := json.NewDecoder(io.LimitReader(s, maxPeerMsgBytes))
-	for {
+	for n := 0; n < maxPeerMsgs; n++ {
 		var m peerMsg
 		if err := dec.Decode(&m); err != nil {
 			return // EOF, over-cap, or malformed → done with this stream
@@ -226,7 +227,10 @@ func (f *peerService) dispatch(remote string, m peerMsg) {
 		// the UI can show who's asking. If we had ALREADY sent them a request (pending), their request crossing ours
 		// completes the handshake → accepted.
 		var kind = evPeerRequest
-		c := f.social.upsert(remote, func(c *contact) {
+		if _, known := f.social.get(remote); !known {
+			f.social.makeRoomForIncoming()
+		}
+		c, changed := f.social.upsertChanged(remote, func(c *contact) {
 			if m.Nick != "" {
 				c.Nick = m.Nick
 			}
@@ -240,7 +244,9 @@ func (f *peerService) dispatch(remote string, m peerMsg) {
 				c.State = stIncoming
 			}
 		})
-		f.emitContact(kind, c)
+		if changed {
+			f.emitContact(kind, c) // the same request again changes nothing: no save, no event (the GUI refreshes on each)
+		}
 		// Mutual crossing: we just flipped THEM to accepted off their inbound request because WE were already
 		// pending. They, however, only know they sent a request — our matching request may never have reached them
 		// (common: whoever started second couldn't yet resolve the other, so their initial send failed). Tell them
@@ -282,8 +288,10 @@ func (f *peerService) dispatch(remote string, m peerMsg) {
 			f.emitContact(evPeerAccept, c)
 		}
 	case "decline":
+		// The peer ended the pairing: what we shared with it ends too (a pairing made again starts from fresh consent).
 		if c, ok := f.social.get(remote); ok {
 			f.social.remove(remote)
+			f.purgeShares(remote)
 			f.emitContact(evPeerDecline, c)
 		}
 	case "profile":

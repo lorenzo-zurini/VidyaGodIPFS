@@ -633,6 +633,9 @@ func (o *overlayService) datagramRecvLoop(c network.Conn, qc *quic.Conn) {
 		if o.linkm != nil {
 			o.linkm.noteRx(c.RemotePeer())
 		}
+		if !o.admitInbound(c.RemotePeer(), pkt) {
+			continue // unticked, no longer a peer, or not from its own address
+		}
 		o.mu.Lock()
 		link := o.link
 		o.mu.Unlock()
@@ -725,13 +728,7 @@ func (o *overlayService) handleInbound(s network.Stream) {
 	// handler is registered on the public host at goOnline — without this check ANY dialable peer could open
 	// /vidyagod/overlay/1.0.0 and inject arbitrary L3 frames into the game's netns. Only peers may speak here.
 	remote := s.Conn().RemotePeer()
-	authorized := func() bool {
-		o.mu.Lock()
-		_, isRoute := routesContain(o.routes, remote)
-		o.mu.Unlock()
-		return isRoute || (o.linkm != nil && o.linkm.has(remote))
-	}
-	if !authorized() {
+	if !o.admitInbound(remote, nil) {
 		vlog("overlay", "REJECT inbound overlay stream from non-peer %s", shortPeer(remote.String()))
 		return
 	}
@@ -743,12 +740,15 @@ func (o *overlayService) handleInbound(s network.Stream) {
 		// Re-checked PER FRAME, not just at open: a peer removed mid-session keeps their long-lived stream,
 		// and the never-ClosePeer policy means the conn won't die on its own — revocation must close this door
 		// (adversarial round-2). One mutex + map hit per frame; the stream path is not the fast path.
-		if !authorized() {
-			vlog("overlay", "REJECT: %s lost authorization mid-stream", shortPeer(remote.String()))
-			return
-		}
 		if _, ok := ipv4Dst(pkt); !ok {
 			continue // not an IPv4 packet — never inject junk into the TUN
+		}
+		if !o.admitInbound(remote, pkt) {
+			if !o.admitInbound(remote, nil) {
+				vlog("overlay", "REJECT: %s lost authorization mid-stream", shortPeer(remote.String()))
+				return
+			}
+			continue // a packet not from its own address: dropped
 		}
 		o.mu.Lock()
 		link := o.link
@@ -763,6 +763,37 @@ func (o *overlayService) handleInbound(s network.Stream) {
 			return
 		}
 	}
+}
+
+// admitInbound decides whether a packet from remote enters the game's link: the sender is a session or maintained peer
+// that is not unticked from the virtual LAN (its packets are refused as ours to it are), and the packet comes from its
+// own address — its vIP (or 0.0.0.0, a discovery broadcast before an address): one peer cannot speak as another, and a
+// game that trusts source addresses (most LAN games) cannot be fooled into a kick or a forged player.
+func (o *overlayService) admitInbound(remote peer.ID, pkt []byte) bool {
+	src, srcOK := ipv4Src(pkt)
+	o.mu.Lock()
+	_, isRoute := routesContain(o.routes, remote)
+	owner, routed := o.routes[src]
+	o.mu.Unlock()
+	o.exclMu.Lock()
+	excluded := o.excluded[remote]
+	o.exclMu.Unlock()
+	if excluded || !(isRoute || (o.linkm != nil && o.linkm.has(remote))) {
+		return false
+	}
+	if pkt == nil {
+		return true // the stream's open, before any packet
+	}
+	//Its own address: the one the routing table gives it, else the one its ID derives.
+	return srcOK && ((routed && owner == remote) || (!routed && src == lanVIP(remote.String())) || src == "0.0.0.0")
+}
+
+// ipv4Src extracts the source IP of an IPv4 packet (bytes 12..15), or ("",false) for non-IPv4 / too short.
+func ipv4Src(pkt []byte) (string, bool) {
+	if len(pkt) < 20 || pkt[0]>>4 != 4 {
+		return "", false
+	}
+	return net.IPv4(pkt[12], pkt[13], pkt[14], pkt[15]).String(), true
 }
 
 // ipv4Dst extracts the destination IP of an IPv4 packet (bytes 16..19), or ("",false) for non-IPv4 / too short.

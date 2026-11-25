@@ -791,9 +791,12 @@ func VgFetchOnce(cidStr *C.char, dest *C.char, isDir C.int, errOut **C.char) C.i
 	emit(kindStarted, -1, 0, nil)
 	fdiag("VgFetchOnce mode=%d cid=%s", int(isDir), cs)
 	var err error
-	if isDir != 0 {
+	switch isDir {
+	case 1:
 		err = n.fetchDirToPath(cs, d, onP, onF)
-	} else {
+	case 2: // a node file a peer's snapshot names: at most a node's size, or refused before it lands
+		err = n.fetchToPath(cs, d, onP, onF, maxNodeBytes)
+	default:
 		err = n.fetchToPath(cs, d, onP, onF) // single attempt; clears a stale ref on errMissingFiles
 	}
 	rc := classifyFetchErr(cs, err)

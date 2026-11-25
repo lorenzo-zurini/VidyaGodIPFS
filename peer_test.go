@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -531,5 +532,96 @@ func TestPresenceLivenessToggles(t *testing.T) {
 	// online is transient: a reload never resurrects it.
 	if c, _ := newSocialState(dir).get("12D3KooWPeer"); c.online {
 		t.Fatal("online state must not persist across reload")
+	}
+}
+
+// A stranger can open a stream and send requests: the same request again changes nothing (no address-book write, no
+// event), and at most maxIncoming requests wait — the oldest go. Teeth: write on every request (the count grows); keep
+// every request (the book grows without bound).
+func TestRequestFloodIsBounded(t *testing.T) {
+	s := newSocialState(t.TempDir())
+	f := newPeerService(context.Background(), nil, nil, s, nil)
+	f.dispatch("12D3KooWSame", peerMsg{Type: "request", Nick: "x"})
+	before := s.saves
+	for i := 0; i < 50; i++ {
+		f.dispatch("12D3KooWSame", peerMsg{Type: "request", Nick: "x"})
+	}
+	if s.saves != before {
+		t.Fatalf("the same request rewrote the address book %d times", s.saves-before)
+	}
+	for i := 0; i < maxIncoming+20; i++ {
+		f.dispatch(fmt.Sprintf("12D3KooWFlood%03d", i), peerMsg{Type: "request"})
+		time.Sleep(time.Millisecond) // distinct AddedAt
+	}
+	incoming := 0
+	for _, c := range s.list() {
+		if c.State == stIncoming {
+			incoming++
+		}
+	}
+	if incoming > maxIncoming {
+		t.Fatalf("%d requests wait, more than %d", incoming, maxIncoming)
+	}
+	if _, ok := s.get("12D3KooWFlood000"); ok {
+		t.Fatal("the oldest waiting request was kept past the bound")
+	}
+	if _, ok := s.get(fmt.Sprintf("12D3KooWFlood%03d", maxIncoming+19)); !ok {
+		t.Fatal("the newest request was dropped")
+	}
+}
+
+// One inbound stream carries at most maxPeerMsgs messages: a stream packed with thousands is cut there. Teeth: read
+// to EOF (the last profile message wins).
+func TestOneStreamCarriesFewMessages(t *testing.T) {
+	hA, hB := testHost(t), testHost(t)
+	connectHosts(t, hA, hB)
+	sB := newSocialState(t.TempDir())
+	fB := newPeerService(context.Background(), hB, nil, sB, nil)
+	fB.start()
+	st, err := hA.NewStream(context.Background(), hB.ID(), peerProtoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(st)
+	_ = enc.Encode(peerMsg{Type: "request", Nick: "n0"})
+	for i := 1; i < 40; i++ {
+		_ = enc.Encode(peerMsg{Type: "profile", Nick: fmt.Sprintf("n%d", i)})
+	}
+	_ = st.CloseWrite()
+	deadline := time.Now().Add(3 * time.Second)
+	var c contact
+	for time.Now().Before(deadline) {
+		c, _ = sB.get(hA.ID().String())
+		if c.Nick == fmt.Sprintf("n%d", maxPeerMsgs-1) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	c, _ = sB.get(hA.ID().String())
+	if c.Nick != fmt.Sprintf("n%d", maxPeerMsgs-1) {
+		t.Fatalf("after one stream the nick is %q, want n%d (the stream read past %d messages, or not at all)", c.Nick, maxPeerMsgs-1, maxPeerMsgs)
+	}
+}
+
+// A peer that ends the pairing ends what we share with it too: a pairing made again starts from fresh consent.
+// Teeth: drop the purge (shareLibs keeps the old share).
+func TestTheirDeclinePurgesOurShares(t *testing.T) {
+	s := newSocialState(t.TempDir())
+	f := newPeerService(context.Background(), nil, nil, s, nil)
+	const peer = "12D3KooWDecliner"
+	s.upsert(peer, func(c *contact) { c.State = stAccepted })
+	f.shareMu.Lock()
+	if f.shareLibs == nil {
+		f.shareLibs = map[string]map[string][]shareItem{}
+	}
+	f.shareLibs[peer] = map[string][]shareItem{"Games": nil}
+	f.shareMu.Unlock()
+	f.dispatch(peer, peerMsg{Type: "decline"})
+	f.shareMu.Lock()
+	_, still := f.shareLibs[peer]
+	f.shareMu.Unlock()
+	if still {
+		t.Fatal("their decline left what we share with them")
 	}
 }

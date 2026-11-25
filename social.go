@@ -50,6 +50,7 @@ type profile struct {
 
 // socialState is the persistent address book + self profile. Guarded by mu; all mutators persist through save().
 type socialState struct {
+	saves    int // writes of the address book (a test counts them)
 	mu       sync.Mutex
 	path     string // <repo>/social.json
 	self     profile
@@ -102,6 +103,7 @@ func (s *socialState) load() {
 
 // save atomically rewrites social.json. Caller holds mu.
 func (s *socialState) saveLocked() {
+	s.saves++
 	d := diskSocial{Profile: s.self}
 	for _, c := range s.contacts {
 		d.Contacts = append(d.Contacts, c)
@@ -135,19 +137,55 @@ func (s *socialState) getProfile() profile {
 
 // upsert creates-or-updates a contact under mu and returns a copy for event emission. mutate runs with the entry.
 func (s *socialState) upsert(peerID string, mutate func(c *contact)) contact {
+	c, _ := s.upsertChanged(peerID, mutate)
+	return c
+}
+
+// upsertChanged is upsert that says whether anything changed — and writes the address book only then: a peer (or a
+// stranger) repeating the same request must not cost a whole social.json rewrite each time.
+func (s *socialState) upsertChanged(peerID string, mutate func(c *contact)) (contact, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.contacts[peerID]
-	if c == nil {
+	created := c == nil
+	if created {
 		// Stateless on creation: each caller sets the intended state explicitly (addPeer→pending,
 		// acceptPeer→accepted, the request handler→incoming). A default of pending would make the request
 		// handler mistake a brand-new inbound contact for a mutual crossing.
 		c = &contact{PeerID: peerID, AddedAt: time.Now().UnixMilli()}
 		s.contacts[peerID] = c
 	}
+	before := *c
 	mutate(c)
+	changed := created || before != *c
+	if changed {
+		s.saveLocked()
+	}
+	return *c, changed
+}
+
+// maxIncoming bounds the requests waiting for an answer: anyone can send one (a peer ID is free to make), and each is
+// kept and shown. Past it, the oldest waiting request goes.
+const maxIncoming = 64
+
+// makeRoomForIncoming drops the oldest waiting requests until a new one fits under maxIncoming.
+func (s *socialState) makeRoomForIncoming() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var waiting []*contact
+	for _, c := range s.contacts {
+		if c.State == stIncoming {
+			waiting = append(waiting, c)
+		}
+	}
+	if len(waiting) < maxIncoming {
+		return
+	}
+	sort.Slice(waiting, func(i, j int) bool { return waiting[i].AddedAt < waiting[j].AddedAt })
+	for _, c := range waiting[:len(waiting)-maxIncoming+1] {
+		delete(s.contacts, c.PeerID)
+	}
 	s.saveLocked()
-	return *c
 }
 
 // get returns a copy of a contact and whether it exists.
@@ -209,8 +247,10 @@ func (s *socialState) setPresence(peerID string, online bool) (bool, contact) {
 	changed := c.online != online
 	c.online = online
 	if online {
-		c.LastSeen = time.Now().UnixMilli()
-		s.saveLocked()
+		c.LastSeen = time.Now().UnixMilli() // kept in memory; written with the next change (a ping each 45 s is no save)
+		if changed {
+			s.saveLocked()
+		}
 	}
 	return changed, *c
 }

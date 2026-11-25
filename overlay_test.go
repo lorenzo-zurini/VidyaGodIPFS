@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"io"
 	"testing"
 	"time"
@@ -282,5 +283,34 @@ func TestAttachTearsDownLeftoverState(t *testing.T) {
 	o.mu.Unlock()
 	if cur != packetLink(newLink) || !running {
 		t.Fatalf("new link not installed cleanly (running=%v)", running)
+	}
+}
+
+// A packet enters the game only from a peer that is in the virtual LAN (not unticked) and only from its own address:
+// an unticked peer's packets are refused as ours to it are, and one peer cannot send as another (most LAN games trust
+// source addresses). Teeth: admit by routing alone (the excluded peer and the forged source get in).
+func TestOverlayAdmitsOnlyAPeersOwnPackets(t *testing.T) {
+	hA, hB, hC := testHost(t), testHost(t), testHost(t)
+	o := newOverlayService(context.Background(), hA, nil, nil)
+	bVIP, cVIP := [4]byte{10, 66, 5, 2}, [4]byte{10, 66, 5, 3}
+	if err := o.configure("10.66.5.1", "10.66.0.0/16", map[string]string{"10.66.5.2": hB.ID().String(), "10.66.5.3": hC.ID().String()}); err != nil {
+		t.Fatal(err)
+	}
+	me := [4]byte{10, 66, 5, 1}
+	if !o.admitInbound(hB.ID(), ipv4Packet(bVIP, me, nil)) {
+		t.Fatal("B's own packet was refused")
+	}
+	if o.admitInbound(hB.ID(), ipv4Packet(cVIP, me, nil)) {
+		t.Fatal("B sending as C was let in")
+	}
+	if !o.admitInbound(hB.ID(), ipv4Packet([4]byte{0, 0, 0, 0}, [4]byte{255, 255, 255, 255}, nil)) {
+		t.Fatal("a discovery broadcast before an address was refused")
+	}
+	o.setExcluded(map[peer.ID]bool{hB.ID(): true})
+	if o.admitInbound(hB.ID(), ipv4Packet(bVIP, me, nil)) {
+		t.Fatal("an unticked peer's packet was let in")
+	}
+	if !o.admitInbound(hC.ID(), ipv4Packet(cVIP, me, nil)) {
+		t.Fatal("C's own packet was refused")
 	}
 }
