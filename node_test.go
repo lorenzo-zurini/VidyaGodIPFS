@@ -914,3 +914,44 @@ func TestMoveRefsManyMovesIsALookupPerReference(t *testing.T) {
 	}
 	t.Logf("%d moves over %d references: %v", len(moves), len(cids), took)
 }
+
+// A node closing waits on its compaction, the DHT, the host — outside gMu: every Vg* call (get) answers at once that
+// the node is off, instead of waiting out the whole teardown (the GUI froze for it). A start waits for the close (the
+// closing node holds the repo). Teeth: close under gMu (get blocks until the close ends).
+func TestClosingANodeDoesNotHoldEveryCall(t *testing.T) {
+	repo := t.TempDir()
+	if err := openNode(repo); err != nil {
+		t.Fatal(err)
+	}
+	n := get()
+	if n == nil {
+		t.Fatal("no node after open")
+	}
+	n.compactWG.Add(1) // a compaction "in flight": the close waits for it
+	closed := make(chan struct{})
+	go func() { closeNode(); close(closed) }()
+	time.Sleep(200 * time.Millisecond)
+	got := make(chan *node, 1)
+	go func() { got <- get() }()
+	select {
+	case g := <-got:
+		if g != nil {
+			t.Fatal("get() answered the closing node")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("get() waited on the close")
+	}
+	reopened := make(chan error, 1)
+	go func() { reopened <- openNode(repo) }()
+	select {
+	case <-reopened:
+		t.Fatal("a start ran while the close still held the repo")
+	case <-time.After(300 * time.Millisecond):
+	}
+	n.compactWG.Done()
+	<-closed
+	if err := <-reopened; err != nil {
+		t.Fatalf("start after the close: %v", err)
+	}
+	closeNode()
+}

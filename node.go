@@ -127,6 +127,9 @@ type node struct {
 var (
 	gMu   sync.Mutex
 	gNode *node
+	// gClosing: a node being closed outside gMu (closeNode). A start waits for it — the closing one still holds the
+	// repo's datastore.
+	gClosing sync.WaitGroup
 )
 
 // openNode initializes the node at repoPath (created if missing). Idempotent: a second call is a no-op.
@@ -134,6 +137,7 @@ var (
 var openLevelDB = leveldb.NewDatastore
 
 func openNode(repoPath string) error {
+	gClosing.Wait() // the node closing (if any) lets go of the repo first
 	gMu.Lock()
 	defer gMu.Unlock()
 	if gNode != nil {
@@ -254,35 +258,43 @@ func retryOnline(n *node) {
 }
 
 // closeNode tears the node down.
+// The node is taken out under gMu and closed OUTSIDE it: every Vg* call takes gMu (get), and a close waits on the
+// DHT, the host and an in-flight compaction (minutes on a large store) — every caller, the GUI's included, waited
+// with it. From the moment it is taken out, get() answers nil: the node is off.
 func closeNode() {
 	gMu.Lock()
-	defer gMu.Unlock()
-	if gNode == nil {
+	n := gNode
+	gNode = nil
+	if n != nil {
+		gClosing.Add(1)
+	}
+	gMu.Unlock()
+	if n == nil {
 		return
 	}
-	if gNode.mdns != nil {
-		_ = gNode.mdns.Close()
+	defer gClosing.Done()
+	if n.mdns != nil {
+		_ = n.mdns.Close()
 	}
-	if gNode.provider != nil {
-		_ = gNode.provider.Close()
+	if n.provider != nil {
+		_ = n.provider.Close()
 	}
-	if gNode.dht != nil {
-		_ = gNode.dht.Close()
+	if n.dht != nil {
+		_ = n.dht.Close()
 	}
-	if gNode.host != nil {
-		_ = gNode.host.Close()
+	if n.host != nil {
+		_ = n.host.Close()
 	}
-	gNode.cancel()
+	n.cancel()
 	// Bar new compactions and WAIT for the in-flight one: closing leveldb under a live CompactRange is a race
 	// inside goleveldb (compaction ack vs close). Wait happens before the datastore close, deliberately.
-	gNode.compactMu.Lock()
-	gNode.compactClosed = true
-	gNode.compactMu.Unlock()
-	gNode.compactWG.Wait()
-	if c, ok := gNode.ds.(datastore.Datastore); ok {
+	n.compactMu.Lock()
+	n.compactClosed = true
+	n.compactMu.Unlock()
+	n.compactWG.Wait()
+	if c, ok := n.ds.(datastore.Datastore); ok {
 		_ = c.Close()
 	}
-	gNode = nil
 }
 
 // scheduleCompaction runs a whole-DB leveldb compaction to reclaim the disk that deleted blocks leave behind as
